@@ -94,8 +94,13 @@ Optional ML/test environment:
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install scikit-learn pytest
+.venv/bin/python -m pip install -r requirements.txt
 ```
+
+`requirements.txt` covers the Python API, policy, ML, and test dependencies.
+The BCC binding is deliberately installed through Kali packages, not pip: it
+must match the installed `libbcc` and running kernel. Run privileged BCC
+collectors with the system `python3` after installing `python3-bpfcc`.
 
 ### 2. Start live ingestion
 
@@ -244,6 +249,7 @@ not weakened or removed to hide that limitation.
 | `policy/` | Deterministic fail-closed dry-run policy |
 | `api/`, `dashboard/` | Read-only analyst API and interface |
 | `tests/` | Focused unit and integration regression tests |
+| `requirements.txt` | Python dependencies for API, policy, ML, and tests |
 
 ## Data handling
 

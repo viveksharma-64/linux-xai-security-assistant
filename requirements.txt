@@ -1,0 +1,16 @@
+# Runtime API, policy, and ML dependencies.
+# Install in a virtual environment with: python -m pip install -r requirements.txt
+#
+# BCC/eBPF is intentionally not listed here. Install the Kali packages shown in
+# README.md so the Python binding matches the running kernel and libbcc.
+
+fastapi>=0.135,<0.136
+uvicorn>=0.38,<0.39
+pydantic>=2.13,<3
+PyYAML>=6.0,<7
+psutil>=7.1,<8
+numpy>=2.4,<3
+scikit-learn>=1.9,<2
+
+# Test runner used by the focused regression suite.
+pytest>=9.1,<10
