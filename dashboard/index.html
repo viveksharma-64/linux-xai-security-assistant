@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Linux XAI Security Console</title>
+  <link rel="stylesheet" href="/dashboard/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">C-DAC / LINUX SECURITY ASSISTANT</p>
+      <h1>Security Console</h1>
+    </div>
+    <div class="read-only">READ-ONLY VIEW</div>
+  </header>
+  <main>
+    <section class="status-grid" id="status-cards" aria-label="System status"></section>
+    <section class="content-grid">
+      <article class="panel telemetry-panel">
+        <div class="panel-heading"><h2>Telemetry health</h2><span id="health-badge">Loading</span></div>
+        <div id="collector-detail" class="overview-note">Loading collector status.</div>
+        <div id="telemetry-list" class="telemetry-list"></div>
+      </article>
+      <article class="panel overview-panel">
+        <div class="panel-heading"><h2>Security overview</h2><span class="muted">Persisted data</span></div>
+        <div id="severity-counts" class="severity-counts"></div>
+        <div class="overview-note">No live stream is required. This console reads the SQLite security record.</div>
+      </article>
+    </section>
+    <section class="panel findings-panel">
+      <div class="panel-heading"><h2>Detection findings</h2><span id="finding-count" class="muted"></span></div>
+      <div class="table-wrap"><table><thead><tr><th>ID</th><th>Severity</th><th>Risk</th><th>Entity</th><th>Window</th></tr></thead><tbody id="findings-body"></tbody></table></div>
+    </section>
+    <section class="detail-grid">
+      <article class="panel detail-panel"><div class="panel-heading"><h2>Evidence detail</h2><span id="selected-id" class="muted">Select a finding</span></div><div id="detail-content" class="empty-state">Select a finding above to inspect persisted evidence.</div></article>
+      <article class="panel detail-panel"><div class="panel-heading"><h2>Policy decision</h2><span class="muted">No actions available</span></div><div id="policy-content" class="empty-state">Policy decisions appear here when persisted.</div></article>
+    </section>
+  </main>
+  <footer>Live verified: process execution, post-exec context, file access, TCP/network, authentication/session, system/service lifecycle, and pipes/streams/IPC.</footer>
+  <script src="/dashboard/app.js"></script>
+</body>
+</html>

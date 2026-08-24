@@ -1,0 +1,49 @@
+==================================================
+ Linux XAI Security Assistant — Environment Check
+==================================================
+
+--- OS release ---
+PRETTY_NAME="Kali GNU/Linux Rolling"
+NAME="Kali GNU/Linux"
+VERSION_ID="2026.3"
+VERSION="2026.3"
+VERSION_CODENAME=kali-rolling
+ID=kali
+ID_LIKE=debian
+HOME_URL="https://www.kali.org/"
+SUPPORT_URL="https://forums.kali.org/"
+BUG_REPORT_URL="https://bugs.kali.org/"
+ANSI_COLOR="1;31"
+[PASS] Running on Kali Linux, as expected.
+
+--- Kernel version ---
+uname -r => 7.0.12+kali-amd64
+[PASS] Kernel version recorded: 7.0.12+kali-amd64
+
+--- BTF support (needed for CO-RE style BCC programs) ---
+[PASS] BTF present at /sys/kernel/btf/vmlinux
+
+--- bpftool feature probe (bpf_syscall / btf) ---
+[WARN] bpftool not installed. Install with: sudo apt install linux-tools-common linux-tools-$(uname -r) (or bpftool directly if packaged for your kernel).
+
+--- Kernel headers ---
+[PASS] Kernel headers appear present for 7.0.12+kali-amd64.
+
+--- BCC (bpfcc-tools / python3-bpfcc) ---
+[PASS] bpfcc-tools package is installed.
+BCC python module OK: /usr/lib/python3/dist-packages/bcc/__init__.py
+[PASS] python3 'import bcc' succeeded.
+
+--- bpftrace (debug/verification tool only — NOT part of the shipped app) ---
+[WARN] bpftrace not installed or not found. This is a KNOWN issue on some Kali-rolling snapshots (the package has been intermittently pulled from the repo). This is NOT a blocker — the application telemetry layer uses BCC, not bpftrace. bpftrace is only used here for quick manual verification. If you want it anyway, try: sudo apt update && sudo apt install -y bpftrace
+
+--- auditd (fallback telemetry source) ---
+[PASS] auditd tools present.
+
+--- Privilege check ---
+[WARN] Not running as root. BCC probe attachment (CAP_BPF/CAP_SYS_ADMIN) will need sudo when we run the actual PoC.
+
+==================================================
+ Summary: 7 passed, 3 warnings, 0 failed
+==================================================
+No hard failures. Review warnings, then proceed to telemetry/bcc/process_exec_probe.py

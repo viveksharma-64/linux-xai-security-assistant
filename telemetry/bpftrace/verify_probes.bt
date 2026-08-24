@@ -1,0 +1,37 @@
+#!/usr/bin/env bpftrace
+//
+// verify_probes.bt
+//
+// DEBUG/VERIFICATION ONLY. This is not part of the shipped application —
+// the real telemetry layer is BCC + Python (see ../bcc/process_exec_probe.py).
+//
+// Purpose: confirm that the process-exec and TCP-connect kernel entry
+// points actually fire on this specific Kali kernel before we build
+// anything on top of them.
+//
+// Run:   sudo bpftrace telemetry/bpftrace/verify_probes.bt
+// Stop:  Ctrl+C
+//
+// If bpftrace is not installed on this Kali snapshot, skip this file —
+// it is optional. Go straight to the BCC PoC and rely on its own output
+// for verification instead.
+
+BEGIN
+{
+    printf("[verify_probes] tracing execve and tcp_v4_connect. Ctrl+C to stop.\n");
+}
+
+tracepoint:syscalls:sys_enter_execve
+{
+    printf("[verify] execve  pid=%d comm=%s file=%s\n", pid, comm, str(args->filename));
+}
+
+kprobe:tcp_v4_connect
+{
+    printf("[verify] connect pid=%d comm=%s (tcp_v4_connect entered)\n", pid, comm);
+}
+
+interval:s:15
+{
+    printf("[verify] 15s elapsed, still tracing...\n");
+}

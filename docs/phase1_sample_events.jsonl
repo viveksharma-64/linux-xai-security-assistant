@@ -1,0 +1,30 @@
+{"event_type": "telemetry_startup", "message": "loading eBPF programs...", "timestamp": 1787077810.1234}
+{"event_type": "telemetry_info", "message": "tcp probes attached", "timestamp": 1787077810.5234}
+{"event_type": "telemetry_startup", "message": "probes attached, polling events. Ctrl+C to stop.", "timestamp": 1787077810.8234}
+{"event_type": "process_exec", "timestamp": 1787077812.0234, "pid": 47231, "uid": 1000, "comm": "ls", "filename": "/usr/bin/ls"}
+{"event_type": "process_exec", "timestamp": 1787077812.2345, "pid": 47232, "uid": 1000, "comm": "find", "filename": "/usr/bin/find"}
+{"event_type": "system_health", "timestamp": 1787077815.1234, "mem_percent": 61.5, "mem_available_mb": 2816}
+{"event_type": "process_exec", "timestamp": 1787077816.5234, "pid": 47233, "uid": 1000, "comm": "grep", "filename": "/usr/bin/grep"}
+{"event_type": "process_exec", "timestamp": 1787077816.9234, "pid": 47234, "uid": 1000, "comm": "cat", "filename": "/usr/bin/cat"}
+{"event_type": "process_exec", "timestamp": 1787077817.3234, "pid": 47235, "uid": 1000, "comm": "whoami", "filename": "/usr/bin/whoami"}
+{"event_type": "process_exec", "timestamp": 1787077817.7234, "pid": 47236, "uid": 1000, "comm": "id", "filename": "/usr/bin/id"}
+{"event_type": "process_exec", "timestamp": 1787077818.1234, "pid": 47237, "uid": 1000, "comm": "ps", "filename": "/bin/ps"}
+{"event_type": "process_exec", "timestamp": 1787077818.5234, "pid": 47238, "uid": 1000, "comm": "touch", "filename": "/usr/bin/touch"}
+{"event_type": "process_exec", "timestamp": 1787077818.9234, "pid": 47239, "uid": 1000, "comm": "echo", "filename": "/bin/echo"}
+{"event_type": "system_health", "timestamp": 1787077820.1234, "mem_percent": 60.8, "mem_available_mb": 2897}
+{"event_type": "process_exec", "timestamp": 1787077820.5234, "pid": 47240, "uid": 1000, "comm": "cp", "filename": "/usr/bin/cp"}
+{"event_type": "process_exec", "timestamp": 1787077820.9234, "pid": 47241, "uid": 1000, "comm": "dd", "filename": "/bin/dd"}
+{"event_type": "process_exec", "timestamp": 1787077821.3234, "pid": 47242, "uid": 1000, "comm": "timeout", "filename": "/usr/bin/timeout"}
+{"event_type": "process_exec", "timestamp": 1787077821.7234, "pid": 47243, "uid": 1000, "comm": "curl", "filename": "/usr/bin/curl"}
+{"event_type": "process_exec", "timestamp": 1787077822.1234, "pid": 47244, "uid": 1000, "comm": "uname", "filename": "/bin/uname"}
+{"event_type": "process_exec", "timestamp": 1787077822.5234, "pid": 47245, "uid": 1000, "comm": "df", "filename": "/usr/bin/df"}
+{"event_type": "system_health", "timestamp": 1787077825.1234, "mem_percent": 59.2, "mem_available_mb": 3040}
+{"event_type": "process_exec", "timestamp": 1787077825.5234, "pid": 47246, "uid": 1000, "comm": "free", "filename": "/usr/bin/free"}
+{"event_type": "process_exec", "timestamp": 1787077825.9234, "pid": 47247, "uid": 1000, "comm": "systemctl", "filename": "/usr/bin/systemctl"}
+{"event_type": "process_exec", "timestamp": 1787077826.3234, "pid": 47248, "uid": 1000, "comm": "journalctl", "filename": "/usr/bin/journalctl"}
+{"event_type": "process_exec", "timestamp": 1787077826.7234, "pid": 47249, "uid": 1000, "comm": "pgrep", "filename": "/usr/bin/pgrep"}
+{"event_type": "process_exec", "timestamp": 1787077827.1234, "pid": 47250, "uid": 1000, "comm": "wc", "filename": "/usr/bin/wc"}
+{"event_type": "process_exec", "timestamp": 1787077827.5234, "pid": 47251, "uid": 1000, "comm": "seq", "filename": "/usr/bin/seq"}
+{"event_type": "process_exec", "timestamp": 1787077827.9234, "pid": 47252, "uid": 1000, "comm": "tail", "filename": "/usr/bin/tail"}
+{"event_type": "system_health", "timestamp": 1787077830.1234, "mem_percent": 58.9, "mem_available_mb": 3104}
+{"event_type": "telemetry_shutdown", "message": "stopped by user", "timestamp": 1787077835.1234}

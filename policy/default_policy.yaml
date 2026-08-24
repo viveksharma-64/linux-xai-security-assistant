@@ -1,0 +1,41 @@
+version: 1
+policies:
+  - policy_id: critical_action_pending_approval
+    priority: 100
+    match:
+      severity: [CRITICAL]
+      min_risk_score: 0.8
+    decision: ACTION_PENDING_APPROVAL
+    required_approval: true
+    proposed_action: Review the finding and approve any future response separately.
+    allowed_recommendation_keywords: [review]
+
+  - policy_id: high_review_required
+    priority: 90
+    match:
+      severity: [HIGH]
+      min_risk_score: 0.6
+    decision: REVIEW_REQUIRED
+    required_approval: true
+    proposed_action: Review the process tree and command history.
+    allowed_recommendation_keywords: [review]
+
+  - policy_id: medium_log_and_review
+    priority: 80
+    match:
+      severity: [MEDIUM]
+      min_risk_score: 0.35
+    decision: LOG
+    required_approval: false
+    proposed_action: Record the finding for analyst review.
+    allowed_recommendation_keywords: [review, record]
+
+  - policy_id: low_log_with_limits
+    priority: 70
+    match:
+      severity: [LOW]
+      min_risk_score: 0.0
+    decision: LOG
+    required_approval: false
+    proposed_action: No response action; retain the finding for audit.
+    allowed_recommendation_keywords: [review, retain]
