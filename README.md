@@ -8,11 +8,36 @@ canonical event model, persists evidence in SQLite, and produces transparent
 security findings. It helps analysts understand *what was observed*, *why it
 was flagged*, and *what evidence supports that conclusion*.
 
+## What the problem asks for
+
+The project brief:
+
+> Design an AI-powered monitoring system that learns normal system behavior to
+> detect security threats and system failures in real time. The solution should
+> explain why anomalies are detected and automatically recommend or perform
+> corrective actions.
+
+Each clause maps to code, and the honest gaps are marked rather than hidden:
+
+| Requirement clause | Where it lives | Status |
+|---|---|---|
+| Learn normal system behavior | `baseline/` behavioral baseline (ML present but inactive) | Implemented |
+| Detect security threats in real time | `detection/` fusion over streaming collectors (6 of 7 sources stream) | Implemented |
+| Detect system failures in real time | `system_health` events are collected but not yet scored | **Not implemented** |
+| Explain why anomalies are detected | `explainability/` evidence + advisory `assistant/` | Implemented |
+| Recommend or perform corrective actions | `assistant/` advises and `policy/` emits fail-closed dry-run decisions | **Recommend only** — performing actions is deliberately not built |
+
+The two gaps are documented positions, not oversights. Performing corrective
+actions in particular is intentionally out of scope: it would conflict with the
+safety principles below — observation-only collectors, an advisory assistant,
+and fail-closed dry-run policy. [AGENTS.md](AGENTS.md) carries the full
+clause-by-clause traceability.
+
 ## Submission snapshot
 
 | Area | Current state |
 |---|---|
-| Telemetry | All planned families are **LIVE VERIFIED** on Kali Linux 2026.3 / kernel `7.0.12+kali` |
+| Telemetry | All planned families are **LIVE VERIFIED** on Kali Linux 2026.3 / kernel `7.1.5+kali` |
 | Detection | Deterministic baseline, rules, context, and fusion are implemented |
 | Explainability | Persisted evidence reconstruction and analyst-facing explanations are implemented |
 | Assistant | Optional, provider-neutral, evidence-grounded narration; never a decision-maker |
@@ -170,15 +195,15 @@ Live BCC probes must be run from an interactive privileged Kali terminal.
 Each collector emits JSONL that can be sent through the same canonical
 normalizer and SQLite ingestion boundary.
 
-| Telemetry | Collector |
-|---|---|
-| Process execution / health | `telemetry/bcc/telemetry_basic.py` |
-| Post-exec context | `telemetry/bcc/process_context.py` |
-| Network | `telemetry/bcc/network_state_probe.py` |
-| File access | `telemetry/auditd/file_access_monitor.py` |
-| Authentication/session | `telemetry/journald/auth_session_monitor.py` |
-| Service lifecycle | `telemetry/journald/service_monitor.py` |
-| IPC pipe creation | `telemetry/bcc/ipc_pipe_probe.py` |
+| Telemetry | Collector | Mode |
+|---|---|---|
+| Process execution / health | `telemetry/bcc/telemetry_basic.py` | streaming (kernel) |
+| Post-exec context | `telemetry/bcc/process_context.py` | streaming (kernel) |
+| Network | `telemetry/bcc/network_state_probe.py` | streaming (kernel) |
+| File access | `telemetry/auditd/file_access_monitor.py` | one-shot query |
+| Authentication/session | `telemetry/journald/auth_session_monitor.py` | streaming (journal cursor) |
+| Service lifecycle | `telemetry/journald/service_monitor.py` | streaming (journal cursor) |
+| IPC pipe creation | `telemetry/bcc/ipc_pipe_probe.py` | streaming (kernel) |
 
 For example, use a collector with the ingestion service:
 
@@ -191,6 +216,57 @@ sudo env PYTHONPATH=. python3 -m pipeline.live_ingestion \
 Do not reintroduce `ntohs()` in the network collector: this Kali tracepoint
 exports `dport` in host byte order. Do not revert the IPC probe's x86_64 ABI
 fix: the `pipefd` user pointer comes from `regs->di` in the syscall wrapper.
+
+The remaining files in `telemetry/bcc/` — `telemetry_simple.py`,
+`telemetry_collector.py`, `process_exec_probe.py`, and
+`network_connect_probe.py` — are superseded proofs of concept, marked
+`DEPRECATED / LEGACY` in their module docstrings. They are kept for historical
+reference only: they are not wired to ingestion, not covered by the regression
+suite, and not perf-buffer-loss reported. Use the collectors in the table above.
+
+### Streaming journald collectors
+
+Both journald collectors follow the journal continuously and persist a journal
+cursor, so a restart resumes where the previous run stopped instead of
+re-reading a fixed window or silently skipping the gap.
+
+```bash
+sudo env PYTHONPATH=. python3 -m pipeline.live_ingestion \
+  --db "$PWD/security_demo.db" -- \
+  python3 telemetry/journald/auth_session_monitor.py
+```
+
+| Flag / variable | Default | Purpose |
+|---|---|---|
+| `--follow` / `--no-follow` | `--follow` | Stream continuously, or read one window and exit. |
+| `--since` | `10 minutes ago` | Start window when no usable cursor exists. |
+| `--cursor-file` | `state/journald-<name>.cursor` | Where the resume position is stored. |
+| `--checkpoint-interval` | `2.0` seconds | Coalescing window for cursor writes. |
+| `SECURITY_STATE_DIR` | `<repo>/state` | Base directory for cursor files. |
+
+Operational properties that matter when reading the output:
+
+- **At-least-once, biased to re-read.** The cursor is persisted only after the
+  event it covers has been written and flushed, so a crash re-reads a small
+  overlap rather than dropping events. The re-read is safe because the store
+  inserts on a content hash that excludes the per-run fields (`boot_id`,
+  `agent_id`, monotonic time), so a replayed record collapses onto its existing
+  row instead of duplicating it.
+- **The cursor advances over records the collector ignores**, so a quiet period
+  cannot turn a restart into hours of re-reading.
+- **A cursor that cannot be resumed from is reported, never silently replaced.**
+  If the stored position no longer exists in the journal — rotation, vacuum, or a
+  rebuilt journal — the collector emits a `telemetry_warning` event carrying
+  `stale_cursor`, `reason`, and `recovery="since_window"`, then falls back to
+  `--since`. That warning is a stored row, so the gap is visible in the API and
+  dashboard rather than only in a log.
+- **Clean shutdown is checkpointed.** `SIGTERM`/`SIGINT` handlers stop the stream
+  and force a final cursor write, well inside the supervisor's five-second grace
+  period before `SIGKILL`.
+- `state/` is git-ignored; cursor files are local runtime state, not artifacts.
+- `read_journal()` remains in both modules for scripted one-shot use. It is not
+  the supervised path and cannot resume; `tests/test_journal_stream.py` pins that
+  it derives the same events as the streaming path so the two cannot drift.
 
 ## ML status and activation gate
 
@@ -215,24 +291,28 @@ to make a model pass.
 
 ## Tests
 
-Run focused ML, detection, and explainability tests with:
+Run the whole suite from the repository root. `pyproject.toml` sets
+`pythonpath = ["."]`, so no `PYTHONPATH` prefix is needed:
 
 ```bash
-cd ~/linux-xai-security-assistant
-PYTHONPATH=. .venv/bin/python -m pytest -q \
-  tests/test_ml_integration.py tests/test_phase4.py tests/test_phase5.py
+pytest -q
 ```
 
-Established focused results include:
+To run a focused subset:
 
-- IPC tests: 6 passed
-- Authentication tests: 4 passed
-- Earlier network focused tests: 27 passed
-- ML/detection/explainability focused tests: 22 passed
+```bash
+pytest -q tests/test_journal_stream.py tests/test_ml_integration.py
+```
 
-The entire repository suite is not claimed as clean: known environment/runtime
-timeout issues remain around some TestClient/live-ingestion tests. Tests are
-not weakened or removed to hide that limitation.
+Measured on Python 3.14.6 with pytest 9.1.1:
+
+- Full suite: **304 passed, 4 skipped** (~16s)
+- The 4 skips are `tests/test_ml_integration.py`, which requires scikit-learn
+- Streaming journald: 92 passed, including two integration tests that exercise
+  the real `journalctl` cursor semantics on systemd 261
+
+Re-measure before restating those numbers. Tests are never weakened, skipped, or
+removed to make a run look clean.
 
 ## Project layout
 

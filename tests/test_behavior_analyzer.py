@@ -16,7 +16,7 @@ def _event(timestamp, comm="bash", uid=1000, pid=100):
 
 
 def test_aggregate_windows_are_configurable_and_deterministic(tmp_path):
-    analyzer = BehaviorAnalyzer(SQLiteEventStore(str(tmp_path / "phase3.db")), window_seconds=10)
+    analyzer = BehaviorAnalyzer(SQLiteEventStore(str(tmp_path / "events.db")), window_seconds=10)
     events = [
         _event(100.0, comm="python", pid=2),
         _event(101.0, comm="bash", pid=1),
@@ -34,7 +34,7 @@ def test_aggregate_windows_are_configurable_and_deterministic(tmp_path):
 
 def test_learning_requires_verified_normal_data_and_promotes_once_ready(tmp_path):
     analyzer = BehaviorAnalyzer(
-        SQLiteEventStore(str(tmp_path / "phase3.db")),
+        SQLiteEventStore(str(tmp_path / "events.db")),
         minimum_normal_execs=4,
     )
     normal_events = [_event(1000 + index, comm="bash", pid=index) for index in range(3)]
@@ -57,7 +57,7 @@ def test_learning_requires_verified_normal_data_and_promotes_once_ready(tmp_path
 
 
 def test_monitoring_persists_structured_risk_and_does_not_learn(tmp_path):
-    store = SQLiteEventStore(str(tmp_path / "phase3.db"))
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
     analyzer = BehaviorAnalyzer(store, minimum_normal_execs=4)
     normal_events = [_event(1000 + index, comm="bash", pid=index) for index in range(4)]
     analyzer.learn_normal(normal_events, verified_normal=True)
@@ -85,7 +85,7 @@ def test_monitoring_persists_structured_risk_and_does_not_learn(tmp_path):
 
 
 def test_ready_baseline_can_be_reloaded_for_monitoring(tmp_path):
-    db_path = tmp_path / "phase3.db"
+    db_path = tmp_path / "events.db"
     first_store = SQLiteEventStore(str(db_path))
     first_analyzer = BehaviorAnalyzer(first_store, minimum_normal_execs=4)
     first_analyzer.learn_normal(
@@ -101,7 +101,7 @@ def test_ready_baseline_can_be_reloaded_for_monitoring(tmp_path):
 
 def test_monitoring_waits_for_ready_baseline(tmp_path):
     analyzer = BehaviorAnalyzer(
-        SQLiteEventStore(str(tmp_path / "phase3.db")),
+        SQLiteEventStore(str(tmp_path / "events.db")),
         minimum_normal_execs=500,
     )
     result = analyzer.monitor([_event(1000, comm="nc")])
@@ -119,7 +119,7 @@ def test_real_capture_is_sanity_checked_but_not_promoted(tmp_path):
 
     events = [json.loads(line) for line in capture_path.read_text().splitlines() if line.strip()]
     analyzer = BehaviorAnalyzer(
-        SQLiteEventStore(str(tmp_path / "phase3.db")),
+        SQLiteEventStore(str(tmp_path / "events.db")),
         minimum_normal_execs=500,
     )
     result = analyzer.learn_normal(events, verified_normal=True)

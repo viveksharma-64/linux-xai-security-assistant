@@ -2,13 +2,19 @@
 """
 process_exec_probe.py
 
-Phase 1 telemetry PoC. NOT the final pipeline — this proves that we can
+DEPRECATED / LEGACY: the original proof of concept, superseded by
+telemetry/bcc/telemetry_basic.py. Retained for historical reference only. It is
+not wired to the ingestion pipeline, is not covered by the regression suite,
+and is not perf-buffer-loss reported. Do not use it for live telemetry and do
+not build on it.
+
+The original telemetry PoC. NOT the final pipeline — this proves that we can
 capture structured, kernel-level events (process execution + outbound
 TCP connect attempts) using BCC on this specific host, and prints them
 as JSON lines to stdout.
 
-Phase 2 will replace the "print to stdout" step with a real event
-collector that normalizes and forwards these into the pipeline.
+The "print to stdout" step was later replaced by a real event collector
+that normalizes and forwards these into the pipeline.
 
 Run (must be root — BCC needs CAP_BPF/CAP_SYS_ADMIN to attach probes):
     sudo python3 telemetry/bcc/process_exec_probe.py

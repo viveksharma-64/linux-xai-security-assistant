@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Network-only BCC collector for successful IPv4 TCP connections."""
+"""Network-only BCC collector for successful IPv4 TCP connections.
+
+DEPRECATED / LEGACY: superseded by telemetry/bcc/network_state_probe.py, which
+uses the sock:inet_sock_set_state tracepoint instead of this module's older
+tcp_v4_connect/struct sock approach. Retained as a historical proof of concept
+only. It is not wired to the ingestion pipeline, is not covered by the
+regression suite, and is not perf-buffer-loss reported. Do not use it for live
+telemetry and do not build on it; per AGENTS.md, do not revert the network
+collector to this approach.
+"""
 
 import json
 import socket

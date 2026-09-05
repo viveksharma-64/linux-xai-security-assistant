@@ -14,7 +14,7 @@ class AnalysisMode(str, Enum):
 
 class BehaviorAnalyzer:
     """
-    Phase 3 windowed behavior analysis around the Phase 2 baseline engine.
+    Windowed behavior analysis around the baseline engine.
 
     Normal data enters only through learn_normal(..., verified_normal=True).
     Monitoring never mutates the normal sample set or promotes a baseline.

@@ -11,7 +11,7 @@ from storage.sqlite_store import SQLiteEventStore
 
 
 def _explanation(tmp_path):
-    store = SQLiteEventStore(str(tmp_path / "phase6.db"))
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
     event = Event.from_raw_json(
         {
             "event_type": "process_exec",

@@ -76,6 +76,22 @@ class StatusResponse(StrictModel):
     collector_processed_count: int = 0
     collector_malformed_count: int = 0
     collector_updated_at: Optional[float] = None
+    # Backpressure and event-loss detail. Optional because a database written
+    # before these columns existed, or one no collector has ever reported into,
+    # has nothing to say -- and "unknown" must not be rendered as zero loss.
+    collector_queue_depth: Optional[int] = None
+    collector_queue_capacity: Optional[int] = None
+    collector_queue_high_water_mark: Optional[int] = None
+    collector_backpressure_wait_count: Optional[int] = None
+    collector_backpressure_wait_seconds: Optional[float] = None
+    first_drop_timestamp: Optional[float] = None
+    last_drop_timestamp: Optional[float] = None
+    # Kernel-side loss, reported by the collector rather than observed by the
+    # supervisor. Separate from dropped_event_count because a perf ring overrun
+    # and a full ingestion queue are different failures with different fixes.
+    kernel_lost_event_count: Optional[int] = None
+    first_kernel_loss_timestamp: Optional[float] = None
+    last_kernel_loss_timestamp: Optional[float] = None
 
 
 class EventResponse(StrictModel):
@@ -83,6 +99,7 @@ class EventResponse(StrictModel):
     event_type: str
     timestamp: float
     timestamp_ns: Optional[int] = None
+    timestamp_monotonic: Optional[float] = None
     pid: Optional[int] = None
     ppid: Optional[int] = None
     uid: Optional[int] = None
@@ -94,6 +111,12 @@ class EventResponse(StrictModel):
     source: Optional[str] = None
     version: Optional[str] = None
     event_hash: Optional[str] = None
+    # Which host, boot, and agent observed the event. Null for rows written
+    # before identity existed, and for hosts with no readable machine-id -- the
+    # dashboard must be able to say "unknown", not imply a single host.
+    host_id: Optional[str] = None
+    boot_id: Optional[str] = None
+    agent_id: Optional[str] = None
     payload: Dict[str, Any]
 
 
@@ -237,6 +260,16 @@ def create_app(store: Optional[SQLiteEventStore] = None) -> FastAPI:
             collector_processed_count=int(collector.get("processed_count") or 0),
             collector_malformed_count=int(collector.get("malformed_count") or 0),
             collector_updated_at=collector.get("updated_at"),
+            collector_queue_depth=collector.get("queue_depth"),
+            collector_queue_capacity=collector.get("queue_capacity"),
+            collector_queue_high_water_mark=collector.get("queue_high_water_mark"),
+            collector_backpressure_wait_count=collector.get("backpressure_wait_count"),
+            collector_backpressure_wait_seconds=collector.get("backpressure_wait_seconds"),
+            first_drop_timestamp=collector.get("first_drop_timestamp"),
+            last_drop_timestamp=collector.get("last_drop_timestamp"),
+            kernel_lost_event_count=collector.get("kernel_lost_event_count"),
+            first_kernel_loss_timestamp=collector.get("first_kernel_loss_timestamp"),
+            last_kernel_loss_timestamp=collector.get("last_kernel_loss_timestamp"),
         )
 
     @app.get("/api/events", response_model=List[EventResponse])

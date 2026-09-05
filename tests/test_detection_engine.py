@@ -55,7 +55,7 @@ def test_rules_are_independently_testable():
 
 
 def test_normal_behavior_without_behavior_risk_produces_no_findings(tmp_path):
-    store = SQLiteEventStore(str(tmp_path / "phase4.db"))
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
     engine = DetectionEngine(store)
     result = engine.detect(risks=[], events=[_event(1000, "bash")])
     assert result == {"status": "detected", "mode": "detection", "findings": []}
@@ -63,7 +63,7 @@ def test_normal_behavior_without_behavior_risk_produces_no_findings(tmp_path):
 
 
 def test_detection_fuses_behavior_rules_and_context(tmp_path):
-    store = SQLiteEventStore(str(tmp_path / "phase4.db"))
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
     engine = DetectionEngine(store)
     events = [
         _event(1000 + index, comm="nc" if index < 2 else "bash", uid=0 if index == 0 else 1000, pid=index)
@@ -96,7 +96,7 @@ def test_detection_fuses_behavior_rules_and_context(tmp_path):
 
 
 def test_findings_are_persisted_with_structured_evidence(tmp_path):
-    store = SQLiteEventStore(str(tmp_path / "phase4.db"))
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
     engine = DetectionEngine(store)
     engine.detect(risks=[_risk(score=0.7)], events=[_event(1000, "nc")])
 
@@ -114,7 +114,7 @@ def test_findings_are_persisted_with_structured_evidence(tmp_path):
 
 
 def test_detection_persistence_is_idempotent_for_identical_evidence(tmp_path):
-    store = SQLiteEventStore(str(tmp_path / "phase4.db"))
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
     engine = DetectionEngine(store)
     first = engine.detect(risks=[_risk(score=0.7)], events=[_event(1000, "nc")])
     second = engine.detect(risks=[_risk(score=0.7)], events=[_event(1000, "nc")])
@@ -123,8 +123,8 @@ def test_detection_persistence_is_idempotent_for_identical_evidence(tmp_path):
     assert len(store.read_detection_findings()) == 1
 
 
-def test_phase3_risk_to_phase4_finding_sqlite_integration(tmp_path):
-    store = SQLiteEventStore(str(tmp_path / "phase4.db"))
+def test_behavior_risk_to_finding_sqlite_integration(tmp_path):
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
     analyzer = BehaviorAnalyzer(store, minimum_normal_execs=4)
     normal = [_event(1000 + index, comm="bash", pid=index) for index in range(4)]
     analyzer.learn_normal(normal, verified_normal=True)
@@ -142,7 +142,7 @@ def test_phase3_risk_to_phase4_finding_sqlite_integration(tmp_path):
 
 
 def test_severity_thresholds_are_explicit(tmp_path):
-    engine = DetectionEngine(SQLiteEventStore(str(tmp_path / "phase4.db")))
+    engine = DetectionEngine(SQLiteEventStore(str(tmp_path / "events.db")))
     assert engine._severity(0.10) == "LOW"
     assert engine._severity(0.35) == "MEDIUM"
     assert engine._severity(0.60) == "HIGH"

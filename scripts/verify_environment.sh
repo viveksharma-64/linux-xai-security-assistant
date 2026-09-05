@@ -130,6 +130,6 @@ if [ "$FAIL" -gt 0 ]; then
     echo "One or more checks FAILED. Resolve these before running the BCC PoC."
     exit 1
 else
-    echo "No hard failures. Review warnings, then proceed to telemetry/bcc/process_exec_probe.py"
+    echo "No hard failures. Review warnings, then proceed to telemetry/bcc/telemetry_basic.py"
     exit 0
 fi

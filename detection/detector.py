@@ -10,7 +10,7 @@ from storage.sqlite_store import SQLiteEventStore
 
 class DetectionEngine:
     """
-    Phase 4 detection fusion over Phase 3 behavior risks and canonical events.
+    Detection fusion over behavior risks and canonical events.
 
     This component detects and records findings only. It performs no response,
     remediation, process control, or system configuration changes.

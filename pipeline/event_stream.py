@@ -1,25 +1,34 @@
 #!/usr/bin/env python3
 """
-pipeline/event_stream.py
+Canonical event contract between the telemetry layer and everything downstream.
 
-Canonical event interface for Phase 1 → Phase 2 integration.
+Collectors emit JSON lines; this module defines the `Event` they are normalized
+into, and the collector/normalizer/store interfaces that the batch and live
+ingestion paths implement. Baseline learning, detection, explanation, and policy
+all read `Event`, so it is the single point at which telemetry becomes typed.
 
-Phase 1 (telemetry_collector.py) emits JSON lines matching these schemas.
-Phase 2 (Event Normalizer) consumes these and produces canonical Event objects.
+The contract exists so collectors can be replaced without touching downstream
+stages: an added or reworked probe changes only its own raw schema and the
+normalizer's handling of it.
 
-This interface ensures:
-- Telemetry is independent of downstream processing
-- Phase 1 can be replaced/enhanced without breaking Phase 2+
-- Events are structured, typed, and version-controlled
-- All relevant context is captured at collection time
+Diagnostics go to logging, never to stdout. Stdout is a data channel here --
+collectors write JSON lines to it and `pipeline/live_ingestion.py:main` writes a
+single health object to it -- so a warning printed there corrupts a consumer's
+parse.
 """
 
 import json
+import logging
 import math
+import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from enum import Enum
 from typing import Any, Dict, Iterator, Optional, Union
+
+from pipeline import identity
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _coerce_float(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -46,12 +55,12 @@ def _coerce_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 
 
 # =============================================================================
-# CANONICAL EVENT TYPES (from Phase 1 telemetry)
+# CANONICAL EVENT TYPES (emitted by the telemetry collectors)
 # =============================================================================
 
 
 class EventType(str, Enum):
-    """All event types emitted by Phase 1 telemetry layer."""
+    """All event types emitted by the telemetry collectors."""
 
     # Kernel-level events
     PROCESS_EXEC = "process_exec"
@@ -72,18 +81,65 @@ class EventType(str, Enum):
     TELEMETRY_WARNING = "telemetry_warning"
 
 
-@dataclass
+@dataclass(frozen=True)
 class Event:
     """
     Canonical event representation.
 
-    All telemetry events normalize to this structure for Phase 2+ processing.
+    All telemetry events normalize to this structure before any analysis stage.
+
+    Immutable on purpose
+    --------------------
+    This is the evidence record behind a security finding, and it is read
+    concurrently: the ingestion consumer, the detection stages, and the feature
+    extractor all see the same object. A mutable evidence record means a value
+    an analyst reads in an explanation is not provably the value that produced
+    the score -- any stage could have adjusted it in between, and nothing in the
+    stored finding would show that it had. Freezing makes the record
+    write-once, and makes sharing one `Event` across stages safe without
+    defensive copying.
+
+    Freezing is shallow: `payload` and `ancestry` are still mutable containers.
+    Making them deeply immutable would mean converting every payload to a
+    mapping type that no longer round-trips through `json.dumps`, which costs
+    more than it buys. The attribute rebinding that actually caused trouble --
+    reassigning `timestamp` or `uid` after construction, in the normalizer -- is
+    what this prevents.
+
+    Timestamps
+    ----------
+    Three clocks, because no one of them answers every question.
+    `timestamp` is wall clock: comparable across hosts, and the only one an
+    analyst can line up against an external log, but it can step backwards under
+    NTP correction. `timestamp_monotonic` never steps and is therefore the one
+    that can measure a duration honestly -- but it is only comparable within a
+    single boot, which is why it is meaningless without `boot_id`. `timestamp_ns`
+    stays what it always was: the kernel clock reading a probe reported, present
+    only when the collector supplied one.
+    Identity, equality, and what "the same event" means
+    ---------------------------------------------------
+    `timestamp_monotonic`, `boot_id`, and `agent_id` are excluded from equality
+    and hashing. They describe the observation session -- which agent run
+    noticed this event, on which boot, how far into that boot -- not the event
+    itself. Two normalizations of one collector record describe the same thing
+    that happened on the host even though the agent read them microseconds
+    apart, and code that aggregates or compares events must be able to say so;
+    `baseline/behavior_analyzer.aggregate_windows` is documented as
+    deterministic and would otherwise stop being so.
+
+    That exclusion set is deliberately identical to the one
+    `SQLiteEventStore._event_hash` leaves out of the deduplication key, so
+    "equal events" and "events the store treats as duplicates" cannot drift
+    apart. `host_id` is on the other side of that line in both places: two hosts
+    doing the same thing at the same instant are two events, not one.
     """
 
     # Core fields (present in all events)
     event_type: EventType
     timestamp: float  # Unix timestamp (seconds)
     timestamp_ns: Optional[int] = None  # Kernel clock (nanoseconds, if available)
+    # CLOCK_MONOTONIC, valid only within boot_id. compare=False: see above.
+    timestamp_monotonic: Optional[float] = field(default=None, compare=False)
 
     # Process context (present in kernel events)
     pid: Optional[int] = None
@@ -102,11 +158,21 @@ class Event:
     source: str = "telemetry_bcc"  # Origin (BCC, auditd, etc.)
     version: str = "1.0"  # Event schema version
 
+    # Observation identity. Nullable because a container without /etc/machine-id
+    # must still be able to ingest: an event with unknown provenance is worth
+    # more than no event. See pipeline/identity.py.
+    host_id: Optional[str] = None
+    boot_id: Optional[str] = field(default=None, compare=False)
+    agent_id: Optional[str] = field(default=None, compare=False)
+
     def __post_init__(self):
+        # object.__setattr__ because the dataclass is frozen. These are
+        # normalizations of the value the caller passed, applied once at
+        # construction, not mutation of a constructed event.
         if self.payload is None:
-            self.payload = {}
+            object.__setattr__(self, "payload", {})
         if self.ancestry is None:
-            self.ancestry = []
+            object.__setattr__(self, "ancestry", [])
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert event to dictionary for JSON serialization."""
@@ -122,7 +188,7 @@ class Event:
     @classmethod
     def from_raw_json(cls, raw_json: dict) -> "Event":
         """
-        Factory method: parse raw JSON from Phase 1 telemetry into canonical Event.
+        Factory method: parse raw collector JSON into a canonical Event.
 
         Handles all event types and normalizes to common structure.
         """
@@ -223,6 +289,7 @@ class Event:
             event_type=event_type,
             timestamp=timestamp,
             timestamp_ns=timestamp_ns,
+            timestamp_monotonic=raw_json.get("timestamp_monotonic"),
             pid=pid,
             ppid=ppid,
             uid=uid,
@@ -234,6 +301,13 @@ class Event:
             payload=payload,
             source=raw_json.get("source", "telemetry_bcc"),
             version=raw_json.get("version", "1.0"),
+            # Read from the record rather than stamped here. A collector that
+            # knows its own identity -- or a replayed capture that recorded one
+            # -- must keep it; `CanonicalNormalizer` supplies this host's
+            # identity only when the record carries none.
+            host_id=raw_json.get("host_id"),
+            boot_id=raw_json.get("boot_id"),
+            agent_id=raw_json.get("agent_id"),
         )
 
 
@@ -246,8 +320,8 @@ class EventCollector(ABC):
     """
     Abstract base for telemetry collection.
 
-    Phase 1: telemetry_collector.py implements this via BCC probes.
-    Produces JSON lines to stdout/file.
+    Implemented by the collectors under telemetry/ (BCC, journald, auditd).
+    Produces JSON lines to stdout or a file.
     """
 
     @abstractmethod
@@ -265,8 +339,8 @@ class EventNormalizer(ABC):
     """
     Abstract base for event normalization.
 
-    Phase 2: Converts raw telemetry into canonical Event objects.
-    Handles schema validation, missing fields, type coercion.
+    Converts raw telemetry into canonical Event objects.
+    Handles schema validation, missing fields, and type coercion.
     """
 
     @abstractmethod
@@ -287,13 +361,18 @@ class EventStore(ABC):
     """
     Abstract base for event persistence.
 
-    Phase 2+: Stores canonical events for later analysis.
-    Implementations: SQLite, parquet, etc.
+    Implementations: SQLiteEventStore (production), InMemoryEventStore (tests).
     """
 
     @abstractmethod
-    def write(self, event: Event) -> None:
-        """Write a single canonical event to storage."""
+    def write(self, event: Event) -> bool:
+        """
+        Write a single canonical event to storage.
+
+        Returns True if the event was newly stored, False if it was rejected or
+        already present. `LiveIngestionService._consume` counts a False as a
+        duplicate, so an implementation returning None reports every event as one.
+        """
         pass
 
     @abstractmethod
@@ -313,7 +392,7 @@ class EventStore(ABC):
 
 
 # =============================================================================
-# CONCRETE IMPLEMENTATIONS (Phase 2 stubs)
+# CONCRETE IMPLEMENTATIONS
 # =============================================================================
 
 
@@ -321,7 +400,7 @@ class JSONLineCollector(EventCollector):
     """
     Collects events from a JSON lines file (e.g., telemetry_collector.py output).
 
-    Phase 1 PoC output → Phase 2 normalizer input.
+    Reads a captured collector JSONL file for the normalizer to consume.
     """
 
     def __init__(self, file_path: str):
@@ -337,8 +416,9 @@ class JSONLineCollector(EventCollector):
                 try:
                     yield json.loads(line)
                 except json.JSONDecodeError as e:
-                    # Log and skip malformed lines
-                    print(f"WARNING: Skipped malformed JSON: {e}", flush=True)
+                    LOGGER.warning(
+                        "jsonl_malformed_line path=%s error=%s", self.file_path, e
+                    )
                     continue
 
 
@@ -347,6 +427,11 @@ class CanonicalNormalizer(EventNormalizer):
     Normalizes raw telemetry to canonical Event objects.
 
     Implements: type validation, field coercion, filtering.
+
+    This is also where an event acquires the identity of the host observing it
+    and a monotonic companion to its wall clock, because it is the one point
+    every telemetry source passes through. Stamping in each collector instead
+    would mean seven places to keep correct and seven ways to forget.
     """
 
     def normalize(self, raw_event: Dict[str, Any]) -> Optional[Event]:
@@ -355,49 +440,88 @@ class CanonicalNormalizer(EventNormalizer):
             if "event_type" not in raw_event or not raw_event.get("event_type"):
                 raise ValueError("event_type is required")
 
-            timestamp = _coerce_float(raw_event.get("timestamp"), default=None)
+            # Coercion writes back several fields, so it operates on a copy. The
+            # caller's dict is telemetry it may still log, retry, or route
+            # elsewhere; normalization must not edit it underneath them.
+            record = dict(raw_event)
+
+            timestamp = _coerce_float(record.get("timestamp"), default=None)
             if timestamp is None or not math.isfinite(timestamp):
                 raise ValueError("timestamp must be numeric")
+            record["timestamp"] = timestamp
 
-            uid = raw_event.get("uid")
+            uid = record.get("uid")
             if uid is not None and not isinstance(uid, int):
                 try:
                     uid = int(uid)
                 except (TypeError, ValueError):
                     raise ValueError("uid must be numeric")
+            record["uid"] = uid
 
             for field in ("pid", "ppid", "gid"):
-                raw_event[field] = _coerce_int(raw_event.get(field))
-            parent_comm = raw_event.get("parent_comm")
-            raw_event["parent_comm"] = parent_comm if isinstance(parent_comm, str) else None
-            ancestry = raw_event.get("ancestry", [])
-            raw_event["ancestry"] = ancestry if isinstance(ancestry, list) else []
+                record[field] = _coerce_int(record.get(field))
+            parent_comm = record.get("parent_comm")
+            record["parent_comm"] = parent_comm if isinstance(parent_comm, str) else None
+            ancestry = record.get("ancestry", [])
+            # Copied, not aliased: the Event would otherwise share the caller's
+            # list and later mutation on either side would be visible to both.
+            record["ancestry"] = list(ancestry) if isinstance(ancestry, list) else []
 
-            event = Event.from_raw_json(raw_event)
-            if event is None:
-                return None
-            event.timestamp = timestamp
-            if uid is not None:
-                event.uid = uid
-            return event
+            self._stamp_observation(record)
+            return Event.from_raw_json(record)
         except Exception as e:
-            print(f"WARNING: Normalization failed: {e}", flush=True)
+            LOGGER.warning(
+                "normalization_failed event_type=%s pid=%s error=%s",
+                raw_event.get("event_type") if isinstance(raw_event, dict) else None,
+                raw_event.get("pid") if isinstance(raw_event, dict) else None,
+                e,
+            )
             return None
+
+    @staticmethod
+    def _stamp_observation(record: Dict[str, Any]) -> None:
+        """
+        Record who observed this event and when, on the monotonic clock.
+
+        Only fills what the record does not already carry. A replayed capture
+        arrives with the identity of the host that originally saw it, and
+        overwriting that would relabel another machine's evidence as this one's
+        -- which is worse than having no identity at all, because it is a
+        confident false statement rather than a null.
+
+        The monotonic reading is taken at normalization, so it measures when the
+        agent saw the event rather than when the kernel produced it. That is the
+        honest reading available here: nothing upstream reports a monotonic
+        timestamp, and inventing one from the wall clock would just launder an
+        adjustable clock into a field that promises not to be.
+        """
+        for field, value in (
+            ("host_id", identity.host_id()),
+            ("boot_id", identity.boot_id()),
+            ("agent_id", identity.agent_id()),
+        ):
+            if record.get(field) is None:
+                record[field] = value
+        if record.get("timestamp_monotonic") is None:
+            record["timestamp_monotonic"] = time.monotonic()
 
 
 class InMemoryEventStore(EventStore):
     """
-    Simple in-memory event store (for testing/small datasets).
+    Simple in-memory event store, for tests and small batch datasets.
 
-    Phase 2 PoC; replaced by SQLite in Phase 3+.
+    Not a persistence path: SQLiteEventStore is the durable implementation.
     """
 
     def __init__(self):
         self.events = []
 
-    def write(self, event: Event) -> None:
-        """Append event to memory."""
+    def write(self, event: Event) -> bool:
+        """Append event to memory. No deduplication, so a store always succeeds."""
+        if event is None:
+            return False
         self.events.append(event)
+        return True
 
     def read_all(self) -> Iterator[Event]:
         """Yield all stored events."""
@@ -416,15 +540,17 @@ class InMemoryEventStore(EventStore):
 
 
 # =============================================================================
-# PIPELINE ORCHESTRATOR (Phase 2 stub)
+# BATCH PIPELINE ORCHESTRATOR
 # =============================================================================
 
 
 class TelemetryPipeline:
     """
-    Orchestrates telemetry collection → normalization → storage.
+    Orchestrates telemetry collection → normalization → storage for a finite
+    source, such as a captured JSONL file.
 
-    Phase 2: Connects Phase 1 output to Phase 3+ processing.
+    The streaming counterpart is `pipeline/live_ingestion.LiveIngestionService`,
+    which adds a bounded queue, supervision, and health reporting.
     """
 
     def __init__(
@@ -449,8 +575,10 @@ class TelemetryPipeline:
             else:
                 self.skipped_count += 1
 
-        print(
-            f"Pipeline complete: {self.processed_count} processed, {self.skipped_count} skipped"
+        LOGGER.info(
+            "batch_pipeline_complete processed=%d skipped=%d",
+            self.processed_count,
+            self.skipped_count,
         )
 
 
@@ -460,10 +588,10 @@ class TelemetryPipeline:
 
 if __name__ == "__main__":
     """
-    Example: Load Phase 1 output, normalize, store in memory.
+    Example: load a collector JSONL file, normalize, store in memory.
 
     Usage:
-        python3 pipeline/event_stream.py /path/to/phase1_events.jsonl
+        python3 pipeline/event_stream.py /path/to/capture.jsonl
     """
     import sys
 

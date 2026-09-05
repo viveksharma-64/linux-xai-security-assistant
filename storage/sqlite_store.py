@@ -1,15 +1,32 @@
 import json
 import hashlib
 import sqlite3
+from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
 from pipeline.event_stream import CanonicalNormalizer, Event, EventStore
+from storage.migrations import migrate
 
 
 class SQLiteEventStore(EventStore):
     """
-    SQLite-backed persistence for canonical events and Phase 2 analytics metadata.
+    SQLite-backed persistence for canonical events and the analytics records
+    derived from them: features, baselines, risks, findings, explanations,
+    policy decisions, assistant responses, and ML provenance.
+
+    The schema is versioned; see storage/migrations.py.
     """
+
+    # Columns accepted as `query()` filter keys. Filter keys are interpolated
+    # into SQL (only values can be bound as parameters), so an unrestricted key
+    # is an injection vector reachable from any caller-supplied dict.
+    QUERYABLE_EVENT_COLUMNS = frozenset({
+        "id", "event_type", "timestamp", "timestamp_ns", "timestamp_monotonic",
+        "pid", "ppid", "uid", "gid",
+        "comm", "executable", "parent_comm",
+        "source", "version", "event_hash",
+        "host_id", "boot_id", "agent_id",
+    })
 
     def __init__(self, db_path: str = "phase2_events.db"):
         self.db_path = db_path
@@ -24,258 +41,40 @@ class SQLiteEventStore(EventStore):
             conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
+    @contextmanager
+    def _transaction(self) -> Iterator[sqlite3.Connection]:
+        """
+        Yield a connection that is committed on success, rolled back on failure,
+        and closed unconditionally.
+
+        `sqlite3.Connection.__exit__` ends the transaction but does not close the
+        connection, so a bare `with self._connect() as conn` leaks it until
+        garbage collection. On the ingestion path that is one leaked file
+        descriptor per stored event, and every lingering reader also blocks WAL
+        checkpointing, so the -wal file grows without bound.
+        """
+        conn = self._connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
     def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_type TEXT NOT NULL,
-                    timestamp REAL NOT NULL,
-                    timestamp_ns INTEGER,
-                    pid INTEGER,
-                    ppid INTEGER,
-                    uid INTEGER,
-                    gid INTEGER,
-                    comm TEXT,
-                    executable TEXT,
-                    parent_comm TEXT,
-                    ancestry_json TEXT NOT NULL DEFAULT '[]',
-                    source TEXT,
-                    version TEXT,
-                    payload_json TEXT NOT NULL,
-                    event_hash TEXT
-                )
-                """
-            )
-            columns = {
-                row[1]
-                for row in conn.execute("PRAGMA table_info(events)").fetchall()
-            }
-            if "ppid" not in columns:
-                conn.execute("ALTER TABLE events ADD COLUMN ppid INTEGER")
-            if "executable" not in columns:
-                conn.execute("ALTER TABLE events ADD COLUMN executable TEXT")
-            if "event_hash" not in columns:
-                conn.execute("ALTER TABLE events ADD COLUMN event_hash TEXT")
-            if "parent_comm" not in columns:
-                conn.execute("ALTER TABLE events ADD COLUMN parent_comm TEXT")
-            if "ancestry_json" not in columns:
-                conn.execute("ALTER TABLE events ADD COLUMN ancestry_json TEXT NOT NULL DEFAULT '[]'")
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_events_event_type ON events(event_type)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp)"
-            )
-            conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_hash ON events(event_hash) WHERE event_hash IS NOT NULL"
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS collector_runtime (
-                    id INTEGER PRIMARY KEY CHECK (id = 1),
-                    status TEXT NOT NULL,
-                    detail TEXT,
-                    error TEXT,
-                    started_at REAL,
-                    stopped_at REAL,
-                    last_event_timestamp REAL,
-                    processed_count INTEGER NOT NULL DEFAULT 0,
-                    malformed_count INTEGER NOT NULL DEFAULT 0,
-                    dropped_event_count INTEGER NOT NULL DEFAULT 0,
-                    duplicate_count INTEGER NOT NULL DEFAULT 0,
-                    throughput REAL NOT NULL DEFAULT 0.0,
-                    updated_at REAL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS event_features (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_type TEXT,
-                    window_start REAL,
-                    window_end REAL,
-                    total_events INTEGER,
-                    unique_commands INTEGER,
-                    unique_uids INTEGER,
-                    command_frequency TEXT,
-                    uid_activity TEXT,
-                    anomaly_score REAL,
-                    created_at REAL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS behavior_baselines (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    baseline_name TEXT,
-                    window_start REAL,
-                    window_end REAL,
-                    normal_count INTEGER,
-                    feature_summary TEXT,
-                    status TEXT,
-                    created_at REAL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS anomaly_scores (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_id INTEGER,
-                    event_type TEXT,
-                    timestamp REAL,
-                    anomaly_score REAL,
-                    score_bucket TEXT,
-                    explanation TEXT,
-                    created_at REAL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS behavior_risks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    window_start REAL NOT NULL,
-                    window_end REAL NOT NULL,
-                    entity_type TEXT NOT NULL,
-                    entity_key TEXT NOT NULL,
-                    anomaly_score REAL NOT NULL,
-                    risk_level TEXT NOT NULL,
-                    contributing_features TEXT NOT NULL,
-                    explanation TEXT NOT NULL,
-                    mode TEXT NOT NULL,
-                    created_at REAL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS detection_findings (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_risk_id INTEGER,
-                    window_start REAL NOT NULL,
-                    window_end REAL NOT NULL,
-                    entity_type TEXT NOT NULL,
-                    entity_key TEXT NOT NULL,
-                    risk_score REAL NOT NULL,
-                    severity TEXT NOT NULL,
-                    behavior_score REAL NOT NULL,
-                    rule_score REAL NOT NULL,
-                    context_score REAL NOT NULL,
-                    evidence_json TEXT NOT NULL,
-                    explanation TEXT NOT NULL,
-                    mode TEXT NOT NULL,
-                    provenance_hash TEXT,
-                    detector_version TEXT,
-                    created_at REAL
-                )
-                """
-            )
-            columns = {
-                row[1]
-                for row in conn.execute("PRAGMA table_info(detection_findings)").fetchall()
-            }
-            if "provenance_hash" not in columns:
-                conn.execute("ALTER TABLE detection_findings ADD COLUMN provenance_hash TEXT")
-            if "detector_version" not in columns:
-                conn.execute("ALTER TABLE detection_findings ADD COLUMN detector_version TEXT")
-            conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_detection_findings_provenance ON detection_findings(provenance_hash) WHERE provenance_hash IS NOT NULL"
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS finding_explanations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    finding_id INTEGER NOT NULL UNIQUE,
-                    explanation_json TEXT NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS policy_decisions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    finding_id INTEGER,
-                    policy_id TEXT NOT NULL,
-                    decision TEXT NOT NULL,
-                    reason TEXT NOT NULL,
-                    risk_score REAL NOT NULL,
-                    severity TEXT NOT NULL,
-                    required_approval INTEGER NOT NULL,
-                    proposed_action TEXT NOT NULL,
-                    limitations_json TEXT NOT NULL,
-                    timestamp REAL NOT NULL,
-                    dry_run INTEGER NOT NULL,
-                    advisory_rejection TEXT
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS assistant_responses (
-                    finding_id INTEGER PRIMARY KEY,
-                    response_json TEXT NOT NULL,
-                    created_at REAL NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS ml_datasets (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    schema_version TEXT NOT NULL,
-                    schema_hash TEXT NOT NULL,
-                    environment_json TEXT NOT NULL,
-                    verification_json TEXT NOT NULL,
-                    created_at REAL NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS ml_training_windows (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    dataset_id TEXT NOT NULL REFERENCES ml_datasets(id),
-                    window_start REAL NOT NULL,
-                    window_end REAL NOT NULL,
-                    event_ids_json TEXT NOT NULL,
-                    features_json TEXT NOT NULL,
-                    schema_version TEXT NOT NULL,
-                    schema_hash TEXT NOT NULL,
-                    collector_context_json TEXT NOT NULL,
-                    verified_normal INTEGER NOT NULL CHECK (verified_normal IN (0, 1)),
-                    verification_json TEXT NOT NULL,
-                    immutable_hash TEXT NOT NULL UNIQUE,
-                    created_at REAL NOT NULL
-                )
-                """
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_ml_training_windows_dataset ON ml_training_windows(dataset_id, id)")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS ml_models (
-                    id TEXT PRIMARY KEY,
-                    version TEXT NOT NULL,
-                    algorithm TEXT NOT NULL,
-                    hyperparameters_json TEXT NOT NULL,
-                    artifact_path TEXT NOT NULL,
-                    artifact_checksum TEXT NOT NULL,
-                    schema_version TEXT NOT NULL,
-                    schema_hash TEXT NOT NULL,
-                    training_window_ids_json TEXT NOT NULL,
-                    runtime_json TEXT NOT NULL,
-                    evaluation_json TEXT NOT NULL,
-                    active INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1)),
-                    created_at REAL NOT NULL
-                )
-                """
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_ml_models_active ON ml_models(active, created_at)")
+        """
+        Bring the database schema up to date.
+
+        Schema definition lives in storage/migrations.py, which records what has
+        been applied so a file can report its own shape and a database written by
+        a newer build is refused rather than written into. See that module for
+        why versioning replaced the in-place `CREATE IF NOT EXISTS` + `ALTER`
+        sequence that used to live here.
+        """
+        conn = self._connect()
+        try:
+            self.schema_version = migrate(conn)
+        finally:
+            conn.close()
 
     def _row_to_event(self, row: sqlite3.Row) -> Event:
         payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
@@ -288,6 +87,7 @@ class SQLiteEventStore(EventStore):
             event_type=EventType(event_type),
             timestamp=float(row["timestamp"]),
             timestamp_ns=row["timestamp_ns"],
+            timestamp_monotonic=row["timestamp_monotonic"],
             pid=row["pid"],
             ppid=row["ppid"],
             uid=row["uid"],
@@ -299,9 +99,34 @@ class SQLiteEventStore(EventStore):
             payload=payload,
             source=row["source"] or "telemetry_bcc",
             version=row["version"] or "1.0",
+            host_id=row["host_id"],
+            boot_id=row["boot_id"],
+            agent_id=row["agent_id"],
         )
 
     def _event_hash(self, event: Event) -> str:
+        """
+        Deduplication key for an event.
+
+        `host_id` is in the material and the other identity fields are not, and
+        the split is the whole point. Two hosts can genuinely produce the same
+        pid, comm, and timestamp; without the host in the key the unique index
+        would treat one as a duplicate of the other and drop a real event from a
+        real machine. So host must be here.
+
+        `boot_id`, `agent_id`, and `timestamp_monotonic` describe the
+        observation session rather than the observed event, and they change
+        every time the agent restarts. Including them would mean re-ingesting
+        the same capture inserts a second copy of every row, which is exactly
+        the restart behaviour `test_subprocess_shutdown_is_clean_and_service_can_restart`
+        pins down. They stay out.
+
+        Note that adding host_id changes the hash of events stored before this
+        column existed. That is correct and harmless: old rows keep their old
+        hashes, the unique index still holds, and re-ingesting a pre-identity
+        capture writes one new row. Silently deduplicating across hosts would be
+        the actual harm.
+        """
         material = {
             "event_type": event.event_type.value,
             "timestamp": float(event.timestamp),
@@ -317,13 +142,14 @@ class SQLiteEventStore(EventStore):
             "payload": event.payload,
             "source": event.source,
             "version": event.version,
+            "host_id": event.host_id,
         }
         encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
     def write(self, event: Event) -> bool:
         if event is None:
-            return
+            return False
 
         try:
             timestamp = float(event.timestamp)
@@ -334,19 +160,21 @@ class SQLiteEventStore(EventStore):
             raise ValueError("event_type is required")
         event_hash = self._event_hash(event)
 
-        with self._connect() as conn:
+        with self._transaction() as conn:
             cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO events (
-                    event_type, timestamp, timestamp_ns, pid, ppid, uid, gid,
+                    event_type, timestamp, timestamp_ns, timestamp_monotonic,
+                    pid, ppid, uid, gid,
                     comm, executable, parent_comm, ancestry_json, source, version,
-                    payload_json, event_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    payload_json, event_hash, host_id, boot_id, agent_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.event_type.value,
                     timestamp,
                     event.timestamp_ns,
+                    event.timestamp_monotonic,
                     event.pid,
                     event.ppid,
                     event.uid,
@@ -359,6 +187,9 @@ class SQLiteEventStore(EventStore):
                     event.version,
                     json.dumps(event.payload, sort_keys=True),
                     event_hash,
+                    event.host_id,
+                    event.boot_id,
+                    event.agent_id,
                 ),
             )
             return cursor.rowcount == 1
@@ -381,7 +212,7 @@ class SQLiteEventStore(EventStore):
             raise ValueError(f"ML dataset missing fields: {', '.join(missing)}")
         if not dataset["verification"].get("verified_normal"):
             raise ValueError("ML dataset must be explicitly verified_normal")
-        with self._connect() as conn:
+        with self._transaction() as conn:
             conn.execute(
                 "INSERT INTO ml_datasets (id, name, schema_version, schema_hash, environment_json, verification_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (dataset["id"], dataset["name"], dataset["schema_version"], dataset["schema_hash"],
@@ -399,7 +230,7 @@ class SQLiteEventStore(EventStore):
             raise ValueError("training windows require explicit verified_normal=True")
         material = {key: window[key] for key in required if key != "created_at"}
         immutable_hash = hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-        with self._connect() as conn:
+        with self._transaction() as conn:
             dataset = conn.execute("SELECT schema_version, schema_hash FROM ml_datasets WHERE id = ?", (window["dataset_id"],)).fetchone()
             if dataset is None:
                 raise ValueError("unknown ML dataset")
@@ -412,7 +243,7 @@ class SQLiteEventStore(EventStore):
             return int(cursor.lastrowid)
 
     def read_ml_training_windows(self, dataset_id: str) -> List[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             rows = conn.execute("SELECT * FROM ml_training_windows WHERE dataset_id = ? ORDER BY window_start, id", (dataset_id,)).fetchall()
         return self._decode_ml_training_windows(rows)
 
@@ -421,7 +252,7 @@ class SQLiteEventStore(EventStore):
         if not window_ids:
             return []
         placeholders = ", ".join("?" for _ in window_ids)
-        with self._connect() as conn:
+        with self._transaction() as conn:
             rows = conn.execute(
                 f"SELECT * FROM ml_training_windows WHERE id IN ({placeholders}) ORDER BY id",
                 [int(window_id) for window_id in window_ids],
@@ -444,7 +275,7 @@ class SQLiteEventStore(EventStore):
         missing = [key for key in required if key not in model]
         if missing:
             raise ValueError(f"ML model missing fields: {', '.join(missing)}")
-        with self._connect() as conn:
+        with self._transaction() as conn:
             if model["active"]:
                 conn.execute("UPDATE ml_models SET active = 0 WHERE active = 1")
             conn.execute(
@@ -454,7 +285,7 @@ class SQLiteEventStore(EventStore):
         return str(model["id"])
 
     def read_ml_model(self, model_id: str) -> Optional[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             row = conn.execute("SELECT * FROM ml_models WHERE id = ?", (model_id,)).fetchone()
         if row is None:
             return None
@@ -465,7 +296,7 @@ class SQLiteEventStore(EventStore):
         return record
 
     def write_feature_record(self, feature_data: Dict[str, Any]) -> None:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             conn.execute(
                 """
                 INSERT INTO event_features (
@@ -489,7 +320,7 @@ class SQLiteEventStore(EventStore):
             )
 
     def write_baseline_record(self, baseline_data: Dict[str, Any]) -> None:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             conn.execute(
                 """
                 INSERT INTO behavior_baselines (
@@ -515,7 +346,7 @@ class SQLiteEventStore(EventStore):
             if not 0.0 <= anomaly_score <= 1.0:
                 raise ValueError("anomaly_score must be between 0 and 1")
 
-        with self._connect() as conn:
+        with self._transaction() as conn:
             conn.execute(
                 """
                 INSERT INTO anomaly_scores (
@@ -535,7 +366,7 @@ class SQLiteEventStore(EventStore):
             )
 
     def read_anomaly_records(self) -> List[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             rows = conn.execute(
                 "SELECT * FROM anomaly_scores ORDER BY id ASC"
             ).fetchall()
@@ -546,7 +377,7 @@ class SQLiteEventStore(EventStore):
         if not 0.0 <= anomaly_score <= 1.0:
             raise ValueError("anomaly_score must be between 0 and 1")
 
-        with self._connect() as conn:
+        with self._transaction() as conn:
             conn.execute(
                 """
                 INSERT INTO behavior_risks (
@@ -570,7 +401,7 @@ class SQLiteEventStore(EventStore):
             )
 
     def read_risk_records(self) -> List[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             rows = conn.execute(
                 "SELECT * FROM behavior_risks ORDER BY window_start ASC, id ASC"
             ).fetchall()
@@ -587,7 +418,7 @@ class SQLiteEventStore(EventStore):
         if any(not 0.0 <= score <= 1.0 for score in scores.values()):
             raise ValueError("detection scores must be between 0 and 1")
 
-        with self._connect() as conn:
+        with self._transaction() as conn:
             provenance_hash = finding.get("provenance_hash")
             if provenance_hash:
                 existing = conn.execute(
@@ -627,7 +458,7 @@ class SQLiteEventStore(EventStore):
             return int(cursor.lastrowid)
 
     def read_detection_findings(self) -> List[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             rows = conn.execute(
                 "SELECT * FROM detection_findings ORDER BY window_start ASC, id ASC"
             ).fetchall()
@@ -639,7 +470,7 @@ class SQLiteEventStore(EventStore):
             return findings
 
     def read_detection_finding(self, finding_id: int) -> Optional[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             row = conn.execute(
                 "SELECT * FROM detection_findings WHERE id = ?",
                 (finding_id,),
@@ -651,7 +482,7 @@ class SQLiteEventStore(EventStore):
             return finding
 
     def write_explanation(self, explanation: Dict[str, Any]) -> None:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             conn.execute(
                 """
                 INSERT INTO finding_explanations (finding_id, explanation_json)
@@ -665,14 +496,14 @@ class SQLiteEventStore(EventStore):
             )
 
     def read_explanations(self) -> List[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             rows = conn.execute(
                 "SELECT explanation_json FROM finding_explanations ORDER BY finding_id ASC"
             ).fetchall()
             return [json.loads(row["explanation_json"]) for row in rows]
 
     def read_explanation(self, finding_id: int) -> Optional[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             row = conn.execute(
                 "SELECT explanation_json FROM finding_explanations WHERE finding_id = ?",
                 (finding_id,),
@@ -680,7 +511,7 @@ class SQLiteEventStore(EventStore):
             return json.loads(row["explanation_json"]) if row else None
 
     def write_policy_decision(self, decision: Dict[str, Any]) -> int:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO policy_decisions (
@@ -707,7 +538,7 @@ class SQLiteEventStore(EventStore):
             return int(cursor.lastrowid)
 
     def read_policy_decisions(self) -> List[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             rows = conn.execute(
                 "SELECT * FROM policy_decisions ORDER BY timestamp ASC, id ASC"
             ).fetchall()
@@ -723,7 +554,7 @@ class SQLiteEventStore(EventStore):
     def write_assistant_response(self, response: Dict[str, Any], created_at: Optional[float] = None) -> None:
         import time
 
-        with self._connect() as conn:
+        with self._transaction() as conn:
             conn.execute(
                 """
                 INSERT INTO assistant_responses (finding_id, response_json, created_at)
@@ -740,7 +571,7 @@ class SQLiteEventStore(EventStore):
             )
 
     def read_assistant_response(self, finding_id: int) -> Optional[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             row = conn.execute(
                 "SELECT response_json FROM assistant_responses WHERE finding_id = ?",
                 (finding_id,),
@@ -748,7 +579,7 @@ class SQLiteEventStore(EventStore):
             return json.loads(row["response_json"]) if row else None
 
     def read_latest_ready_baseline(self, baseline_name: str = "default") -> Optional[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             row = conn.execute(
                 """
                 SELECT * FROM behavior_baselines
@@ -764,16 +595,19 @@ class SQLiteEventStore(EventStore):
             return record
 
     def read_all(self) -> Iterator[Event]:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             rows = conn.execute(
                 "SELECT * FROM events ORDER BY timestamp ASC, id ASC"
             ).fetchall()
-            for row in rows:
-                yield self._row_to_event(row)
+        # Decoded outside the connection scope: rows are already materialised, so
+        # holding the connection open for the consumer's iteration would pin a
+        # descriptor and a WAL read mark for an unbounded time.
+        for row in rows:
+            yield self._row_to_event(row)
 
     def read_event_records(self, limit: int = 100, event_type: Optional[str] = None) -> List[Dict[str, Any]]:
         limit = max(1, min(int(limit), 500))
-        with self._connect() as conn:
+        with self._transaction() as conn:
             if event_type is None:
                 rows = conn.execute(
                     "SELECT * FROM events ORDER BY timestamp DESC, id DESC LIMIT ?",
@@ -797,7 +631,7 @@ class SQLiteEventStore(EventStore):
             return records
 
     def read_event_record(self, event_id: int) -> Optional[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             row = conn.execute(
                 "SELECT * FROM events WHERE id = ?",
                 (event_id,),
@@ -819,6 +653,8 @@ class SQLiteEventStore(EventStore):
         for key, value in filters.items():
             if value is None:
                 continue
+            if key not in self.QUERYABLE_EVENT_COLUMNS:
+                raise ValueError(f"unsupported query column: {key!r}")
             clauses.append(f"{key} = ?")
             values.append(value)
 
@@ -827,13 +663,13 @@ class SQLiteEventStore(EventStore):
             return
 
         sql = "SELECT * FROM events WHERE " + " AND ".join(clauses) + " ORDER BY timestamp ASC"
-        with self._connect() as conn:
+        with self._transaction() as conn:
             rows = conn.execute(sql, values).fetchall()
-            for row in rows:
-                yield self._row_to_event(row)
+        for row in rows:
+            yield self._row_to_event(row)
 
     def get_recent_events(self, limit: int = 100) -> List[Event]:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             rows = conn.execute(
                 "SELECT * FROM events ORDER BY timestamp DESC LIMIT ?",
                 (limit,),
@@ -841,57 +677,75 @@ class SQLiteEventStore(EventStore):
             return [self._row_to_event(row) for row in rows]
 
     def count_events(self) -> int:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             row = conn.execute("SELECT COUNT(*) AS c FROM events").fetchone()
             return int(row["c"])
 
     def latest_event_timestamp(self) -> Optional[float]:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             row = conn.execute("SELECT MAX(timestamp) AS latest FROM events").fetchone()
             return float(row["latest"]) if row["latest"] is not None else None
 
+    # Fields of a health snapshot that reach the database, paired with the value
+    # used when a caller omits one. Declared rather than spelled out inside the
+    # INSERT because the previous fixed column list meant a new health field was
+    # silently unpersisted -- the supervisor would count something the API and
+    # dashboard could never show. `tests/test_live_ingestion.py` asserts every
+    # CollectorHealth field appears here, so adding one without a migration is a
+    # test failure rather than a quiet hole in the record.
+    COLLECTOR_HEALTH_COLUMNS: Dict[str, Any] = {
+        "status": "unknown",
+        "detail": None,
+        "error": None,
+        "started_at": None,
+        "stopped_at": None,
+        "last_event_timestamp": None,
+        "processed_count": 0,
+        "malformed_count": 0,
+        "dropped_event_count": 0,
+        "duplicate_count": 0,
+        "throughput": 0.0,
+        "updated_at": None,
+        "queue_depth": 0,
+        "queue_capacity": 0,
+        "queue_high_water_mark": 0,
+        "backpressure_wait_seconds": 0.0,
+        "backpressure_wait_count": 0,
+        "first_drop_timestamp": None,
+        "last_drop_timestamp": None,
+        "kernel_lost_event_count": 0,
+        "first_kernel_loss_timestamp": None,
+        "last_kernel_loss_timestamp": None,
+    }
+
     def write_collector_health(self, health: Dict[str, Any]) -> None:
-        with self._connect() as conn:
+        columns = list(self.COLLECTOR_HEALTH_COLUMNS)
+        placeholders = ", ".join("?" for _ in columns)
+        assignments = ", ".join(f"{column}=excluded.{column}" for column in columns)
+        # An explicit None on a NOT NULL counter falls back to the default too,
+        # not just a missing key: a partial snapshot must not fail the write that
+        # records why the collector is unhealthy.
+        values = []
+        for column, default in self.COLLECTOR_HEALTH_COLUMNS.items():
+            value = health.get(column, default)
+            values.append(default if value is None else value)
+        with self._transaction() as conn:
             conn.execute(
-                """
-                INSERT INTO collector_runtime (
-                    id, status, detail, error, started_at, stopped_at,
-                    last_event_timestamp, processed_count, malformed_count,
-                    dropped_event_count, duplicate_count, throughput, updated_at
-                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    status=excluded.status, detail=excluded.detail, error=excluded.error,
-                    started_at=excluded.started_at, stopped_at=excluded.stopped_at,
-                    last_event_timestamp=excluded.last_event_timestamp,
-                    processed_count=excluded.processed_count,
-                    malformed_count=excluded.malformed_count,
-                    dropped_event_count=excluded.dropped_event_count,
-                    duplicate_count=excluded.duplicate_count,
-                    throughput=excluded.throughput, updated_at=excluded.updated_at
+                f"""
+                INSERT INTO collector_runtime (id, {", ".join(columns)})
+                VALUES (1, {placeholders})
+                ON CONFLICT(id) DO UPDATE SET {assignments}
                 """,
-                (
-                    health.get("status", "unknown"),
-                    health.get("detail"),
-                    health.get("error"),
-                    health.get("started_at"),
-                    health.get("stopped_at"),
-                    health.get("last_event_timestamp"),
-                    health.get("processed_count", 0),
-                    health.get("malformed_count", 0),
-                    health.get("dropped_event_count", 0),
-                    health.get("duplicate_count", 0),
-                    health.get("throughput", 0.0),
-                    health.get("updated_at"),
-                ),
+                tuple(values),
             )
 
     def read_collector_health(self) -> Optional[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             row = conn.execute("SELECT * FROM collector_runtime WHERE id = 1").fetchone()
             return dict(row) if row else None
 
     def reset(self) -> None:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             conn.execute("DELETE FROM anomaly_scores")
             conn.execute("DELETE FROM behavior_risks")
             conn.execute("DELETE FROM detection_findings")

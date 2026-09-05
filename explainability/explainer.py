@@ -9,7 +9,7 @@ UNAVAILABLE_TELEMETRY = []
 
 class FindingExplainer:
     """
-    Reconstruct deterministic explanations from persisted Phase 4 findings.
+    Reconstruct deterministic explanations from persisted detection findings.
 
     This class is read-only with respect to detection decisions: it does not
     create findings, change scores, evaluate rules, or infer maliciousness.

@@ -5,9 +5,17 @@ import argparse
 import json
 import re
 import subprocess
-import sys
-import time
 from typing import Any, Iterable, Iterator, Optional
+
+# Importable both as a package module and as a sibling file: this collector is
+# run as `python3 telemetry/journald/auth_session_monitor.py`, where the
+# repository root is not on sys.path.
+try:
+    from telemetry.journald.journal_stream import add_stream_arguments, run_collector
+except ImportError:
+    from journal_stream import add_stream_arguments, run_collector
+
+COLLECTOR_NAME = "auth"
 
 
 _PAM_SESSION = re.compile(
@@ -78,6 +86,15 @@ def parse_journal_json(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
 
 
 def read_journal(since: str) -> Iterator[dict[str, Any]]:
+    """
+    One-shot query over a fixed window.
+
+    Retained for scripted and ad-hoc use, not for live collection: it buffers the
+    whole result and cannot resume. The supervised path is `run_collector`, which
+    streams and persists a cursor. `tests/test_journal_stream.py` pins that both
+    paths derive the same events from the same journalctl output, so this cannot
+    drift away from the live behaviour it mirrors.
+    """
     command = ["journalctl", "--no-pager", "--output=json", "--since", since]
     result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=15)
     if result.returncode != 0:
@@ -87,17 +104,9 @@ def read_journal(since: str) -> Iterator[dict[str, Any]]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Read-only PAM/session telemetry from journald.")
-    parser.add_argument("--since", default="10 minutes ago", help="journald --since expression")
+    add_stream_arguments(parser)
     args = parser.parse_args()
-    print(json.dumps({"event_type": "telemetry_startup", "message": "journald authentication query starting", "timestamp": time.time()}), flush=True)
-    try:
-        for event in read_journal(args.since):
-            print(json.dumps(event, sort_keys=True), flush=True)
-    except (OSError, subprocess.TimeoutExpired, RuntimeError) as error:
-        print(json.dumps({"event_type": "telemetry_warning", "message": f"journald authentication query failed: {error}", "timestamp": time.time()}), flush=True)
-        return 1
-    print(json.dumps({"event_type": "telemetry_shutdown", "message": "journald authentication query finished", "timestamp": time.time()}), flush=True)
-    return 0
+    return run_collector(COLLECTOR_NAME, normalize_journal_record, args)
 
 
 if __name__ == "__main__":

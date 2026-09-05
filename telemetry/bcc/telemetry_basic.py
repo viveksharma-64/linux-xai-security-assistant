@@ -1,4 +1,4 @@
-#\!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 telemetry_basic.py - Minimal eBPF post-exec tracepoint collector
 
@@ -18,6 +18,11 @@ try:
     from telemetry.bcc.process_context import read_process_context
 except ImportError:
     from process_context import read_process_context
+
+try:
+    from telemetry.bcc.perf_loss import PerfBufferLossReporter
+except ImportError:
+    from perf_loss import PerfBufferLossReporter
 
 try:
     from bcc import BPF
@@ -98,7 +103,12 @@ def handle_exec_event(cpu, data, size):
     }
     print(json.dumps(event), flush=True)
 
-b["exec_events"].open_perf_buffer(handle_exec_event)
+# Shared by every per-CPU registration bcc makes, so the count it reports is
+# process-wide rather than one total per CPU. lost_cb is what makes a kernel
+# ring-buffer overrun visible: without it the samples the kernel discards leave a
+# hole in this stream that no counter anywhere records.
+loss_reporter = PerfBufferLossReporter(buffer_name="exec_events", source="telemetry_bcc")
+b["exec_events"].open_perf_buffer(handle_exec_event, lost_cb=loss_reporter)
 
 health_count = 0
 try:
@@ -115,8 +125,16 @@ try:
                     "mem_available_mb": mem.available // (1024*1024),
                 }), flush=True)
                 health_count = 0
-            except:
+            # Health reporting is best-effort and must never take the collector
+            # down: psutil.Error, OSError on a closed/broken stdout, and encoding
+            # failures are all swallowed here. Narrowed from a bare `except:` so
+            # a Ctrl+C landing inside this block still reaches the
+            # KeyboardInterrupt handler below, which flushes the loss reporter.
+            except Exception:
                 pass
 except KeyboardInterrupt:
+    # Flushed before the shutdown notice so a loss burst inside the last
+    # reporting window is still reported rather than lost with the process.
+    loss_reporter.flush()
     print(json.dumps({"event_type": "telemetry_shutdown", "timestamp": time.time()}), file=sys.stderr)
     sys.exit(0)

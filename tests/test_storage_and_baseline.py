@@ -20,7 +20,7 @@ def _sample_event(event_type="process_exec", **extra):
 
 
 def test_sqlite_event_store_round_trip(tmp_path):
-    db_path = tmp_path / "phase2.db"
+    db_path = tmp_path / "events.db"
     store = SQLiteEventStore(str(db_path))
 
     event = Event.from_raw_json(_sample_event())
@@ -160,7 +160,7 @@ def test_capture_filter_excludes_stale_and_auditctl_records():
 
 
 def test_canonical_provenance_and_optional_process_context_round_trip(tmp_path):
-    store = SQLiteEventStore(str(tmp_path / "phase2.db"))
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
     event = Event.from_raw_json({
         **_sample_event(),
         "ppid": 42,
@@ -179,7 +179,7 @@ def test_canonical_provenance_and_optional_process_context_round_trip(tmp_path):
 
 
 def test_sqlite_store_skips_malformed_events(tmp_path):
-    db_path = tmp_path / "phase2.db"
+    db_path = tmp_path / "events.db"
     store = SQLiteEventStore(str(db_path))
 
     malformed = {"event_type": "process_exec", "timestamp": "bad", "uid": 1000}
@@ -255,7 +255,7 @@ def test_abnormal_burst_score_increases_with_peak_activity():
 
 
 def test_stored_anomaly_explanation_matches_scored_features(tmp_path):
-    store = SQLiteEventStore(str(tmp_path / "phase2.db"))
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
     baseline = BehavioralBaseline(minimum_samples=1)
     samples = [_sample_event(timestamp=1700000000.0, comm="bash")]
     summary = baseline.feature_summary([baseline._normalize_event(item) for item in samples])
@@ -268,7 +268,7 @@ def test_stored_anomaly_explanation_matches_scored_features(tmp_path):
 
 
 def test_sqlite_rejects_out_of_range_anomaly_scores(tmp_path):
-    store = SQLiteEventStore(str(tmp_path / "phase2.db"))
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
     try:
         store.write_anomaly_record({"anomaly_score": 1.1})
     except ValueError:

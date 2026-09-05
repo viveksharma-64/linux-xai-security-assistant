@@ -16,7 +16,7 @@ DEFAULT_POLICY = ROOT / "policy" / "default_policy.yaml"
 
 
 def _setup(tmp_path):
-    store = SQLiteEventStore(str(tmp_path / "phase8.db"))
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
     event = Event.from_raw_json({
         "event_type": "process_exec",
         "timestamp": 1000.0,

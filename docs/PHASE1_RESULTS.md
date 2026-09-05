@@ -148,7 +148,15 @@ telemetry/bcc/
 ├── telemetry_simple.py          [BACKUP] Tracepoint version
 ├── telemetry_collector.py       [FUTURE] Extended version
 └── process_exec_probe.py        [REFERENCE] Original PoC
+```
 
+> **Superseded.** The status markers above are the historical Phase 1 view.
+> `telemetry_simple.py`, `telemetry_collector.py`, and `process_exec_probe.py`
+> are now marked `DEPRECATED / LEGACY` in their module docstrings and are kept
+> for historical reference only. `telemetry_basic.py` remains the current
+> process collector. See AGENTS.md for the authoritative list.
+
+```
 pipeline/
 └── event_stream.py              [INTERFACE] Canonical event format + normalizer
 

@@ -1,6 +1,13 @@
-#\!/usr/bin/env python3
+#!/usr/bin/env python3
 """
-telemetry_collector.py - Phase 1 Telemetry PoC
+telemetry_collector.py - Full-featured telemetry PoC
+
+DEPRECATED / LEGACY: superseded by the per-domain collectors
+(telemetry/bcc/telemetry_basic.py, network_state_probe.py, ipc_pipe_probe.py).
+Retained as a historical proof of concept only. It is not wired to the
+ingestion pipeline, is not covered by the regression suite, and is not
+perf-buffer-loss reported. Do not use it for live telemetry and do not build
+on it.
 
 Extended version of process_exec_probe.py with:
 - Process execution events

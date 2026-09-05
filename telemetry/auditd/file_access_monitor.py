@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Minimal file-access telemetry for Phase 1.
+Minimal file-access telemetry.
 
 Priority:
 1. auditd (preferred if the environment is root-capable and auditd is usable)

@@ -18,7 +18,7 @@ def _event(timestamp, comm="bash", uid=1000, pid=1):
 
 
 def _finding(tmp_path, multi_rule=True):
-    store = SQLiteEventStore(str(tmp_path / "phase5.db"))
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
     engine = DetectionEngine(store)
     features = {
         "execution_frequency": 12 if multi_rule else 1,
@@ -50,13 +50,13 @@ def _finding(tmp_path, multi_rule=True):
 
 
 def test_no_detection_produces_no_explanation(tmp_path):
-    store = SQLiteEventStore(str(tmp_path / "phase5.db"))
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
     assert FindingExplainer(store).explain_all() == []
     assert store.read_explanations() == []
 
 
 def test_insufficient_baseline_produces_no_detection_or_explanation(tmp_path):
-    store = SQLiteEventStore(str(tmp_path / "phase5.db"))
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
     analyzer = BehaviorAnalyzer(store, minimum_normal_execs=500)
     learning = analyzer.learn_normal([_event(1000, "bash")], verified_normal=True)
     assert learning["status"] == "insufficient_normal_data"
@@ -91,7 +91,7 @@ def test_multi_rule_high_critical_explanation_reconstructs_fusion(tmp_path):
 
 
 def test_explanation_rejects_incomplete_evidence(tmp_path):
-    store = SQLiteEventStore(str(tmp_path / "phase5.db"))
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
     explainer = FindingExplainer(store)
     finding = {
         "id": 1,

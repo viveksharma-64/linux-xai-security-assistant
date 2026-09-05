@@ -1,6 +1,11 @@
-#\!/usr/bin/env python3
+#!/usr/bin/env python3
 """
-telemetry_simple.py - Ultra-simplified Phase 1 PoC
+telemetry_simple.py - Ultra-simplified PoC
+
+DEPRECATED / LEGACY: superseded by telemetry/bcc/telemetry_basic.py. Retained
+as a historical proof of concept only. It is not wired to the ingestion
+pipeline, is not covered by the regression suite, and is not perf-buffer-loss
+reported. Do not use it for live telemetry and do not build on it.
 
 Uses only basic tracepoints, no complex kernel struct includes.
 Captures: process execution, system calls, basic context.

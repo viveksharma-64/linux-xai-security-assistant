@@ -57,6 +57,10 @@ to trigger events, and confirm lines print. Ctrl+C to stop.
 
 ### 5. Run the real Phase 1 PoC (BCC)
 
+> **Superseded.** `process_exec_probe.py` is now marked `DEPRECATED / LEGACY`
+> and is kept for historical reference only. For live telemetry use
+> `sudo python3 telemetry/bcc/telemetry_basic.py` instead — see README.md.
+
 ```bash
 sudo python3 telemetry/bcc/process_exec_probe.py
 ```

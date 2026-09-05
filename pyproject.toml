@@ -1,0 +1,129 @@
+#
+# Packaging and tooling configuration for the Linux XAI Security Assistant.
+#
+# Versioning scheme
+# -----------------
+#   0.9.x  Feature-complete demonstrator undergoing production hardening.
+#   1.0.0  Reserved for the completion of the production roadmap (through the
+#          analyst-experience phase): supervised ingestion with no silent event
+#          loss, migrated schema, authenticated API, measured detection efficacy.
+#
+# Installation
+# ------------
+#   python3 -m venv .venv && . .venv/bin/activate
+#   pip install -e '.[dev]'
+#
+# BCC/eBPF is deliberately NOT a declared dependency. The Python binding must
+# match the running kernel and libbcc, so it is installed from Kali packages:
+#   sudo apt install -y bpfcc-tools python3-bpfcc libbpfcc libbpfcc-dev
+# See README.md and scripts/verify_environment.sh.
+#
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "linux-xai-security-assistant"
+version = "0.9.0"
+description = "Explainable, read-only Linux kernel-level intrusion and behavioral threat detection"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Vivek Kumar Sharma" }]
+keywords = [
+    "security",
+    "ebpf",
+    "linux",
+    "intrusion-detection",
+    "explainable-ai",
+    "threat-detection",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Security",
+    "Topic :: System :: Monitoring",
+]
+
+# Runtime API, policy, and ML dependencies. Kept in lockstep with
+# requirements.txt, which remains the supported non-editable install path.
+dependencies = [
+    "fastapi>=0.135,<0.136",
+    "uvicorn>=0.38,<0.39",
+    "pydantic>=2.13,<3",
+    "PyYAML>=6.0,<7",
+    "psutil>=7.1,<8",
+    "numpy>=2.4,<3",
+    "scikit-learn>=1.9,<2",
+]
+
+[project.optional-dependencies]
+# Test runner for the regression suite. Kept deliberately small: every addition
+# here is a dependency an offline Kali host must be able to satisfy.
+dev = ["pytest>=9.1,<10"]
+
+[project.urls]
+Homepage = "https://github.com/vivek-kumar-sharma/linux-xai-security-assistant"
+
+[project.scripts]
+# Read-only API and dashboard host. Refuses non-loopback binds unless
+# ALLOW_NON_LOOPBACK_API=1 is set explicitly; see api/__main__.py.
+linux-xai-api = "api.__main__:main"
+# Supervised bounded ingestion service.
+linux-xai-ingest = "pipeline.live_ingestion:main"
+
+[tool.setuptools]
+# Explicit package list. Auto-discovery is not used because the repository root
+# also holds non-package directories (docs, scripts, tests, dashboard, ml/models).
+packages = [
+    "api",
+    "assistant",
+    "baseline",
+    "detection",
+    "explainability",
+    "ml",
+    "observability",
+    "pipeline",
+    "policy",
+    "storage",
+    "telemetry",
+    "telemetry.auditd",
+    "telemetry.bcc",
+    "telemetry.journald",
+]
+
+[tool.setuptools.package-data]
+policy = ["*.yaml"]
+
+[tool.pytest.ini_options]
+# `pythonpath` removes the previously load-bearing requirement to invoke the
+# suite as `PYTHONPATH=. python3 -m pytest`. Bare `pytest` now works, which is
+# what CI and new contributors will reach for first.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "--strict-markers --strict-config"
+filterwarnings = [
+    # Show everything by default. Python silences ResourceWarning out of the box;
+    # un-silencing it is what surfaced ~113 unclosed SQLite connections in
+    # storage/sqlite_store.py and the leaked collector pipes in
+    # pipeline/live_ingestion.py. Later entries take precedence.
+    #
+    # Deliberately NOT "error::ResourceWarning": ResourceWarning is raised during
+    # finalization, so the exception cannot propagate and pytest never fails on
+    # it -- Python just prints "Exception ignored while finalizing". Leaks are
+    # enforced instead by tests/test_resource_lifetime.py, which counts open file
+    # descriptors directly and does not depend on GC timing.
+    "default",
+    # BCC's ctypes Structures trigger an implicit-_layout_ deprecation on
+    # Python 3.14. It originates in /usr/lib/python3/dist-packages/bcc and is
+    # not actionable from this repository.
+    "ignore:Due to '_pack_'.*:DeprecationWarning",
+]

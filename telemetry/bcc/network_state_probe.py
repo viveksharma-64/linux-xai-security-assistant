@@ -7,6 +7,14 @@ import sys
 import time
 from typing import Any, Optional
 
+# Importable both as a package module and as a sibling file: the documented way
+# to run this collector is `python3 telemetry/bcc/network_state_probe.py`, where
+# the repository root is not on sys.path.
+try:
+    from telemetry.bcc.perf_loss import PerfBufferLossReporter
+except ImportError:
+    from perf_loss import PerfBufferLossReporter
+
 try:
     from bcc import BPF
 except ImportError:
@@ -122,6 +130,14 @@ def handle_state_event(cpu, data, size):
         print(json.dumps(normalized), flush=True)
 
 
+# Module level, and shared by every per-CPU registration bcc makes, so the count
+# it reports is process-wide rather than one total per CPU.
+loss_reporter = PerfBufferLossReporter(
+    buffer_name="state_events",
+    source="telemetry_bcc_network_state",
+)
+
+
 def main():
     global b
     print(json.dumps({
@@ -131,7 +147,10 @@ def main():
     }), file=sys.stderr)
     try:
         b = BPF(text=BPF_PROGRAM)
-        b["state_events"].open_perf_buffer(handle_state_event)
+        # lost_cb is what makes a kernel ring-buffer overrun visible. Without it
+        # the samples the kernel discards leave a hole in this stream that no
+        # counter anywhere records. See telemetry/bcc/perf_loss.py.
+        b["state_events"].open_perf_buffer(handle_state_event, lost_cb=loss_reporter)
     except Exception as error:
         print(json.dumps({
             "event_type": "telemetry_error",
@@ -144,6 +163,9 @@ def main():
         while True:
             b.perf_buffer_poll()
     except KeyboardInterrupt:
+        # Flushed before the shutdown notice so a loss burst inside the last
+        # reporting window is still reported rather than lost with the process.
+        loss_reporter.flush()
         print(json.dumps({
             "event_type": "telemetry_shutdown",
             "message": "stopped by user",

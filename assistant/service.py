@@ -43,7 +43,7 @@ class AssistantInputError(ValueError):
 
 class AssistantService:
     """
-    Evidence-grounded analyst/narrator over Phase 5 explanations.
+    Evidence-grounded analyst/narrator over detection explanations.
 
     The provider is untrusted output. Authoritative identity, score, severity,
     evidence, limitations, and detection meaning remain controlled locally.
@@ -115,6 +115,11 @@ UNTRUSTED STRUCTURED EVIDENCE ENDS.
             for item in explanation["contributing_factors"]
             if item.get("label") == "FACT"
         ]
+        limitations = explanation.get("limitations") or []
+        if isinstance(limitation_list := limitations, list) and limitation_list:
+            limitations_text = " ".join(str(item) for item in limitation_list if item)
+        else:
+            limitations_text = "TCP/network, file, and audit/auth telemetry are unavailable."
         fallback = {
             "finding_id": explanation["finding_id"],
             "severity": explanation["severity"],
@@ -128,7 +133,7 @@ UNTRUSTED STRUCTURED EVIDENCE ENDS.
                 "This fallback does not independently determine maliciousness."
             ),
             "recommended_action": "Review the process tree, command history, and relevant host context.",
-            "limitations": " ".join(explanation["limitations"]),
+            "limitations": limitations_text,
             "confidence_statement": "Confidence is limited to the supplied deterministic evidence.",
             "provider": provider,
             "fallback_used": True,
@@ -167,7 +172,7 @@ UNTRUSTED STRUCTURED EVIDENCE ENDS.
         return response
 
     def generate(self, explanation: Dict[str, Any]) -> Dict[str, Any]:
-        """Narrate one validated Phase 5 explanation, falling back safely on failure."""
+        """Narrate one validated detection explanation, falling back safely on failure."""
         self._validate_explanation(explanation)
         finding_id = explanation["finding_id"]
         request_id = str(uuid.uuid4())
