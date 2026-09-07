@@ -142,6 +142,18 @@ class FindingResponse(StrictModel):
     provenance_hash: Optional[str] = None
     detector_version: Optional[str] = None
     created_at: Optional[float] = None
+    # Correlation/suppression disposition (migration 8). Suppression is a
+    # disposition only -- it never alters a score; a suppressed finding is still
+    # persisted, explained, and chained.
+    correlation_id: Optional[str] = None
+    suppressed: bool = False
+    suppression_reason: Optional[str] = None
+    # Append-only evidence-chain integrity (migration 8). Surfaced so an API
+    # consumer can independently verify continuity; Optional so a pre-chain
+    # legacy row still serializes rather than 500-ing the read API.
+    chain_seq: Optional[int] = None
+    chain_prev_hash: Optional[str] = None
+    chain_hash: Optional[str] = None
 
 
 class ExplanationResponse(StrictModel):
@@ -190,6 +202,11 @@ class PolicyDecisionResponse(StrictModel):
     timestamp: float
     dry_run: bool
     advisory_rejection: Optional[str] = None
+    # Append-only evidence-chain integrity (migration 8), Optional for the same
+    # reason as FindingResponse: a pre-chain legacy row still serializes.
+    chain_seq: Optional[int] = None
+    chain_prev_hash: Optional[str] = None
+    chain_hash: Optional[str] = None
 
 
 class LivenessResponse(StrictModel):

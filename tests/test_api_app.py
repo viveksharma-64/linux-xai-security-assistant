@@ -70,14 +70,25 @@ def test_event_detection_explanation_and_policy_retrieval(tmp_path):
     store, explanation = _setup(tmp_path)
     client = TestClient(create_app(store))
     assert client.get("/api/events").json()[0]["event_type"] == "process_exec"
-    assert client.get("/api/detections").json()[0]["id"] == 1
+    detection = client.get("/api/detections").json()[0]
+    assert detection["id"] == 1
+    # The read-only evidence API surfaces the D4 disposition and the D5
+    # append-only chain (migration 8), not just the score. Genesis link:
+    # seq 0, all-zero prev hash, a 64-hex chain hash; suppression defaults off.
+    assert detection["suppressed"] is False
+    assert detection["correlation_id"]
+    assert detection["chain_seq"] == 0
+    assert detection["chain_prev_hash"] == "0" * 64
+    assert len(detection["chain_hash"]) == 64
     assert client.get("/api/detections/1").json()["risk_score"] == 0.5775
     assert client.get("/api/explanations/1").json()["finding_id"] == explanation["finding_id"]
     assistant = client.get("/api/assistant/1").json()
     assert assistant["status"] == "persisted"
     assert assistant["response"]["finding_id"] == 1
     assert client.get("/api/policies").json()
-    assert client.get("/api/policy-decisions").json()[0]["finding_id"] == 1
+    decision = client.get("/api/policy-decisions").json()[0]
+    assert decision["finding_id"] == 1
+    assert len(decision["chain_hash"]) == 64  # policy chain is surfaced too
 
 
 def test_telemetry_status_reports_all_live_verified_sources(tmp_path):

@@ -1,8 +1,15 @@
 from detection.detector import DetectionEngine
-from detection.rules import ExecutionBurstRule, SuspiciousUtilityActivityRule
+from detection.rules import load_rules
 from baseline.behavior_analyzer import BehaviorAnalyzer
 from pipeline.event_stream import Event
 from storage.sqlite_store import SQLiteEventStore
+
+
+def _rule(rule_id):
+    for rule in load_rules():
+        if rule.rule_id == rule_id:
+            return rule
+    raise AssertionError(f"rule {rule_id} is not bound by the default catalog")
 
 
 def _event(timestamp, comm="bash", uid=1000, pid=1):
@@ -46,8 +53,8 @@ def test_rules_are_independently_testable():
         "features": _risk()["contributing_features"],
         "events": [_event(1000, comm="nc", uid=1000)],
     }
-    utility = SuspiciousUtilityActivityRule().evaluate(context)
-    burst = ExecutionBurstRule().evaluate(context)
+    utility = _rule("suspicious_utility_activity").evaluate(context)
+    burst = _rule("execution_burst").evaluate(context)
     assert utility.matched is True
     assert utility.score == 0.65
     assert burst.matched is True

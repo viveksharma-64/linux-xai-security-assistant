@@ -11,6 +11,12 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from pipeline.event_stream import CanonicalNormalizer, Event, EventStore
+from storage.evidence_chain import (
+    FINDING_CHAIN_COLUMNS,
+    POLICY_CHAIN_COLUMNS,
+    next_link,
+    verify_chain,
+)
 from storage.migrations import migrate
 
 
@@ -112,6 +118,13 @@ class SQLiteEventStore(EventStore):
         self._local = threading.local()
         self._connections: "set[sqlite3.Connection]" = set()
         self._connections_lock = threading.Lock()
+        # Serialises chain extension across writer threads. The chain fold reads
+        # MAX(chain_seq) and inserts the successor; two concurrent finding writes
+        # must not read the same head and fork the sequence. Held around the
+        # whole transaction so the COMMIT lands before the next writer reads the
+        # head. The partial UNIQUE index on chain_seq is the backstop: even a
+        # missed lock turns a fork into a constraint error, never a silent split.
+        self._chain_lock = threading.Lock()
         self._closed = False
         self._init_db()
         self._apply_file_mode()
@@ -174,6 +187,38 @@ class SQLiteEventStore(EventStore):
         conn = self._connect()
         with conn:
             yield conn
+
+    def _extend_chain(
+        self,
+        conn: sqlite3.Connection,
+        table: str,
+        columns: Sequence[str],
+        row_id: int,
+    ) -> None:
+        """
+        Append the just-inserted row `row_id` to `table`'s hash chain.
+
+        Reads the current chain head, folds the *stored* row (re-read from the
+        table, so any SQLite type-affinity round-trip is already applied and the
+        bytes match what the migration backfill would hash), and writes the three
+        `chain_*` columns back. Must be called inside the same transaction as the
+        INSERT and under `self._chain_lock`, so the head read and the successor
+        write are atomic against other writers.
+        """
+        head = conn.execute(
+            f"SELECT chain_seq, chain_hash FROM {table} "
+            "WHERE chain_seq IS NOT NULL ORDER BY chain_seq DESC LIMIT 1"
+        ).fetchone()
+        prev_seq = head["chain_seq"] if head is not None else None
+        prev_hash = head["chain_hash"] if head is not None else None
+        stored = dict(
+            conn.execute(f"SELECT * FROM {table} WHERE id = ?", (row_id,)).fetchone()
+        )
+        link = next_link(prev_seq, prev_hash, columns, stored)
+        conn.execute(
+            f"UPDATE {table} SET chain_seq = ?, chain_prev_hash = ?, chain_hash = ? WHERE id = ?",
+            (link["chain_seq"], link["chain_prev_hash"], link["chain_hash"], row_id),
+        )
 
     def close(self) -> None:
         """
@@ -698,44 +743,56 @@ class SQLiteEventStore(EventStore):
         if any(not 0.0 <= score <= 1.0 for score in scores.values()):
             raise ValueError("detection scores must be between 0 and 1")
 
-        with self._transaction() as conn:
-            provenance_hash = finding.get("provenance_hash")
-            if provenance_hash:
-                existing = conn.execute(
-                    "SELECT id FROM detection_findings WHERE provenance_hash = ?",
-                    (provenance_hash,),
-                ).fetchone()
-                if existing is not None:
-                    return int(existing["id"])
-            cursor = conn.execute(
-                """
-                INSERT INTO detection_findings (
-                    source_risk_id, window_start, window_end, entity_type,
-                    entity_key, risk_score, severity, behavior_score,
-                    rule_score, context_score, evidence_json, explanation,
-                    mode, provenance_hash, detector_version, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    finding.get("source_risk_id"),
-                    float(finding["window_start"]),
-                    float(finding["window_end"]),
-                    finding["entity_type"],
-                    str(finding["entity_key"]),
-                    scores["risk_score"],
-                    finding["severity"],
-                    scores["behavior_score"],
-                    scores["rule_score"],
-                    scores["context_score"],
-                    json.dumps(finding["evidence"], sort_keys=True),
-                    finding["explanation"],
-                    finding["mode"],
-                    provenance_hash,
-                    finding.get("detector_version"),
-                    finding.get("created_at"),
-                ),
-            )
-            return int(cursor.lastrowid)
+        # The chain lock spans dedup, insert, and chain extension so two writer
+        # threads cannot read the same chain head and fork the sequence. A dedup
+        # hit returns without touching the chain: the finding is already a link.
+        with self._chain_lock:
+            with self._transaction() as conn:
+                provenance_hash = finding.get("provenance_hash")
+                if provenance_hash:
+                    existing = conn.execute(
+                        "SELECT id FROM detection_findings WHERE provenance_hash = ?",
+                        (provenance_hash,),
+                    ).fetchone()
+                    if existing is not None:
+                        return int(existing["id"])
+                cursor = conn.execute(
+                    """
+                    INSERT INTO detection_findings (
+                        source_risk_id, window_start, window_end, entity_type,
+                        entity_key, risk_score, severity, behavior_score,
+                        rule_score, context_score, evidence_json, explanation,
+                        mode, provenance_hash, detector_version,
+                        correlation_id, suppressed, suppression_reason, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        finding.get("source_risk_id"),
+                        float(finding["window_start"]),
+                        float(finding["window_end"]),
+                        finding["entity_type"],
+                        str(finding["entity_key"]),
+                        scores["risk_score"],
+                        finding["severity"],
+                        scores["behavior_score"],
+                        scores["rule_score"],
+                        scores["context_score"],
+                        json.dumps(finding["evidence"], sort_keys=True),
+                        finding["explanation"],
+                        finding["mode"],
+                        provenance_hash,
+                        finding.get("detector_version"),
+                        finding.get("correlation_id"),
+                        int(bool(finding.get("suppressed", False))),
+                        finding.get("suppression_reason"),
+                        finding.get("created_at"),
+                    ),
+                )
+                finding_id = int(cursor.lastrowid)
+                self._extend_chain(
+                    conn, "detection_findings", FINDING_CHAIN_COLUMNS, finding_id
+                )
+                return finding_id
 
     def read_detection_findings(self) -> List[Dict[str, Any]]:
         with self._transaction() as conn:
@@ -746,6 +803,8 @@ class SQLiteEventStore(EventStore):
             for row in rows:
                 finding = dict(row)
                 finding["evidence"] = json.loads(finding.pop("evidence_json"))
+                if "suppressed" in finding:
+                    finding["suppressed"] = bool(finding["suppressed"])
                 findings.append(finding)
             return findings
 
@@ -759,6 +818,8 @@ class SQLiteEventStore(EventStore):
                 return None
             finding = dict(row)
             finding["evidence"] = json.loads(finding.pop("evidence_json"))
+            if "suppressed" in finding:
+                finding["suppressed"] = bool(finding["suppressed"])
             return finding
 
     def write_explanation(self, explanation: Dict[str, Any]) -> None:
@@ -791,31 +852,39 @@ class SQLiteEventStore(EventStore):
             return json.loads(row["explanation_json"]) if row else None
 
     def write_policy_decision(self, decision: Dict[str, Any]) -> int:
-        with self._transaction() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO policy_decisions (
-                    finding_id, policy_id, decision, reason, risk_score,
-                    severity, required_approval, proposed_action,
-                    limitations_json, timestamp, dry_run, advisory_rejection
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    decision.get("finding_id"),
-                    decision["policy_id"],
-                    decision["decision"],
-                    decision["reason"],
-                    float(decision["risk_score"]),
-                    decision["severity"],
-                    int(bool(decision["required_approval"])),
-                    decision["proposed_action"],
-                    json.dumps(decision["limitations"], sort_keys=True),
-                    float(decision["timestamp"]),
-                    int(bool(decision["dry_run"])),
-                    decision.get("advisory_rejection"),
-                ),
-            )
-            return int(cursor.lastrowid)
+        # policy_decisions is append-only (no dedup), so every insert extends the
+        # chain. Same lock discipline as findings: head read and successor write
+        # are atomic against concurrent writers.
+        with self._chain_lock:
+            with self._transaction() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO policy_decisions (
+                        finding_id, policy_id, decision, reason, risk_score,
+                        severity, required_approval, proposed_action,
+                        limitations_json, timestamp, dry_run, advisory_rejection
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        decision.get("finding_id"),
+                        decision["policy_id"],
+                        decision["decision"],
+                        decision["reason"],
+                        float(decision["risk_score"]),
+                        decision["severity"],
+                        int(bool(decision["required_approval"])),
+                        decision["proposed_action"],
+                        json.dumps(decision["limitations"], sort_keys=True),
+                        float(decision["timestamp"]),
+                        int(bool(decision["dry_run"])),
+                        decision.get("advisory_rejection"),
+                    ),
+                )
+                decision_id = int(cursor.lastrowid)
+                self._extend_chain(
+                    conn, "policy_decisions", POLICY_CHAIN_COLUMNS, decision_id
+                )
+                return decision_id
 
     def read_policy_decisions(self) -> List[Dict[str, Any]]:
         with self._transaction() as conn:
@@ -830,6 +899,42 @@ class SQLiteEventStore(EventStore):
                 decision["limitations"] = json.loads(decision.pop("limitations_json"))
                 decisions.append(decision)
             return decisions
+
+    def verify_findings_chain(self) -> Dict[str, Any]:
+        """
+        Recompute the detection_findings hash chain from on-disk columns.
+
+        Returns the `verify_chain` verdict (`ok`, `checked`, `break_seq`,
+        `reason`). Reads every row ordered by `chain_seq` and re-folds it, so a
+        mutated, reordered, deleted, or inserted historical row is detected. This
+        is the read-side counterpart to the append-only writer and mutates
+        nothing. A fresh row read here carries the same stored values the writer
+        hashed, so a well-formed chain always verifies.
+        """
+        with self._transaction() as conn:
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM detection_findings ORDER BY chain_seq ASC, id ASC"
+                ).fetchall()
+            ]
+        return verify_chain(FINDING_CHAIN_COLUMNS, rows)
+
+    def verify_policy_chain(self) -> Dict[str, Any]:
+        """
+        Recompute the policy_decisions hash chain from on-disk columns.
+
+        Same contract as `verify_findings_chain`, over the append-only policy
+        decision log.
+        """
+        with self._transaction() as conn:
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM policy_decisions ORDER BY chain_seq ASC, id ASC"
+                ).fetchall()
+            ]
+        return verify_chain(POLICY_CHAIN_COLUMNS, rows)
 
     def write_assistant_response(self, response: Dict[str, Any], created_at: Optional[float] = None) -> None:
         import time

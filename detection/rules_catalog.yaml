@@ -1,0 +1,97 @@
+# Externalized detection rule catalog.
+#
+# One entry per rule. Loaded by detection/rules.py:load_rules(); the bundled copy
+# beside that module is the default. This catalog is the single source of a
+# rule's calibration -- score, behavioural gate, thresholds, allowlists -- and of
+# its MITRE ATT&CK mapping. Nothing about a rule is hardcoded in Python.
+#
+# Every entry carries a per-rule `version` that MUST be bumped whenever the
+# rule's matching semantics, score, or tunables change, so a persisted finding's
+# rule evidence is traceable to the exact definition that produced it. Changing a
+# `score` or threshold changes measured detection efficacy
+# (docs/DETECTION_EFFICACY.md): treat it as a calibration change and re-run
+# scripts/run_efficacy.py, not as a casual config tweak.
+#
+# Integrity is enforced two ways: detection/rules.py:load_catalog() fails closed
+# on a malformed or inconsistent catalog, and tests/test_rule_catalog.py pins the
+# contract (every rule versioned, ATT&CK-mapped with a rationale, ids unique, and
+# the loader binds every enabled entry).
+
+version: 1  # catalog schema version (not a rule version)
+
+rules:
+  - rule_id: privileged_unusual_execution
+    version: 1
+    enabled: true
+    score: 0.80
+    behavior_gate: 0.45
+    safe_commands: [sudo, systemd, "(systemd-hostn)", sshd, login]
+    mitre:
+      tactic: "TA0002 Execution"
+      technique: "T1059 Command and Scripting Interpreter"
+    mapping_rationale: >-
+      Fires when a UID 0 process runs a command outside the conservative system
+      allowlist while the window also carries a behavioural deviation. The
+      evidenced act is command execution by a privileged principal; the rule does
+      not by itself prove that elevation was newly gained, so it is mapped to
+      Execution rather than Privilege Escalation to avoid over-claiming.
+    description: >-
+      Root-privileged execution of a command outside the conservative system
+      allowlist, gated on a co-occurring behavioural anomaly.
+
+  - rule_id: suspicious_utility_activity
+    version: 1
+    enabled: true
+    score: 0.65
+    behavior_gate: 0.45
+    utilities: [nc, ncat, socat, curl, wget, openssl, ssh]
+    mitre:
+      tactic: "TA0011 Command and Control"
+      technique: "T1105 Ingress Tool Transfer"
+    mapping_rationale: >-
+      Flags dual-use network utilities (netcat/socat/curl/wget/openssl/ssh)
+      executing in a window with a behavioural deviation. These are canonical
+      living-off-the-land tools for pulling further tooling onto a host or
+      staging a channel. The same set is dual-use for exfiltration
+      (T1048 Exfiltration Over Alternative Protocol); that is noted here rather
+      than mapped separately because the rule observes the utility, not the
+      direction of transfer.
+    description: >-
+      Execution of dual-use network transfer utilities coincident with a
+      behavioural deviation.
+
+  - rule_id: execution_burst
+    version: 1
+    enabled: true
+    score: 0.60
+    peak_execs_per_second: 5
+    window_execs: 10
+    mitre:
+      tactic: "TA0002 Execution"
+      technique: "T1059.004 Unix Shell"
+    mapping_rationale: >-
+      A concentrated burst of process creation -- a high per-second peak sustained
+      over a minimum window volume -- is characteristic of script-driven execution
+      such as a shell loop or a dropped script, rather than interactive use.
+      Mapped to the Unix Shell sub-technique of Command and Scripting Interpreter.
+    description: >-
+      Process-execution volume concentrated into a high-rate burst within a
+      single behaviour window.
+
+  - rule_id: multi_uid_activity
+    version: 1
+    enabled: true
+    score: 0.40
+    min_unique_uids: 3
+    mitre:
+      tactic: "TA0005 Defense Evasion"
+      technique: "T1078 Valid Accounts"
+    mapping_rationale: >-
+      Several distinct user identities executing processes inside one short
+      behaviour window can reflect movement across valid accounts to blend in
+      with legitimate activity. The rule flags the co-occurrence of identities,
+      never the legitimacy of any single account, so it is the weakest of the
+      four signals and is scored accordingly.
+    description: >-
+      Multiple distinct user identities executing processes within one behaviour
+      window.

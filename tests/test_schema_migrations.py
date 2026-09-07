@@ -419,6 +419,178 @@ def test_identity_columns_are_added_to_an_existing_database(tmp_path):
     assert stored[0].timestamp_monotonic is None
 
 
+def test_evidence_chain_columns_and_backfill_over_an_existing_database(tmp_path):
+    """
+    Migration 8 over a version-7 database -- the shape a deployment upgrading
+    into this release is in.
+
+    Two properties matter here beyond "the columns appear". First, the
+    disposition columns (`suppressed` especially, which is NOT NULL) must default
+    on rows that predate them rather than nulling the write. Second, every
+    evidence row already present must be folded into the chain in `id` order: a
+    database migrated in the field has to carry the same tamper-evident chain a
+    freshly written one would, or it fails its own verification the first time an
+    operator checks it. Reopening must not fold a second time.
+    """
+    db = tmp_path / "evidence_chain_upgrade.db"
+
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.isolation_level = None
+        migrations._ensure_version_table(conn)
+        migrations._apply_baseline(conn)
+        migrations._apply_backpressure_telemetry(conn)
+        migrations._apply_event_identity(conn)
+        migrations._apply_kernel_loss_telemetry(conn)
+        migrations._apply_hot_path_indexes(conn)
+        migrations._apply_maintenance_log(conn)
+        migrations._apply_collector_sources(conn)
+        for version, description in (
+            (1, "baseline"),
+            (2, "backpressure"),
+            (3, "identity"),
+            (4, "kernel-loss"),
+            (5, "hot-path indexes"),
+            (6, "maintenance log"),
+            (7, "collector sources"),
+        ):
+            conn.execute(
+                f"INSERT INTO {SCHEMA_MIGRATIONS_TABLE} (version, description, applied_at) "
+                "VALUES (?, ?, 0.0)",
+                (version, description),
+            )
+        # Two findings and two policy decisions written before the chain existed,
+        # in the pre-v8 column shape.
+        for i in range(2):
+            conn.execute(
+                """
+                INSERT INTO detection_findings (
+                    source_risk_id, window_start, window_end, entity_type,
+                    entity_key, risk_score, severity, behavior_score,
+                    rule_score, context_score, evidence_json, explanation,
+                    mode, provenance_hash, detector_version, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (1, 1000.0, 1300.0, "command", f"cmd{i}", 0.7, "HIGH",
+                 0.7, 0.7, 0.7, "[]", f"finding {i}", "detection",
+                 f"seed-{i}", "detector.v1", 100.0 + i),
+            )
+            conn.execute(
+                """
+                INSERT INTO policy_decisions (
+                    finding_id, policy_id, decision, reason, risk_score,
+                    severity, required_approval, proposed_action,
+                    limitations_json, timestamp, dry_run, advisory_rejection
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (i + 1, f"p{i}", "advisory_only", "dry-run", 0.7, "HIGH",
+                 1, "notify_operator", "{}", 200.0 + i, 1, None),
+            )
+    finally:
+        conn.close()
+
+    store = SQLiteEventStore(str(db))
+
+    assert store.schema_version == LATEST_VERSION
+    assert {
+        "correlation_id",
+        "suppressed",
+        "suppression_reason",
+        "chain_seq",
+        "chain_prev_hash",
+        "chain_hash",
+    } <= _columns(db, "detection_findings")
+    assert {"chain_seq", "chain_prev_hash", "chain_hash"} <= _columns(db, "policy_decisions")
+
+    # Pre-existing rows survived and were folded into a valid chain in id order.
+    findings = store.read_detection_findings()
+    assert [f["entity_key"] for f in findings] == ["cmd0", "cmd1"]
+    assert [f["chain_seq"] for f in findings] == [0, 1]
+    # The disposition columns default rather than nulling a NOT NULL column on an
+    # existing row, and never invent a suppression on data that predates them.
+    assert findings[0]["suppressed"] is False
+    assert findings[0]["suppression_reason"] is None
+    assert findings[0]["correlation_id"] is None
+    assert store.verify_findings_chain() == {
+        "ok": True,
+        "checked": 2,
+        "break_seq": None,
+        "reason": None,
+    }
+
+    decisions = store.read_policy_decisions()
+    assert [d["chain_seq"] for d in decisions] == [0, 1]
+    assert store.verify_policy_chain()["ok"] is True
+    assert store.verify_policy_chain()["checked"] == 2
+
+    # Reopening re-runs migrate(): version 8 must not apply twice, and the
+    # backfilled chain must be left byte-for-byte as first written.
+    hashes_before = [f["chain_hash"] for f in findings]
+    reopened = SQLiteEventStore(str(db))
+    hashes_after = [f["chain_hash"] for f in reopened.read_detection_findings()]
+    assert hashes_after == hashes_before
+    assert reopened.verify_findings_chain()["ok"] is True
+
+    conn = sqlite3.connect(str(db))
+    try:
+        (v8_rows,) = conn.execute(
+            f"SELECT COUNT(*) FROM {SCHEMA_MIGRATIONS_TABLE} WHERE version = ?",
+            (LATEST_VERSION,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert v8_rows == 1, "migration 8 recorded itself more than once"
+
+
+def test_migration_8_backfill_skips_already_chained_rows(tmp_path):
+    """
+    The chain backfill must be idempotent at the row level: a row already
+    carrying a `chain_seq` is skipped, so replaying it over a database the
+    runtime writer already chained recomputes no hash and duplicates no link.
+    Without the `WHERE chain_seq IS NULL` guard a second pass would re-fold every
+    row from a fresh genesis and silently rewrite the chain.
+    """
+    from storage.evidence_chain import FINDING_CHAIN_COLUMNS, POLICY_CHAIN_COLUMNS
+
+    db = tmp_path / "backfill_idempotent.db"
+    store = SQLiteEventStore(str(db))
+    for i in range(3):
+        store.write_detection_finding(
+            {
+                "source_risk_id": 1,
+                "window_start": 1000.0,
+                "window_end": 1300.0,
+                "entity_type": "command",
+                "entity_key": f"cmd{i}",
+                "risk_score": 0.7,
+                "severity": "HIGH",
+                "behavior_score": 0.7,
+                "rule_score": 0.7,
+                "context_score": 0.7,
+                "evidence": [],
+                "explanation": "x",
+                "mode": "detection",
+                "provenance_hash": f"ph{i}",
+                "detector_version": "detector.v1",
+            }
+        )
+    before = [f["chain_hash"] for f in store.read_detection_findings()]
+    store.close()
+
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.isolation_level = None
+        migrations._backfill_chain(conn, "detection_findings", FINDING_CHAIN_COLUMNS)
+        migrations._backfill_chain(conn, "policy_decisions", POLICY_CHAIN_COLUMNS)
+    finally:
+        conn.close()
+
+    reopened = SQLiteEventStore(str(db))
+    after = [f["chain_hash"] for f in reopened.read_detection_findings()]
+    assert after == before
+    assert reopened.verify_findings_chain()["ok"] is True
+
+
 def test_host_index_exists_for_per_host_queries(tmp_path):
     """
     Filtering by host is the common analyst query once a file holds more than

@@ -37,6 +37,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Tuple
 
+from storage.evidence_chain import FINDING_CHAIN_COLUMNS, POLICY_CHAIN_COLUMNS, next_link
+
 SCHEMA_MIGRATIONS_TABLE = "schema_migrations"
 
 
@@ -536,6 +538,84 @@ def _apply_collector_sources(conn: sqlite3.Connection) -> None:
         _add_column_if_absent(conn, "collector_runtime", column, declaration)
 
 
+def _apply_evidence_chain(conn: sqlite3.Connection) -> None:
+    """
+    Correlation/suppression disposition columns plus an append-only hash chain
+    over both evidence tables.
+
+    The three `chain_*` columns turn each evidence table into a tamper-evident
+    log: `chain_hash` commits to the row's content, its sequence number, and the
+    previous link, so a deleted, reordered, or mutated historical row is
+    detectable on read. `correlation_id`/`suppressed`/`suppression_reason` are
+    additive dispositions on findings -- they never feed a detection score.
+
+    The columns are added nullable (no backfilled default hash), then every
+    existing row is folded into the chain in `id` order by `_backfill_chain`,
+    so a database migrated in the field carries the same chain a freshly written
+    one would. The partial unique index on `chain_seq` makes a duplicated
+    sequence a constraint error rather than a silent fork.
+    """
+    for column, declaration in (
+        ("correlation_id", "TEXT"),
+        ("suppressed", "INTEGER NOT NULL DEFAULT 0"),
+        ("suppression_reason", "TEXT"),
+        ("chain_seq", "INTEGER"),
+        ("chain_prev_hash", "TEXT"),
+        ("chain_hash", "TEXT"),
+    ):
+        _add_column_if_absent(conn, "detection_findings", column, declaration)
+    for column, declaration in (
+        ("chain_seq", "INTEGER"),
+        ("chain_prev_hash", "TEXT"),
+        ("chain_hash", "TEXT"),
+    ):
+        _add_column_if_absent(conn, "policy_decisions", column, declaration)
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_detection_findings_chain "
+        "ON detection_findings(chain_seq) WHERE chain_seq IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_decisions_chain "
+        "ON policy_decisions(chain_seq) WHERE chain_seq IS NOT NULL"
+    )
+    _backfill_chain(conn, "detection_findings", FINDING_CHAIN_COLUMNS)
+    _backfill_chain(conn, "policy_decisions", POLICY_CHAIN_COLUMNS)
+
+
+def _backfill_chain(conn: sqlite3.Connection, table: str, columns) -> None:
+    """
+    Fold every not-yet-chained row of `table` into the chain, in `id` order.
+
+    Idempotent: rows already carrying a `chain_seq` are skipped and continue the
+    existing chain, so replaying migration 8 over a partially chained database
+    (or one already fully chained by the runtime writer) is a no-op. Reads each
+    row's stored values back through `cursor.description` rather than assuming a
+    `row_factory`, so the fold is identical whether the connection returns tuples
+    or `sqlite3.Row`; those stored values are exactly what the runtime writer
+    hashes, so backfilled and runtime links cannot diverge.
+    """
+    head = conn.execute(
+        f"SELECT chain_seq, chain_hash FROM {table} "
+        "WHERE chain_seq IS NOT NULL ORDER BY chain_seq DESC LIMIT 1"
+    ).fetchone()
+    prev_seq = head[0] if head is not None else None
+    prev_hash = head[1] if head is not None else None
+    cursor = conn.execute(
+        f"SELECT * FROM {table} WHERE chain_seq IS NULL ORDER BY id ASC"
+    )
+    names = [description[0] for description in cursor.description]
+    pending = cursor.fetchall()
+    for row in pending:
+        stored = dict(zip(names, row))
+        link = next_link(prev_seq, prev_hash, columns, stored)
+        conn.execute(
+            f"UPDATE {table} SET chain_seq = ?, chain_prev_hash = ?, chain_hash = ? WHERE id = ?",
+            (link["chain_seq"], link["chain_prev_hash"], link["chain_hash"], stored["id"]),
+        )
+        prev_seq = link["chain_seq"]
+        prev_hash = link["chain_hash"]
+
+
 MIGRATIONS: Tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -571,6 +651,11 @@ MIGRATIONS: Tuple[Migration, ...] = (
         version=7,
         description="per-source collector supervision state and batch quarantine accounting",
         apply=_apply_collector_sources,
+    ),
+    Migration(
+        version=8,
+        description="append-only hash chain over evidence tables plus finding correlation and suppression",
+        apply=_apply_evidence_chain,
     ),
 )
 

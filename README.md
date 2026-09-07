@@ -45,6 +45,7 @@ clause-by-clause traceability.
 | ML | Implemented and tested, but the current Isolation Forest is **inactive** and not approved for activation |
 | Dashboard | Read-only, **authenticated** FastAPI API and browser dashboard over persisted SQLite data |
 | Operational readiness (Phase B) | Supervised multi-collector ingestion, authenticated API, self-bounding retention, metrics/alerts, and systemd deployment; the test suite gates CI |
+| Detection credibility (Phase C) | Published precision/recall on a seeded corpus, versioned MITRE-mapped rules with per-rule tests, and a tamper-evident append-only evidence hash-chain |
 
 ### LIVE VERIFIED telemetry
 
@@ -125,6 +126,40 @@ Deployment, the threat model, and measured throughput/latency plus the soak
 result are documented in [deploy/README.md](deploy/README.md),
 [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md), and
 [docs/PHASE_B_RESULTS.md](docs/PHASE_B_RESULTS.md).
+
+## Detection credibility (Phase C)
+
+Detection quality is held to the same standard the ML gate already sets —
+measured, versioned, and tamper-evident rather than asserted:
+
+- **Published precision/recall** — the deterministic detector is measured
+  against a committed, seeded, labeled corpus of synthesized canonical `Event`s
+  (`simulation/corpus.py`, read-only simulation — nothing is executed on the
+  host). `docs/DETECTION_EFFICACY.md` is generated from that run and verified in
+  sync: precision 0.7143, recall 1.0000, F1 0.8333, ~11.5 projected false
+  positives/day, over 55 windows.
+- **Versioned, MITRE-mapped rules** — the four rules are externalized to
+  `detection/rules_catalog.yaml`; nothing about a rule is hardcoded. Each carries
+  a `version`, an ATT&CK tactic/technique, and a written mapping rationale, and
+  is independently tested.
+- **Fusion weights justified, not asserted** — the measured separation gap
+  (0.5079 between the highest benign and the lowest attack score) justifies
+  keeping the `0.50/0.35/0.15` weights and `0.80/0.60/0.35` bands unchanged.
+- **Correlation & suppression** — related findings receive a deterministic
+  `correlation_id`; suppression is an explicit disposition
+  (`suppressed`/`suppression_reason`), never a silent drop and never a score
+  input.
+- **Tamper-evident evidence** — `detection_findings` and `policy_decisions` are
+  an append-only hash chain (migration 8);
+  `verify_findings_chain()`/`verify_policy_chain()` detect any mutation,
+  reordering, or deletion.
+- **Verified-normal corpus program** — a documented, operator-attested path to
+  the ≥ 60-window ML gate (`docs/NORMAL_CORPUS_PROGRAM.md`), reusing the fixed
+  gate unchanged rather than moving it.
+
+The full roll-up, chain/migration verifications, and reproduction commands are
+in [docs/PHASE_C_RESULTS.md](docs/PHASE_C_RESULTS.md) and the generated
+[docs/DETECTION_EFFICACY.md](docs/DETECTION_EFFICACY.md).
 
 ## Quick start: run the project
 
@@ -377,7 +412,7 @@ pytest -q tests/test_journal_stream.py tests/test_ml_integration.py
 
 Measured on Python 3.14.6 with pytest 9.1.1:
 
-- Full suite: **401 passed, 4 skipped** (~23s)
+- Full suite: **468 passed, 4 skipped** (~21s)
 - The 4 skips are `tests/test_ml_integration.py`, which requires scikit-learn
 - Streaming journald: 92 passed, including two integration tests that exercise
   the real `journalctl` cursor semantics on systemd 261
@@ -385,6 +420,12 @@ Measured on Python 3.14.6 with pytest 9.1.1:
   layered config, metrics, alerts, and API authentication (`tests/test_service.py`,
   `test_supervisor.py`, `test_quarantine.py`, `test_retention.py`,
   `test_config.py`, `test_metrics.py`, `test_alerts.py`, `test_api_auth.py`)
+- Phase C added coverage for the efficacy harness and contamination guard,
+  per-rule matching, rule-catalog integrity, the append-only evidence hash-chain
+  (continuity, tamper detection, dedup-adds-no-link, suppressed-still-chained),
+  and migration-8 additive/idempotent schema (`tests/test_efficacy.py`,
+  `test_rules.py`, `test_rule_catalog.py`, `test_evidence_chain.py`,
+  `test_schema_migrations.py`)
 
 Re-measure before restating those numbers. Tests are never weakened, skipped, or
 removed to make a run look clean.
@@ -426,6 +467,13 @@ without explicit provenance and operator approval.
   the telemetry, storage, and API surface hardened in Phase B.
 - [docs/PHASE_B_RESULTS.md](docs/PHASE_B_RESULTS.md) — measured ingestion
   throughput/latency and the collector-kill (no-data-loss) soak result.
+- [docs/PHASE_C_RESULTS.md](docs/PHASE_C_RESULTS.md) — published detection
+  efficacy, versioned MITRE-mapped rules, the tamper-evident evidence chain, and
+  the verified-normal corpus path.
+- [docs/DETECTION_EFFICACY.md](docs/DETECTION_EFFICACY.md) — generated
+  precision/recall/FP-per-day and the seeded corpus manifest.
+- [docs/NORMAL_CORPUS_PROGRAM.md](docs/NORMAL_CORPUS_PROGRAM.md) — the
+  verified-normal capture/review program and the (unchanged) ML activation gate.
 - `docs/PHASE*_RESULTS.md` — historical phase evidence. Their older telemetry
   limitations are clearly marked as superseded; AGENTS.md is authoritative.
 - `docs/phase1_sample_events.jsonl` — synthetic fixture only, never live

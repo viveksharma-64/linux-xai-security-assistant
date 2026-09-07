@@ -1,7 +1,7 @@
 from collections import defaultdict
 import hashlib
 import json
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from detection.rules import RuleResult, SecurityRule, default_rules
 from pipeline.event_stream import Event
@@ -14,6 +14,16 @@ class DetectionEngine:
 
     This component detects and records findings only. It performs no response,
     remediation, process control, or system configuration changes.
+
+    Findings are additionally correlated and given an explicit disposition before
+    they are persisted. `correlation_id` groups findings that concern the same
+    entity across a contiguous run of behaviour windows, so an operator can pivot
+    on a single incident rather than a scatter of rows. Suppression is a
+    disposition applied by explicit, operator-supplied specs: a suppressed finding
+    is still scored, explained, persisted, and hash-chained -- it is never a
+    silent drop -- and suppression touches only the `suppressed`/
+    `suppression_reason` fields, never any score, so the explainer's score
+    reconciliation is unaffected.
     """
 
     def __init__(
@@ -22,12 +32,47 @@ class DetectionEngine:
         rules: Optional[Sequence[SecurityRule]] = None,
         persist: bool = True,
         ml_scorer: Optional[Any] = None,
+        suppressions: Optional[Sequence[Mapping[str, Any]]] = None,
     ):
         self.store = store
         self.rules = list(rules) if rules is not None else default_rules()
         self.persist = persist
         self.ml_scorer = ml_scorer
         self.detector_version = "detector.v1"
+        self.suppressions = self._validate_suppressions(suppressions or [])
+
+    @staticmethod
+    def _validate_suppressions(specs: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Normalize and fail-closed-validate operator suppression specs.
+
+        A spec must carry a non-empty ``reason`` (an unexplained suppression is
+        not auditable) and must constrain at least one of ``entity_key`` or
+        ``matched_rule`` (a spec matching everything would silently mute the whole
+        detector). ``entity_type`` is an optional additional constraint.
+        """
+        validated: List[Dict[str, Any]] = []
+        for spec in specs:
+            if not isinstance(spec, Mapping):
+                raise ValueError("each suppression spec must be a mapping")
+            reason = str(spec.get("reason", "")).strip()
+            if not reason:
+                raise ValueError("suppression spec requires a non-empty 'reason'")
+            entity_key = spec.get("entity_key")
+            matched_rule = spec.get("matched_rule")
+            if entity_key is None and matched_rule is None:
+                raise ValueError(
+                    "suppression spec must constrain 'entity_key' and/or 'matched_rule'"
+                )
+            validated.append(
+                {
+                    "entity_type": spec.get("entity_type"),
+                    "entity_key": None if entity_key is None else str(entity_key),
+                    "matched_rule": None if matched_rule is None else str(matched_rule),
+                    "reason": reason,
+                }
+            )
+        return validated
 
     def _provenance_hash(self, finding: Dict[str, Any]) -> str:
         material = {
@@ -136,6 +181,8 @@ class DetectionEngine:
                 "rules": [
                     {
                         "rule_id": result.rule_id,
+                        "version": result.version,
+                        "mitre": dict(result.mitre),
                         "matched": result.matched,
                         "score": result.score,
                         "evidence": result.evidence,
@@ -176,7 +223,77 @@ class DetectionEngine:
             "fusion_formula": fusion_formula,
         }
         finding["provenance_hash"] = self._provenance_hash(finding)
+        # Correlation and disposition are assigned in detect() over the whole
+        # finding batch and are deliberately excluded from _provenance_hash, so
+        # they never perturb a finding's identity or its dedup behaviour.
+        finding["correlation_id"] = None
+        finding["suppressed"] = False
+        finding["suppression_reason"] = None
         return finding
+
+    @staticmethod
+    def _correlation_id(entity_type: str, entity_key: str, anchor_window_start: float) -> str:
+        key = f"{entity_type}|{entity_key}|{float(anchor_window_start)!r}"
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+    def _assign_correlation(self, findings: Sequence[Dict[str, Any]]) -> None:
+        """
+        Group findings about one entity across a contiguous run of windows.
+
+        Within a detect() batch, findings for the same (entity_type, entity_key)
+        are ordered by window and walked: a run continues while windows are
+        adjacent or overlapping and breaks on a gap. Every finding in a run shares
+        a `correlation_id` anchored on the run's first window, so the id is stable
+        for a given batch and identical inputs yield identical ids. It is a
+        triage-grouping key, not an incident-timeline reconstruction.
+        """
+        by_entity: Dict[Any, List[Dict[str, Any]]] = defaultdict(list)
+        for finding in findings:
+            by_entity[(finding["entity_type"], str(finding["entity_key"]))].append(finding)
+        for (entity_type, entity_key), group in by_entity.items():
+            group.sort(key=lambda item: float(item["window_start"]))
+            run_anchor: Optional[float] = None
+            prev_end: Optional[float] = None
+            for finding in group:
+                start = float(finding["window_start"])
+                end = float(finding["window_end"])
+                if prev_end is None or start > prev_end:  # a window gap starts a new run
+                    run_anchor = start
+                finding["correlation_id"] = self._correlation_id(entity_type, entity_key, run_anchor)
+                prev_end = end if prev_end is None else max(prev_end, end)
+
+    @staticmethod
+    def _matched_rule_ids(finding: Dict[str, Any]) -> set:
+        for item in finding["evidence"]:
+            if item.get("signal") == "rule_fusion":
+                return {rule["rule_id"] for rule in item["rules"] if rule["matched"]}
+        return set()
+
+    def _apply_suppressions(self, findings: Sequence[Dict[str, Any]]) -> None:
+        """
+        Apply operator suppression specs as a disposition, never a drop.
+
+        The first matching spec sets `suppressed`/`suppression_reason` and nothing
+        else -- no score, severity, evidence, or ordering is touched -- so a
+        suppressed finding is still persisted, explained, and hash-chained.
+        """
+        if not self.suppressions:
+            return
+        for finding in findings:
+            matched_rules: Optional[set] = None
+            for spec in self.suppressions:
+                if spec["entity_type"] is not None and spec["entity_type"] != finding["entity_type"]:
+                    continue
+                if spec["entity_key"] is not None and spec["entity_key"] != str(finding["entity_key"]):
+                    continue
+                if spec["matched_rule"] is not None:
+                    if matched_rules is None:
+                        matched_rules = self._matched_rule_ids(finding)
+                    if spec["matched_rule"] not in matched_rules:
+                        continue
+                finding["suppressed"] = True
+                finding["suppression_reason"] = spec["reason"]
+                break
 
     def detect(
         self,
@@ -198,10 +315,17 @@ class DetectionEngine:
             ),
         ):
             relevant_events = self._events_for_risk(risk, event_records)
-            finding = self._finding(risk, relevant_events)
-            if should_persist:
+            findings.append(self._finding(risk, relevant_events))
+
+        # Correlate and set disposition over the whole batch before persisting;
+        # neither step alters a score or the provenance hash, so dedup and the
+        # explainer's reconciliation are unaffected.
+        self._assign_correlation(findings)
+        self._apply_suppressions(findings)
+
+        if should_persist:
+            for finding in findings:
                 finding["id"] = self.store.write_detection_finding(finding)
-            findings.append(finding)
 
         return {
             "status": "detected",

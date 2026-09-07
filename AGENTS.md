@@ -2,7 +2,7 @@
 
 **Project**: AI-Powered Explainable Linux Security Assistant for kernel-level intrusion and behavioral threat detection  
 **Environment**: Kali Linux 2026.3, kernel `7.1.5+kali`, x86_64  
-**Current state**: Telemetry implementation and controlled live validation are complete. Phase B operational readiness is complete: supervised multi-collector ingestion, an authenticated read-only API, self-bounding retention, observability, and systemd deployment, with the test suite as the CI gate. ML infrastructure is implemented, tested, and intentionally inactive pending independent normal-data acceptance.  
+**Current state**: Telemetry implementation and controlled live validation are complete. Phase B operational readiness is complete: supervised multi-collector ingestion, an authenticated read-only API, self-bounding retention, observability, and systemd deployment, with the test suite as the CI gate. Phase C detection credibility is complete: published precision/recall against a seeded corpus, versioned MITRE-mapped rules with per-rule tests, a tamper-evident evidence hash-chain, and a documented verified-normal corpus program on a credible path to the (unchanged) ML gate. ML infrastructure is implemented, tested, and intentionally inactive pending independent normal-data acceptance.  
 **Last consolidated update**: 2026-09-07
 
 ## Problem statement and requirement traceability
@@ -76,6 +76,20 @@ load-bearing invariants:
 
 Rationale and measured numbers live in `docs/THREAT_MODEL.md` (STRIDE for this surface) and `docs/PHASE_B_RESULTS.md` (throughput/latency and the soak result); deployment and capability tuning live in `deploy/README.md`.
 
+## Detection credibility (Phase C)
+
+Phase C holds detection quality to the standard the ML gate already sets:
+measured, versioned, tamper-evident. Components and their load-bearing invariants:
+
+- **Published efficacy.** `simulation/corpus.py` (seeded, labeled canonical `Event`s — read-only simulation, nothing executed on the host) + `simulation/efficacy.py` measure the deterministic detector; `scripts/run_efficacy.py` regenerates `docs/DETECTION_EFFICACY.md` and `--check` gates it in sync. Headline: Precision 0.7143, Recall 1.0000, F1 0.8333, FP/day 11.52 over 55 windows. The throwaway behaviour baseline is promoted only via `BehaviorAnalyzer.learn_normal(..., verified_normal=True)` — **never** the `ml/training.py` verified-normal path; `tests/test_efficacy.py` is the contamination guard.
+- **Externalized rules.** The four rules live in `detection/rules_catalog.yaml` (catalog schema v1) — score, gates, thresholds, allowlists, per-rule `version`, and MITRE mapping with a written rationale. Nothing about a rule is hardcoded; `detection/rules.py:load_catalog()` fails closed on an inconsistent catalog. Bump a rule's `version` whenever its semantics/score/tunables change; changing a `score` is a calibration change — re-run `run_efficacy.py`. Pinned by `tests/test_rules.py` (per-rule) and `tests/test_rule_catalog.py` (integrity).
+- **Fusion weights unchanged, now justified.** `0.50/0.35/0.15` and the `0.80/0.60/0.35` bands are **retained**, justified by the measured separation (clean benign peaks at 0.0000, lowest attack 0.5079). The weight/threshold lockstep across `detection/detector.py`, `explainability/explainer.py` (both formula branches + strings), and `tests/test_detection_engine.py` is unchanged — a band/weight change still touches all three in one commit and regenerates the efficacy doc.
+- **Correlation & suppression.** `DetectionEngine.detect()` assigns a deterministic `correlation_id` (contiguous-run grouping per entity) and applies operator suppression specs. Suppression is a **disposition, never a silent drop and never a score input**: a suppressed finding is still persisted, explained, and chained; only `suppressed`/`suppression_reason` are set. This keeps the explainer's `1 - Π(1-score)` reconciliation intact.
+- **Tamper-evident evidence.** `storage/evidence_chain.py` defines one fold (`chain_hash = SHA256(chain_prev_hash || serialized_core)`) used by both the runtime writer and the migration-8 backfill. `detection_findings` and `policy_decisions` are append-only chains extended only on a genuine INSERT (a dedup hit adds no link) under `BEGIN IMMEDIATE`. `verify_findings_chain()`/`verify_policy_chain()` re-fold from disk and detect a mutation, reorder, gap, or deletion. Migration **8** adds these columns additively via `_add_column_if_absent`; versions 1–7 are untouched, `LATEST_VERSION=8`.
+- **Verified-normal corpus program.** `docs/NORMAL_CORPUS_PROGRAM.md` + `scripts/collect_normal_window.py` + `scripts/corpus_status.py` reuse the existing ML training/eval and add **no new ML path**. The tool cannot self-approve (requires `--i-verified-normal` + operator + reason; `ml/training.py` re-checks `verified_normal=True`) and reads sources read-only. The gate (`ml/evaluation.py`: FPR ≤ 5%, 95% Wilson upper ≤ 5%, ≥ 60 independent holdout windows) is **reused, never edited** — the corpus grows to meet the bar.
+
+Rationale and the full measured roll-up live in `docs/PHASE_C_RESULTS.md`; the generated efficacy numbers in `docs/DETECTION_EFFICACY.md`.
+
 ## Telemetry status
 
 All planned telemetry families are **LIVE VERIFIED**. No telemetry category remains unverified.
@@ -116,7 +130,8 @@ IPC canonical persistence validation succeeded using the controlled evidence: `p
 - Earlier network focused tests: **27 passed**.
 - Streaming journald tests: `pytest -q tests/test_journal_stream.py` — **92 passed**, no skips (the two `journalctl`-guarded integration tests do run here and agree with the fake).
 - Phase B operational-readiness tests cover the supervised service, supervisor, quarantine, retention, layered config, metrics, alerts, and API authentication (`tests/test_service.py`, `test_supervisor.py`, `test_quarantine.py`, `test_retention.py`, `test_config.py`, `test_metrics.py`, `test_alerts.py`, `test_api_auth.py`).
-- Full suite, measured on Python 3.14.6 / pytest 9.1.1: **401 passed, 4 skipped in ~23s**. The only skips are `tests/test_ml_integration.py` (scikit-learn absent). Re-measure before restating this number; report the actual output, and do not hide, weaken, or remove tests to claim a clean run.
+- Phase C detection-credibility tests cover the efficacy harness + contamination guard, per-rule matching, catalog integrity, the evidence hash-chain (continuity, tamper, dedup-no-link, suppressed-chained, backfill==runtime), and migration-8 additive/idempotent schema (`tests/test_efficacy.py`, `test_rules.py`, `test_rule_catalog.py`, `test_evidence_chain.py`, `test_schema_migrations.py`).
+- Full suite, measured on Python 3.14.6 / pytest 9.1.1: **468 passed, 4 skipped in ~21s**. The only skips are `tests/test_ml_integration.py` (scikit-learn absent). Re-measure before restating this number; report the actual output, and do not hide, weaken, or remove tests to claim a clean run.
 - `PYTHONPATH=.` is no longer required: `[tool.pytest.ini_options] pythonpath = ["."]` in `pyproject.toml` makes bare `pytest` work. Verified with `env -u PYTHONPATH python3 -m pytest -q`.
 - Live BCC validation requires an interactive privileged Kali terminal. The agent sandbox may lack usable sudo credentials even where a user terminal can attach probes.
 
