@@ -2,8 +2,8 @@
 
 **Project**: AI-Powered Explainable Linux Security Assistant for kernel-level intrusion and behavioral threat detection  
 **Environment**: Kali Linux 2026.3, kernel `7.1.5+kali`, x86_64  
-**Current state**: Telemetry implementation and controlled live validation are complete. ML infrastructure is implemented, tested, and intentionally inactive pending independent normal-data acceptance.  
-**Last consolidated update**: 2026-09-05
+**Current state**: Telemetry implementation and controlled live validation are complete. Phase B operational readiness is complete: supervised multi-collector ingestion, an authenticated read-only API, self-bounding retention, observability, and systemd deployment, with the test suite as the CI gate. ML infrastructure is implemented, tested, and intentionally inactive pending independent normal-data acceptance.  
+**Last consolidated update**: 2026-09-07
 
 ## Problem statement and requirement traceability
 
@@ -59,6 +59,23 @@ collector → JSONL → canonical normalization → bounded ingestion → SQLite
 - Collectors are observation-only. The assistant is advisory only; policy is fail-closed/dry-run. Do not add automatic termination, freezing, blocking, firewall changes, or other destructive system actions.
 - Test verification and live verification are distinct. A low anomaly score is not verified-normal data.
 
+## Operational readiness (Phase B)
+
+Phase B makes the system run unattended as two systemd services (see `deploy/`): a
+supervised ingestion daemon and the read-only API. The components and their
+load-bearing invariants:
+
+- **Supervised ingestion.** `pipeline/service.py` runs the collectors; `pipeline/supervisor.py` restarts a crashed collector with exponential backoff, resets the ladder after a healthy run, and marks a collector *degraded* (service exits non-zero) on a genuine crash loop rather than limping silently. Backoff/health timings are config-driven (`restart_*`, `crash_loop_*`). Proven by `scripts/soak_chaos.py`: 20 `SIGKILL`s → 20 recoveries → zero lost events.
+- **Write-failure quarantine.** `pipeline/quarantine.py` writes any batch a failed DB write would drop to disk — self-describing, `0600` (`FILE_MODE = 0o600`), size-capped — for replay. The no-loss property therefore extends past the store boundary, not just across collector kills.
+- **Authenticated API.** `api/auth.py`. On by default and fail-closed: auth required with no token configured returns `503`, never an open evidence feed. Tokens are compared with `secrets.compare_digest` over a SHA-256 digest of *every* configured token (no short-circuit, so timing does not leak which matched or how many exist); tokens under 16 chars (`MIN_TOKEN_LENGTH`) are refused. Only `/api/health` and `/api/health/live` are unauthenticated (`unprotected_paths()`); `/api/health/ready` and `/metrics` are gated because readiness and metrics are reconnaissance. Do not move readiness or metrics into the open set.
+- **Store hardening.** The evidence DB is created and enforced at mode `0600` (`file_mode`/`enforce_mode`); opening a looser-mode database is refused and readiness reports not-ready. `storage/sqlite_store.py` opens connections `check_same_thread=False` **only** so `close()` can reclaim a worker-thread handle at shutdown — each connection is still used by a single thread. Do not "restore" `check_same_thread=True`; it reintroduces the unclosed-connection leak.
+- **Self-bounding storage.** `storage/retention.py` prunes by age and by a byte cap and `VACUUM`s on a timer, all **in-process** on the ingest daemon (there is deliberately no `.timer` unit). `retention_max_age_days: 0` keeps events indefinitely (byte cap only).
+- **Observability.** `observability/metrics.py` serves a Prometheus-style `/metrics`; `observability/alerts.py` logs disk/queue/collector-silence alerts on *transition* (not every interval) at a level a journald paging rule can key on.
+- **Layered config.** `observability/config.py`: defaults < config file < environment, fail-closed on an unknown key or unparseable value. File modes must be quoted in YAML so `0600` is not reinterpreted as decimal. Env var per field is `SECURITY_<NAME>` (e.g. `SECURITY_API_REQUIRE_AUTH`, `SECURITY_API_TOKENS`, `SECURITY_API_TOKEN_FILE`).
+- **CI.** `.github/workflows/ci.yml`. pytest is the hard gate; `ruff`/`mypy` run but are advisory (they could not be baselined on the offline build host). Do not describe them as gating until they are.
+
+Rationale and measured numbers live in `docs/THREAT_MODEL.md` (STRIDE for this surface) and `docs/PHASE_B_RESULTS.md` (throughput/latency and the soak result); deployment and capability tuning live in `deploy/README.md`.
+
 ## Telemetry status
 
 All planned telemetry families are **LIVE VERIFIED**. No telemetry category remains unverified.
@@ -98,7 +115,8 @@ IPC canonical persistence validation succeeded using the controlled evidence: `p
 - Authentication focused tests: **4 passed**.
 - Earlier network focused tests: **27 passed**.
 - Streaming journald tests: `pytest -q tests/test_journal_stream.py` — **92 passed**, no skips (the two `journalctl`-guarded integration tests do run here and agree with the fake).
-- Full suite, measured on Python 3.14.6 / pytest 9.1.1: **304 passed, 4 skipped in ~16s**. The only skips are `tests/test_ml_integration.py` (scikit-learn absent). Re-measure before restating this number; report the actual output, and do not hide, weaken, or remove tests to claim a clean run.
+- Phase B operational-readiness tests cover the supervised service, supervisor, quarantine, retention, layered config, metrics, alerts, and API authentication (`tests/test_service.py`, `test_supervisor.py`, `test_quarantine.py`, `test_retention.py`, `test_config.py`, `test_metrics.py`, `test_alerts.py`, `test_api_auth.py`).
+- Full suite, measured on Python 3.14.6 / pytest 9.1.1: **401 passed, 4 skipped in ~23s**. The only skips are `tests/test_ml_integration.py` (scikit-learn absent). Re-measure before restating this number; report the actual output, and do not hide, weaken, or remove tests to claim a clean run.
 - `PYTHONPATH=.` is no longer required: `[tool.pytest.ini_options] pythonpath = ["."]` in `pyproject.toml` makes bare `pytest` work. Verified with `env -u PYTHONPATH python3 -m pytest -q`.
 - Live BCC validation requires an interactive privileged Kali terminal. The agent sandbox may lack usable sudo credentials even where a user terminal can attach probes.
 

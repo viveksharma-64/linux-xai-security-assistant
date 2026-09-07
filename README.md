@@ -43,7 +43,8 @@ clause-by-clause traceability.
 | Assistant | Optional, provider-neutral, evidence-grounded narration; never a decision-maker |
 | Policy | Fail-closed, dry-run, advisory-only; no remediation executor exists |
 | ML | Implemented and tested, but the current Isolation Forest is **inactive** and not approved for activation |
-| Dashboard | Read-only FastAPI API and browser dashboard over persisted SQLite data |
+| Dashboard | Read-only, **authenticated** FastAPI API and browser dashboard over persisted SQLite data |
+| Operational readiness (Phase B) | Supervised multi-collector ingestion, authenticated API, self-bounding retention, metrics/alerts, and systemd deployment; the test suite gates CI |
 
 ### LIVE VERIFIED telemetry
 
@@ -84,11 +85,46 @@ do not depend on a collector-specific event model.
 - The assistant is advisory only; it cannot execute commands or change scores.
 - Policy is deterministic and fail-closed. Default approval-gated outcomes are
   dry-run decisions.
-- The API is read-only and defaults to loopback binding.
+- The API is read-only, authenticated on by default, and fails closed: with
+  authentication required but no token configured it returns `503` rather than
+  serve the evidence feed unauthenticated. It binds loopback unless
+  `ALLOW_NON_LOOPBACK_API=1` is set explicitly.
 - No automatic termination, freezing, blocking, firewall changes, or account
   changes are implemented.
 - ML failure falls back to deterministic detection; it cannot break the
   existing detection path.
+
+## Operational readiness (Phase B)
+
+Beyond the collectors and detection, the system is built to run unattended as
+two systemd services — a supervised ingestion daemon and the read-only API:
+
+- **Supervised multi-collector ingestion** (`pipeline/service.py`,
+  `pipeline/supervisor.py`) — runs the collectors together, restarts a crashed
+  one with exponential backoff, marks a genuinely broken one *degraded* rather
+  than limping silently, and reports perf-ring loss separately from backpressure
+  drops.
+- **No silent evidence loss** — a bounded queue counts drops, and a batch a
+  failed DB write would otherwise lose is quarantined to disk at `0600` for
+  replay (`pipeline/quarantine.py`). A collector-kill soak
+  (`scripts/soak_chaos.py`) demonstrates 20 kills → 20 auto-recoveries → zero
+  lost events.
+- **Authenticated API** (`api/auth.py`) — bearer token, on by default and
+  fail-closed, constant-time comparison over every configured token, loopback by
+  default. Only liveness and a static health summary are open.
+- **Self-bounding storage** (`storage/retention.py`) — age and byte-cap pruning
+  plus a periodic `VACUUM`, in-process, so the monitor cannot fill its own disk.
+  The evidence database is created and enforced at mode `0600`.
+- **Observability** (`observability/`) — a Prometheus-style `/metrics` endpoint,
+  disk/queue/collector-silence alerts logged on transition, and layered
+  `defaults < config-file < environment` configuration that fails closed on an
+  unknown key or unparseable value.
+- **CI** (`.github/workflows/ci.yml`) — the test suite is the hard merge gate.
+
+Deployment, the threat model, and measured throughput/latency plus the soak
+result are documented in [deploy/README.md](deploy/README.md),
+[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md), and
+[docs/PHASE_B_RESULTS.md](docs/PHASE_B_RESULTS.md).
 
 ## Quick start: run the project
 
@@ -151,21 +187,35 @@ Press `Ctrl+C` in terminal 1 when you have collected enough events. The
 ingestion service records collector health, processed/malformed/dropped counts,
 and persists canonical events in SQLite.
 
-> The command above is the primary end-to-end demo path for process execution
-> and system health. Other telemetry collectors are independently LIVE
-> VERIFIED; they intentionally remain separate privileged tools until a
-> multi-collector supervisor is added.
+> The command above is the single-collector demo path — the simplest way to see
+> one family end to end. A supervised multi-collector service now exists
+> (`pipeline/service.py`, driven by `pipeline/supervisor.py`): it runs the
+> collectors together, restarts a crashed one with exponential backoff, marks a
+> genuinely broken one *degraded*, and quarantines any batch a failed DB write
+> would otherwise lose. See [deploy/README.md](deploy/README.md) for running it
+> under systemd.
 
 ### 3. Start the read-only dashboard
 
-In terminal 2:
+The API authenticates by default and fails closed: with authentication required
+but no token configured it answers `503` rather than serve the evidence feed
+unauthenticated. For the local demo, mint a token and pass it in. In terminal 2:
 
 ```bash
 cd ~/linux-xai-security-assistant
+export SECURITY_API_TOKENS="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+echo "Dashboard token: $SECURITY_API_TOKENS"
 SECURITY_DB_PATH="$PWD/security_demo.db" PYTHONPATH=. python3 -m api
 ```
 
-Open <http://127.0.0.1:8000/dashboard/>.
+Open <http://127.0.0.1:8000/dashboard/>. The dashboard stores no telemetry of
+its own, so on first load it prompts for the token (kept in `sessionStorage`) —
+paste the value printed above. Only liveness (`/api/health/live`) and the static
+health summary (`/api/health`) are served without a token.
+
+For a throwaway, loopback-only look you can instead set
+`SECURITY_API_REQUIRE_AUTH=false`; the API logs a warning and the dashboard
+stops prompting. Never do this for anything reachable off loopback.
 
 The dashboard reports two different things:
 
@@ -177,14 +227,35 @@ The dashboard reports two different things:
 
 ### 4. Inspect the API
 
-Useful read-only endpoints:
+Two endpoints are open (no token) — a liveness probe and a static health
+summary that disclose only that the process is up:
 
 ```text
+GET /api/health/live
 GET /api/health
+```
+
+Everything else requires the token, sent as `Authorization: Bearer <token>` or
+`X-API-Key: <token>`:
+
+```bash
+curl -fsS -H "Authorization: Bearer $SECURITY_API_TOKENS" \
+  http://127.0.0.1:8000/api/status
+```
+
+```text
+GET /api/health/ready        # 200 ready / 503 not-ready (DB present, mode 0600, telemetry fresh)
+GET /metrics                 # Prometheus-style counters and coverage windows
 GET /api/status
 GET /api/telemetry/status
+GET /api/alerts
+GET /api/sources
+GET /api/maintenance
 GET /api/events?limit=100
 GET /api/detections
+GET /api/detections/{id}
+GET /api/explanations/{id}
+GET /api/assistant/{id}
 GET /api/policies
 GET /api/policy-decisions
 ```
@@ -306,10 +377,14 @@ pytest -q tests/test_journal_stream.py tests/test_ml_integration.py
 
 Measured on Python 3.14.6 with pytest 9.1.1:
 
-- Full suite: **304 passed, 4 skipped** (~16s)
+- Full suite: **401 passed, 4 skipped** (~23s)
 - The 4 skips are `tests/test_ml_integration.py`, which requires scikit-learn
 - Streaming journald: 92 passed, including two integration tests that exercise
   the real `journalctl` cursor semantics on systemd 261
+- Phase B added coverage for the supervised service, quarantine, retention,
+  layered config, metrics, alerts, and API authentication (`tests/test_service.py`,
+  `test_supervisor.py`, `test_quarantine.py`, `test_retention.py`,
+  `test_config.py`, `test_metrics.py`, `test_alerts.py`, `test_api_auth.py`)
 
 Re-measure before restating those numbers. Tests are never weakened, skipped, or
 removed to make a run look clean.
@@ -319,15 +394,18 @@ removed to make a run look clean.
 | Directory | Responsibility |
 |---|---|
 | `telemetry/` | BCC, journald, auditd, and health collectors |
-| `pipeline/` | Canonical Event model, normalization, bounded ingestion |
-| `storage/` | SQLite persistence and ML provenance records |
+| `pipeline/` | Canonical Event model, normalization, bounded ingestion, and the supervised multi-collector service with write-failure quarantine |
+| `storage/` | SQLite persistence (mode `0600` enforced), ML provenance, and age/byte-cap retention |
 | `baseline/` | Explicit verified-normal behavioral baseline |
 | `detection/` | Deterministic rules and evidence fusion |
 | `ml/` | Canonical window schema, training, scoring, evaluation |
 | `explainability/` | Evidence reconstruction and bounded explanations |
 | `assistant/` | Optional provider-neutral advisory narration |
 | `policy/` | Deterministic fail-closed dry-run policy |
-| `api/`, `dashboard/` | Read-only analyst API and interface |
+| `observability/` | Layered config, Prometheus-style metrics, and disk/queue/silence alerting |
+| `api/`, `dashboard/` | Read-only, authenticated analyst API and interface |
+| `deploy/` | systemd units, example config, and the deployment guide |
+| `scripts/` | Environment check, ingestion benchmark, and collector-kill soak harness |
 | `tests/` | Focused unit and integration regression tests |
 | `requirements.txt` | Python dependencies for API, policy, ML, and tests |
 
@@ -342,6 +420,12 @@ without explicit provenance and operator approval.
 
 - [AGENTS.md](AGENTS.md) — authoritative handoff, exact validation evidence,
   architectural constraints, and current ML safety gate.
+- [deploy/README.md](deploy/README.md) — deploying the two systemd services,
+  capability tuning, and verification.
+- [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) — STRIDE-shaped threat model for
+  the telemetry, storage, and API surface hardened in Phase B.
+- [docs/PHASE_B_RESULTS.md](docs/PHASE_B_RESULTS.md) — measured ingestion
+  throughput/latency and the collector-kill (no-data-loss) soak result.
 - `docs/PHASE*_RESULTS.md` — historical phase evidence. Their older telemetry
   limitations are clearly marked as superseded; AGENTS.md is authoritative.
 - `docs/phase1_sample_events.jsonl` — synthetic fixture only, never live
