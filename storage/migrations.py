@@ -402,6 +402,140 @@ def _apply_kernel_loss_telemetry(conn: sqlite3.Connection) -> None:
         _add_column_if_absent(conn, "collector_runtime", column, declaration)
 
 
+def _apply_hot_path_indexes(conn: sqlite3.Connection) -> None:
+    """
+    Indexes matching the queries the service actually runs, and no more.
+
+    Every index is a tax on the ingest path: each row inserted has to be written
+    into each one. So this migration *replaces* two single-column indexes rather
+    than adding to them.
+
+    `idx_events_event_type` and `idx_events_timestamp` are both left-prefixes of
+    the composite indexes created here, and SQLite will use a composite index for
+    a query that constrains only its leading column. Keeping them would cost two
+    extra B-tree writes per event for lookups the new indexes already serve.
+
+    What each new index is for:
+
+    * `idx_events_type_timestamp` -- `read_event_records(event_type=...)` filters
+      on type and orders by timestamp DESC. With only `(event_type)` SQLite had to
+      sort the matched rows; with the composite it walks the index backwards.
+    * `idx_events_timestamp_id` -- the keyset pagination in `_stream_event_rows`
+      and the age-based delete in `storage.retention`, both of which order by
+      `(timestamp, id)`. A `(timestamp)`-only index leaves the tiebreak unindexed,
+      which on a busy host means many rows sharing one timestamp.
+    * the analytics indexes -- every `read_*` on findings, risks, decisions, and
+      baselines orders by its window/timestamp column, and those tables are read
+      on the dashboard's polling path. They are written orders of magnitude less
+      often than `events`, so the write cost is not the concern there.
+    """
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_type_timestamp ON events(event_type, timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_timestamp_id ON events(timestamp, id)")
+    conn.execute("DROP INDEX IF EXISTS idx_events_event_type")
+    conn.execute("DROP INDEX IF EXISTS idx_events_timestamp")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_detection_findings_window ON detection_findings(window_start, id)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_behavior_risks_window ON behavior_risks(window_start, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_policy_decisions_time ON policy_decisions(timestamp, id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_behavior_baselines_ready "
+        "ON behavior_baselines(baseline_name, status, id)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_anomaly_scores_event ON anomaly_scores(event_id)")
+
+
+def _apply_maintenance_log(conn: sqlite3.Connection) -> None:
+    """
+    A record of what data lifecycle management has deleted.
+
+    Retention deletes evidence. Doing that without a durable record would mean an
+    analyst who cannot find an event has no way to distinguish "it was never
+    collected" from "it aged out on Tuesday" -- and the second answer is the one
+    that tells them to widen the retention window before the next investigation.
+
+    Single row per action rather than a running total, because the useful question
+    is "what happened at 03:00 when the disk filled", which a counter cannot
+    answer. `oldest_retained_timestamp` is recorded after each prune so the log
+    also states the coverage the database still has.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS maintenance_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            events_deleted INTEGER NOT NULL DEFAULT 0,
+            rows_deleted INTEGER NOT NULL DEFAULT 0,
+            cutoff_timestamp REAL,
+            oldest_retained_timestamp REAL,
+            db_bytes_before INTEGER,
+            db_bytes_after INTEGER,
+            duration_seconds REAL NOT NULL DEFAULT 0.0,
+            detail TEXT,
+            created_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_maintenance_log_time ON maintenance_log(created_at, id)")
+
+
+def _apply_collector_sources(conn: sqlite3.Connection) -> None:
+    """
+    Per-source supervision state, alongside the aggregate in `collector_runtime`.
+
+    `collector_runtime` is a single row on purpose: it answers "is ingestion
+    working". It cannot answer "which collector died", and on a host running
+    several collectors that is the only question worth asking -- an aggregate that
+    reads "running" because three of four sources are alive is precisely the
+    reassuring lie that lets a blind spot persist for a week.
+
+    Keyed by source name rather than an autoincrement id, and upserted: the useful
+    read is "what is the current state of `exec`", and a table of state
+    transitions would make that a query over history instead of a lookup. The
+    transitions that matter are already durable in the log stream and in
+    `restart_count`.
+
+    `crash_looping` is stored as a flag rather than inferred from
+    `consecutive_failures` at read time, because the threshold that produced it is
+    configuration -- an operator who lowers `crash_loop_threshold` should not
+    retroactively change what the database says happened.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS collector_sources (
+            name TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            detail TEXT,
+            error TEXT,
+            started_at REAL,
+            stopped_at REAL,
+            last_event_timestamp REAL,
+            processed_count INTEGER NOT NULL DEFAULT 0,
+            restart_count INTEGER NOT NULL DEFAULT 0,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            last_failure_at REAL,
+            next_restart_at REAL,
+            backoff_seconds REAL NOT NULL DEFAULT 0.0,
+            crash_looping INTEGER NOT NULL DEFAULT 0,
+            quarantined_batch_count INTEGER NOT NULL DEFAULT 0,
+            quarantined_event_count INTEGER NOT NULL DEFAULT 0,
+            updated_at REAL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_collector_sources_status ON collector_sources(status, name)")
+    # Quarantine accounting on the aggregate row as well. A quarantined batch is
+    # the one loss figure that is recoverable -- the events are still on disk -- so
+    # it has to be visible next to the counters an operator already watches, not
+    # only in the per-source table.
+    for column, declaration in (
+        ("quarantined_batch_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("quarantined_event_count", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        _add_column_if_absent(conn, "collector_runtime", column, declaration)
+
+
 MIGRATIONS: Tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -422,6 +556,21 @@ MIGRATIONS: Tuple[Migration, ...] = (
         version=4,
         description="collector_runtime kernel perf-buffer loss accounting",
         apply=_apply_kernel_loss_telemetry,
+    ),
+    Migration(
+        version=5,
+        description="hot-path composite indexes, replacing redundant single-column indexes",
+        apply=_apply_hot_path_indexes,
+    ),
+    Migration(
+        version=6,
+        description="maintenance log for retention, pruning, and vacuum actions",
+        apply=_apply_maintenance_log,
+    ),
+    Migration(
+        version=7,
+        description="per-source collector supervision state and batch quarantine accounting",
+        apply=_apply_collector_sources,
     ),
 )
 

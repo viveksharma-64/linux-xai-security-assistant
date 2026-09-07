@@ -1,11 +1,57 @@
 import json
 import hashlib
+import logging
+import os
 import sqlite3
+import stat
+import threading
+import time
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from pipeline.event_stream import CanonicalNormalizer, Event, EventStore
 from storage.migrations import migrate
+
+
+LOGGER = logging.getLogger(__name__)
+
+# Rows fetched per page when streaming. Large enough that per-page overhead is
+# amortised, small enough that a full-table scan of a multi-gigabyte database
+# holds only a bounded slice in memory.
+STREAM_PAGE_SIZE = 2000
+
+
+class DatabasePermissionError(RuntimeError):
+    """
+    Raised when the database file's mode cannot be brought within policy.
+
+    Fail-closed: the file holds command lines, file paths, and usernames from the
+    monitored host. Running with it world-readable would turn the audit record
+    into a local information-disclosure primitive, which is worse than not
+    running.
+    """
+
+
+@dataclass
+class BatchWriteResult:
+    """
+    Outcome of one batched insert.
+
+    `rejected` carries the events that could not be encoded at all, paired with
+    the reason, so the caller can quarantine exactly those and still commit the
+    rest. Returning a count instead would force the caller to choose between
+    losing the whole batch and losing the identity of the bad record.
+    """
+
+    attempted: int = 0
+    inserted: int = 0
+    duplicates: int = 0
+    rejected: List[Tuple[Any, str]] = field(default_factory=list)
+
+    @property
+    def rejected_count(self) -> int:
+        return len(self.rejected)
 
 
 class SQLiteEventStore(EventStore):
@@ -15,6 +61,23 @@ class SQLiteEventStore(EventStore):
     policy decisions, assistant responses, and ML provenance.
 
     The schema is versioned; see storage/migrations.py.
+
+    Connection lifetime
+    -------------------
+    One connection per thread, opened on first use and reused thereafter. The
+    previous design opened and closed a connection for every operation, which is
+    correct but costs a file open, a WAL header read, and four PRAGMA round-trips
+    per event on the ingest path. Reuse removes that per-event cost while keeping
+    the property the per-call design was protecting: no connection is ever *used*
+    from more than the thread that opened it, so SQLite never sees concurrent use
+    of one handle.
+
+    Connections are registered so `close()` can shut down handles belonging to
+    threads that have already exited -- a thread-local alone would leak those
+    until interpreter shutdown. Reclaiming a handle from a thread other than its
+    owner is why the connections are opened with `check_same_thread=False` (see
+    `_new_connection`); the thread-local cache, not that assertion, is what keeps
+    a handle single-threaded in use.
     """
 
     # Columns accepted as `query()` filter keys. Filter keys are interpolated
@@ -28,37 +91,133 @@ class SQLiteEventStore(EventStore):
         "host_id", "boot_id", "agent_id",
     })
 
-    def __init__(self, db_path: str = "phase2_events.db"):
-        self.db_path = db_path
-        self._init_db()
+    EVENT_INSERT_SQL = """
+        INSERT OR IGNORE INTO events (
+            event_type, timestamp, timestamp_ns, timestamp_monotonic,
+            pid, ppid, uid, gid,
+            comm, executable, parent_comm, ancestry_json, source, version,
+            payload_json, event_hash, host_id, boot_id, agent_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+    def __init__(
+        self,
+        db_path: str = "phase2_events.db",
+        file_mode: Optional[int] = 0o600,
+        enforce_file_mode: bool = True,
+    ):
+        self.db_path = db_path
+        self.file_mode = file_mode
+        self.enforce_file_mode = enforce_file_mode
+        self._local = threading.local()
+        self._connections: "set[sqlite3.Connection]" = set()
+        self._connections_lock = threading.Lock()
+        self._closed = False
+        self._init_db()
+        self._apply_file_mode()
+
+    # ---------------------------------------------------------------- plumbing
+
+    def _new_connection(self) -> sqlite3.Connection:
+        # check_same_thread=False so close() can reclaim a connection from a
+        # thread other than the one that opened it. Each connection is still only
+        # *used* by its owning thread (see _connect's thread-local cache); this
+        # only lifts CPython's same-thread assertion, which otherwise makes
+        # close() raise ProgrammingError for a pooled handle opened on a worker
+        # thread (e.g. an API request thread) and leak it -- exactly the set that
+        # close()/__del__ and self._connections exist to reclaim.
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout = 5000")
         if self.db_path != ":memory:":
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA foreign_keys = ON")
+            # Group commits at WAL checkpoints instead of fsyncing every
+            # transaction. Under WAL, NORMAL keeps atomicity and integrity across
+            # a process crash; the exposure is a power loss losing the last
+            # commits, which for continuously-arriving telemetry costs a fraction
+            # of a second of events and buys roughly an order of magnitude in
+            # sustained insert throughput.
+            conn.execute("PRAGMA synchronous = NORMAL")
+        return conn
+
+    def _connect(self) -> sqlite3.Connection:
+        """
+        This thread's connection, opened on first use.
+
+        Kept as `_connect()` because the whole store is written against it; the
+        difference from before is that the handle is cached rather than created
+        per call, and callers must not close it (see `_transaction`).
+        """
+        if self._closed:
+            raise sqlite3.ProgrammingError("event store is closed")
+        conn: Optional[sqlite3.Connection] = getattr(self._local, "conn", None)
+        if conn is not None:
+            return conn
+        conn = self._new_connection()
+        self._local.conn = conn
+        with self._connections_lock:
+            self._connections.add(conn)
         return conn
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         """
-        Yield a connection that is committed on success, rolled back on failure,
-        and closed unconditionally.
+        Yield this thread's connection, committed on success and rolled back on
+        failure.
 
-        `sqlite3.Connection.__exit__` ends the transaction but does not close the
-        connection, so a bare `with self._connect() as conn` leaks it until
-        garbage collection. On the ingestion path that is one leaked file
-        descriptor per stored event, and every lingering reader also blocks WAL
-        checkpointing, so the -wal file grows without bound.
+        `sqlite3.Connection.__exit__` ends the transaction without closing the
+        connection, which is exactly what is wanted now that the handle is
+        long-lived and owned by the store rather than by the call.
         """
         conn = self._connect()
+        with conn:
+            yield conn
+
+    def close(self) -> None:
+        """
+        Close every connection this store has opened, from any thread.
+
+        Idempotent, and safe to call from a thread that never touched the store:
+        SQLite forbids *using* a connection from another thread but `close()` on
+        an idle handle is what shutdown needs, and leaving handles open holds WAL
+        read marks that block checkpointing.
+        """
+        self._closed = True
+        with self._connections_lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        self._local = threading.local()
+        for conn in connections:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                # A handle still in use by a live thread refuses to close. Losing
+                # it at interpreter shutdown is strictly better than raising out
+                # of a shutdown path and skipping the remaining handles.
+                pass
+
+    def __enter__(self) -> "SQLiteEventStore":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        """
+        Last-resort close for a store that was never closed explicitly.
+
+        Connections are now long-lived, so an abandoned store would otherwise hold
+        its handles -- and its WAL read marks -- until interpreter exit. Guarded
+        broadly because finalizers run during shutdown when module globals may
+        already be gone, and an exception here is unraisable noise on a path that
+        cannot fix anything.
+        """
         try:
-            with conn:
-                yield conn
-        finally:
-            conn.close()
+            self.close()
+        except BaseException:
+            pass
 
     def _init_db(self) -> None:
         """
@@ -69,12 +228,86 @@ class SQLiteEventStore(EventStore):
         a newer build is refused rather than written into. See that module for
         why versioning replaced the in-place `CREATE IF NOT EXISTS` + `ALTER`
         sequence that used to live here.
+
+        Runs on a dedicated connection that is closed afterwards: `migrate()`
+        switches the handle to autocommit to manage DDL transactions explicitly,
+        and that setting must not leak into the pooled connections the rest of the
+        store relies on for implicit transactions.
         """
-        conn = self._connect()
+        conn = sqlite3.connect(self.db_path)
         try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 5000")
+            if self.db_path != ":memory:":
+                conn.execute("PRAGMA journal_mode = WAL")
             self.schema_version = migrate(conn)
         finally:
             conn.close()
+
+    def _apply_file_mode(self) -> None:
+        """
+        Restrict the database file, and the WAL sidecars, to the owner.
+
+        The sidecars matter as much as the main file: `-wal` holds the most recent
+        commits verbatim, so a world-readable `-wal` leaks the newest evidence
+        even when the database itself is 0600. SQLite creates them with the
+        process umask, which on a default Kali install is 0022.
+
+        Verified after chmod rather than assumed. On a filesystem that cannot
+        represent Unix modes -- a mounted FAT volume, some container overlays --
+        `chmod` succeeds and changes nothing, and a security control that reports
+        success without taking effect is worse than one that is absent.
+        """
+        if self.file_mode is None or self.db_path == ":memory:":
+            return
+        problems: List[str] = []
+        for path in self._database_files():
+            try:
+                os.chmod(path, self.file_mode)
+                actual = stat.S_IMODE(os.stat(path).st_mode)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                problems.append(f"{path}: {type(error).__name__}: {error}")
+                continue
+            if actual & 0o077:
+                problems.append(f"{path}: mode is {actual:04o} after chmod to {self.file_mode:04o}")
+        if not problems:
+            return
+        message = "database file permissions could not be enforced: " + "; ".join(problems)
+        if self.enforce_file_mode:
+            raise DatabasePermissionError(message)
+        LOGGER.warning("db_permissions_unenforced detail=%r", message)
+
+    def _database_files(self) -> List[str]:
+        """The main database file and the WAL sidecars that may hold its data."""
+        return [self.db_path, f"{self.db_path}-wal", f"{self.db_path}-shm"]
+
+    def file_permissions(self) -> Dict[str, Optional[int]]:
+        """
+        Current mode of each database file, for the readiness endpoint to report.
+
+        None for a file that does not exist -- a database with no `-wal` has no
+        permission problem there, and reporting 0 would read as "no access".
+        """
+        modes: Dict[str, Optional[int]] = {}
+        for path in self._database_files():
+            try:
+                modes[path] = stat.S_IMODE(os.stat(path).st_mode)
+            except OSError:
+                modes[path] = None
+        return modes
+
+    def database_bytes(self) -> int:
+        """Total on-disk size including WAL sidecars, which is what fills a disk."""
+        total = 0
+        for path in self._database_files():
+            try:
+                total += os.path.getsize(path)
+            except OSError:
+                continue
+        return total
+
 
     def _row_to_event(self, row: sqlite3.Row) -> Event:
         payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
@@ -147,10 +380,14 @@ class SQLiteEventStore(EventStore):
         encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
-    def write(self, event: Event) -> bool:
-        if event is None:
-            return False
+    def _event_row(self, event: Event) -> Tuple[Any, ...]:
+        """
+        Bind parameters for one event, in `EVENT_INSERT_SQL` column order.
 
+        Extracted so the single-event and batched paths cannot diverge: a column
+        added to one and not the other would silently drop a field on whichever
+        path the caller happens to use.
+        """
         try:
             timestamp = float(event.timestamp)
         except (TypeError, ValueError):
@@ -158,41 +395,84 @@ class SQLiteEventStore(EventStore):
 
         if event.event_type is None or event.event_type.value is None:
             raise ValueError("event_type is required")
-        event_hash = self._event_hash(event)
+
+        return (
+            event.event_type.value,
+            timestamp,
+            event.timestamp_ns,
+            event.timestamp_monotonic,
+            event.pid,
+            event.ppid,
+            event.uid,
+            event.gid,
+            event.comm,
+            event.executable,
+            event.parent_comm,
+            json.dumps(event.ancestry, sort_keys=True),
+            event.source,
+            event.version,
+            json.dumps(event.payload, sort_keys=True),
+            self._event_hash(event),
+            event.host_id,
+            event.boot_id,
+            event.agent_id,
+        )
+
+    def write(self, event: Event) -> bool:
+        if event is None:
+            return False
+
+        row = self._event_row(event)
+        with self._transaction() as conn:
+            cursor = conn.execute(self.EVENT_INSERT_SQL, row)
+            return cursor.rowcount == 1
+
+    def write_events(self, events: Sequence[Event]) -> BatchWriteResult:
+        """
+        Insert many events in one transaction.
+
+        Why batching matters here: with `synchronous = NORMAL` under WAL, a commit
+        still costs a WAL write and page-cache work, and the per-statement
+        overhead of `execute` plus an implicit transaction dominates once events
+        arrive faster than a few hundred per second. One `executemany` inside one
+        transaction turns N commits into one.
+
+        Events that cannot be encoded are separated out *before* the transaction
+        opens and returned in `rejected`, so one malformed record cannot cost the
+        whole batch. Errors raised by SQLite itself (a full disk, a corrupt page)
+        are allowed to propagate: those are batch-level failures, the transaction
+        has rolled back, and the caller's quarantine path is the right handler.
+
+        `inserted` comes from `Connection.total_changes` because `executemany`
+        does not report a per-statement rowcount, and `INSERT OR IGNORE` makes the
+        difference between attempted and inserted exactly the duplicate count --
+        which is a number the collector health record publishes, so it has to be
+        measured rather than assumed.
+        """
+        result = BatchWriteResult()
+        if not events:
+            return result
+
+        rows: List[Tuple[Any, ...]] = []
+        for event in events:
+            if event is None:
+                result.rejected.append((event, "event is None"))
+                continue
+            try:
+                rows.append(self._event_row(event))
+            except (ValueError, TypeError) as error:
+                result.rejected.append((event, f"{type(error).__name__}: {error}"))
+        result.attempted = len(rows)
+        if not rows:
+            return result
 
         with self._transaction() as conn:
-            cursor = conn.execute(
-                """
-                INSERT OR IGNORE INTO events (
-                    event_type, timestamp, timestamp_ns, timestamp_monotonic,
-                    pid, ppid, uid, gid,
-                    comm, executable, parent_comm, ancestry_json, source, version,
-                    payload_json, event_hash, host_id, boot_id, agent_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event.event_type.value,
-                    timestamp,
-                    event.timestamp_ns,
-                    event.timestamp_monotonic,
-                    event.pid,
-                    event.ppid,
-                    event.uid,
-                    event.gid,
-                    event.comm,
-                    event.executable,
-                    event.parent_comm,
-                    json.dumps(event.ancestry, sort_keys=True),
-                    event.source,
-                    event.version,
-                    json.dumps(event.payload, sort_keys=True),
-                    event_hash,
-                    event.host_id,
-                    event.boot_id,
-                    event.agent_id,
-                ),
-            )
-            return cursor.rowcount == 1
+            before = conn.total_changes
+            conn.executemany(self.EVENT_INSERT_SQL, rows)
+            result.inserted = conn.total_changes - before
+        result.duplicates = result.attempted - result.inserted
+        return result
+
 
     def write_raw(self, raw_event: Dict[str, Any]) -> bool:
         try:
@@ -594,16 +874,67 @@ class SQLiteEventStore(EventStore):
             record["feature_summary"] = json.loads(record["feature_summary"])
             return record
 
+    def _stream_event_rows(
+        self,
+        clauses: Sequence[str] = (),
+        values: Sequence[Any] = (),
+        page_size: int = STREAM_PAGE_SIZE,
+    ) -> Iterator[sqlite3.Row]:
+        """
+        Walk matching event rows in `(timestamp, id)` order, one page at a time.
+
+        The previous implementation ran `fetchall()` and yielded from the list.
+        That is bounded by the size of the table, so a month of retained telemetry
+        turns a baseline rebuild into an out-of-memory kill -- and it was written
+        that way for a real reason: holding a cursor open across a consumer's
+        iteration pins a WAL read mark and blocks checkpointing for as long as the
+        consumer takes.
+
+        Keyset pagination gets both properties. Each page is a complete, committed
+        read that ends before the yield, so nothing is pinned between pages, and
+        memory is bounded by `page_size` rather than by the table. The cursor is
+        `(timestamp, id)` rather than `id` alone because that is the order callers
+        see, and `id` order is not `timestamp` order once a collector restarts and
+        re-ingests slightly older events.
+
+        The trade-off, stated plainly: this is not a snapshot. Rows committed
+        after the walk began and sorting after the cursor will be seen. For the
+        readers here -- baseline and analytics passes over historical telemetry --
+        seeing a few extra recent events is harmless, and a stalled WAL checkpoint
+        on a live collector is not.
+        """
+        base = "SELECT * FROM events"
+        conditions = list(clauses)
+        cursor_timestamp: Optional[float] = None
+        cursor_id: Optional[int] = None
+
+        while True:
+            page_conditions = list(conditions)
+            page_values = list(values)
+            if cursor_id is not None:
+                page_conditions.append("(timestamp > ? OR (timestamp = ? AND id > ?))")
+                page_values.extend([cursor_timestamp, cursor_timestamp, cursor_id])
+            sql = base
+            if page_conditions:
+                sql += " WHERE " + " AND ".join(page_conditions)
+            sql += " ORDER BY timestamp ASC, id ASC LIMIT ?"
+            page_values.append(page_size)
+
+            with self._transaction() as conn:
+                rows = conn.execute(sql, page_values).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                yield row
+            cursor_timestamp = rows[-1]["timestamp"]
+            cursor_id = rows[-1]["id"]
+            if len(rows) < page_size:
+                return
+
     def read_all(self) -> Iterator[Event]:
-        with self._transaction() as conn:
-            rows = conn.execute(
-                "SELECT * FROM events ORDER BY timestamp ASC, id ASC"
-            ).fetchall()
-        # Decoded outside the connection scope: rows are already materialised, so
-        # holding the connection open for the consumer's iteration would pin a
-        # descriptor and a WAL read mark for an unbounded time.
-        for row in rows:
+        for row in self._stream_event_rows():
             yield self._row_to_event(row)
+
 
     def read_event_records(self, limit: int = 100, event_type: Optional[str] = None) -> List[Dict[str, Any]]:
         limit = max(1, min(int(limit), 500))
@@ -662,10 +993,7 @@ class SQLiteEventStore(EventStore):
             yield from self.read_all()
             return
 
-        sql = "SELECT * FROM events WHERE " + " AND ".join(clauses) + " ORDER BY timestamp ASC"
-        with self._transaction() as conn:
-            rows = conn.execute(sql, values).fetchall()
-        for row in rows:
+        for row in self._stream_event_rows(clauses, values):
             yield self._row_to_event(row)
 
     def get_recent_events(self, limit: int = 100) -> List[Event]:
@@ -685,6 +1013,176 @@ class SQLiteEventStore(EventStore):
         with self._transaction() as conn:
             row = conn.execute("SELECT MAX(timestamp) AS latest FROM events").fetchone()
             return float(row["latest"]) if row["latest"] is not None else None
+
+    def oldest_event_timestamp(self) -> Optional[float]:
+        """Coverage floor of the database, and the number retention moves."""
+        with self._transaction() as conn:
+            row = conn.execute("SELECT MIN(timestamp) AS oldest FROM events").fetchone()
+            return float(row["oldest"]) if row["oldest"] is not None else None
+
+    def write_maintenance_record(self, record: Dict[str, Any]) -> int:
+        """Append one data-lifecycle action to the durable maintenance log."""
+        with self._transaction() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO maintenance_log (
+                    action, reason, events_deleted, rows_deleted, cutoff_timestamp,
+                    oldest_retained_timestamp, db_bytes_before, db_bytes_after,
+                    duration_seconds, detail, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record["action"],
+                    record["reason"],
+                    int(record.get("events_deleted", 0)),
+                    int(record.get("rows_deleted", 0)),
+                    record.get("cutoff_timestamp"),
+                    record.get("oldest_retained_timestamp"),
+                    record.get("db_bytes_before"),
+                    record.get("db_bytes_after"),
+                    float(record.get("duration_seconds", 0.0)),
+                    record.get("detail"),
+                    float(record.get("created_at", time.time())),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def read_maintenance_records(self, limit: int = 100) -> List[Dict[str, Any]]:
+        limit = max(1, min(int(limit), 1000))
+        with self._transaction() as conn:
+            rows = conn.execute(
+                "SELECT * FROM maintenance_log ORDER BY created_at DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def delete_events_older_than(self, cutoff: float, batch: int = 5000) -> int:
+        """
+        Delete events at or before `cutoff`, in bounded batches.
+
+        Batched because a single unbounded `DELETE` holds the write lock for the
+        whole scan; on a large table that stalls the ingest path long past the
+        5-second `busy_timeout` and the collector starts dropping events -- data
+        loss caused by the retention pass that exists to prevent data loss.
+
+        The subselect uses `idx_events_timestamp_id` (migration 5), so each batch
+        is an index range scan rather than a table scan.
+        """
+        cutoff = float(cutoff)
+        batch = max(1, int(batch))
+        deleted = 0
+        while True:
+            with self._transaction() as conn:
+                cursor = conn.execute(
+                    "DELETE FROM events WHERE id IN ("
+                    "SELECT id FROM events WHERE timestamp <= ? ORDER BY timestamp ASC, id ASC LIMIT ?"
+                    ")",
+                    (cutoff, batch),
+                )
+                removed = cursor.rowcount or 0
+            deleted += removed
+            if removed < batch:
+                return deleted
+
+    def delete_oldest_events(self, count: int) -> Tuple[int, Optional[float]]:
+        """
+        Delete the `count` oldest events, returning how many went and the new floor.
+
+        Used by the size cap, which has to free space regardless of age: a host
+        under a burst can exceed the byte budget with telemetry that is all newer
+        than the retention window, and refusing to act there means filling the
+        disk while claiming to be within policy.
+        """
+        count = max(0, int(count))
+        if count == 0:
+            return 0, self.oldest_event_timestamp()
+        with self._transaction() as conn:
+            cursor = conn.execute(
+                "DELETE FROM events WHERE id IN ("
+                "SELECT id FROM events ORDER BY timestamp ASC, id ASC LIMIT ?"
+                ")",
+                (count,),
+            )
+            deleted = cursor.rowcount or 0
+        return deleted, self.oldest_event_timestamp()
+
+    def delete_analytics_older_than(self, cutoff: float) -> int:
+        """
+        Drop derived analytics whose window ended at or before `cutoff`.
+
+        Derived rows are pruned on the same clock as the events they were derived
+        from. Keeping a finding whose evidence has aged out would leave the
+        dashboard showing a detection an analyst cannot investigate, which is
+        worse than showing nothing: the explanation cites event ids that no longer
+        resolve.
+
+        Explanations, assistant responses, and policy decisions are removed by
+        finding id rather than by their own timestamps, so the four tables stay
+        mutually consistent.
+        """
+        cutoff = float(cutoff)
+        with self._transaction() as conn:
+            findings = [
+                int(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM detection_findings WHERE window_end <= ?", (cutoff,)
+                ).fetchall()
+            ]
+            rows_deleted = 0
+            for start in range(0, len(findings), 500):
+                chunk = findings[start:start + 500]
+                placeholders = ", ".join("?" for _ in chunk)
+                for table in ("finding_explanations", "assistant_responses", "policy_decisions"):
+                    cursor = conn.execute(
+                        f"DELETE FROM {table} WHERE finding_id IN ({placeholders})", chunk
+                    )
+                    rows_deleted += cursor.rowcount or 0
+                cursor = conn.execute(
+                    f"DELETE FROM detection_findings WHERE id IN ({placeholders})", chunk
+                )
+                rows_deleted += cursor.rowcount or 0
+            for table, column in (
+                ("behavior_risks", "window_end"),
+                ("event_features", "window_end"),
+                ("anomaly_scores", "timestamp"),
+            ):
+                cursor = conn.execute(f"DELETE FROM {table} WHERE {column} <= ?", (cutoff,))
+                rows_deleted += cursor.rowcount or 0
+            # behavior_baselines is deliberately not pruned here: a ready baseline
+            # is the reference the detector scores against, and deleting the only
+            # one because it is old would silently disable detection.
+            return rows_deleted
+
+    def vacuum(self) -> None:
+        """
+        Return free pages to the filesystem.
+
+        Deleting rows leaves the pages allocated to the file, so a database that
+        has pruned half its events still occupies the disk it did before. VACUUM
+        rebuilds the file, which needs roughly its own size in free space and
+        takes an exclusive lock -- so it is scheduled (see `storage.retention`)
+        rather than run after every prune.
+
+        Runs on its own autocommit connection: VACUUM cannot execute inside a
+        transaction, and the pooled connections are in Python's legacy implicit
+        transaction mode.
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.isolation_level = None
+            conn.execute("PRAGMA busy_timeout = 30000")
+            conn.execute("VACUUM")
+            # VACUUM rebuilds the database *through* the WAL, so the log ends up
+            # holding a copy of everything just rewritten. Without a truncating
+            # checkpoint the total on-disk footprint can be larger after a vacuum
+            # than before it, which would make the size cap in `storage.retention`
+            # chase a number that vacuuming moves the wrong way. A busy
+            # checkpoint is not fatal: another reader holding the WAL open only
+            # defers the reclaim to the next pass.
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
+        self._apply_file_mode()
 
     # Fields of a health snapshot that reach the database, paired with the value
     # used when a caller omits one. Declared rather than spelled out inside the
@@ -716,6 +1214,8 @@ class SQLiteEventStore(EventStore):
         "kernel_lost_event_count": 0,
         "first_kernel_loss_timestamp": None,
         "last_kernel_loss_timestamp": None,
+        "quarantined_batch_count": 0,
+        "quarantined_event_count": 0,
     }
 
     def write_collector_health(self, health: Dict[str, Any]) -> None:
@@ -743,6 +1243,72 @@ class SQLiteEventStore(EventStore):
         with self._transaction() as conn:
             row = conn.execute("SELECT * FROM collector_runtime WHERE id = 1").fetchone()
             return dict(row) if row else None
+
+    # Per-source supervision state, paired with the value used when a caller
+    # omits one. Same declared-columns approach as COLLECTOR_HEALTH_COLUMNS, and
+    # for the same reason: a supervision field the supervisor tracks but never
+    # persists is a field the API and the operator cannot see.
+    COLLECTOR_SOURCE_COLUMNS: Dict[str, Any] = {
+        "status": "unknown",
+        "detail": None,
+        "error": None,
+        "started_at": None,
+        "stopped_at": None,
+        "last_event_timestamp": None,
+        "processed_count": 0,
+        "restart_count": 0,
+        "consecutive_failures": 0,
+        "last_failure_at": None,
+        "next_restart_at": None,
+        "backoff_seconds": 0.0,
+        "crash_looping": 0,
+        "quarantined_batch_count": 0,
+        "quarantined_event_count": 0,
+        "updated_at": None,
+    }
+
+    def write_source_state(self, name: str, state: Dict[str, Any]) -> None:
+        """
+        Upsert one collector's supervision state.
+
+        Called on every transition (start, failure, backoff, degradation), so it
+        is the record an operator reads to find out which collector is down and
+        for how long. Writes the whole row rather than a delta: a partial update
+        would leave a stale `next_restart_at` next to a fresh `status`, which reads
+        as a restart that is already overdue.
+        """
+        if not name:
+            raise ValueError("source name is required")
+        columns = list(self.COLLECTOR_SOURCE_COLUMNS)
+        placeholders = ", ".join("?" for _ in columns)
+        assignments = ", ".join(f"{column}=excluded.{column}" for column in columns)
+        values: List[Any] = []
+        for column, default in self.COLLECTOR_SOURCE_COLUMNS.items():
+            value = state.get(column, default)
+            if value is None and default is not None:
+                value = default
+            if column == "crash_looping":
+                value = int(bool(value))
+            values.append(value)
+        with self._transaction() as conn:
+            conn.execute(
+                f"""
+                INSERT INTO collector_sources (name, {", ".join(columns)})
+                VALUES (?, {placeholders})
+                ON CONFLICT(name) DO UPDATE SET {assignments}
+                """,
+                (name, *values),
+            )
+
+    def read_source_states(self) -> List[Dict[str, Any]]:
+        with self._transaction() as conn:
+            rows = conn.execute("SELECT * FROM collector_sources ORDER BY name ASC").fetchall()
+        states = []
+        for row in rows:
+            state = dict(row)
+            state["crash_looping"] = bool(state.get("crash_looping"))
+            states.append(state)
+        return states
 
     def reset(self) -> None:
         with self._transaction() as conn:

@@ -1,15 +1,19 @@
-import os
 import time
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import RedirectResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
+from api.auth import TokenAuthenticator, extract_token, unprotected_paths
+from observability import alerts as alerting
+from observability import metrics as metrics_module
+from observability.config import Settings
+from observability.config import settings as load_process_settings
 from storage.sqlite_store import SQLiteEventStore
 
 
@@ -188,6 +192,75 @@ class PolicyDecisionResponse(StrictModel):
     advisory_rejection: Optional[str] = None
 
 
+class LivenessResponse(StrictModel):
+    status: str
+    collected_at: float
+
+
+class ReadinessResponse(StrictModel):
+    status: str
+    # Every failing condition, not the first one. An operator restarting a service
+    # because of stale data should also learn in the same response that the file
+    # permissions are wrong, rather than after the restart fails to help.
+    reasons: List[str]
+    event_count: int
+    data_age_seconds: Optional[float] = None
+    degraded_sources: List[str]
+    collected_at: float
+
+
+class AlertResponse(StrictModel):
+    name: str
+    severity: str
+    summary: str
+    value: Optional[float] = None
+    threshold: Optional[float] = None
+    labels: Dict[str, str]
+
+
+class AlertsResponse(StrictModel):
+    firing: int
+    critical: int
+    warning: int
+    alerts: List[AlertResponse]
+    collected_at: float
+
+
+class SourceStateResponse(StrictModel):
+    name: str
+    status: str
+    detail: Optional[str] = None
+    error: Optional[str] = None
+    started_at: Optional[float] = None
+    stopped_at: Optional[float] = None
+    last_event_timestamp: Optional[float] = None
+    processed_count: int
+    restart_count: int
+    consecutive_failures: int
+    last_failure_at: Optional[float] = None
+    next_restart_at: Optional[float] = None
+    backoff_seconds: float
+    crash_looping: bool
+    quarantined_batch_count: int
+    quarantined_event_count: int
+    updated_at: Optional[float] = None
+
+
+class MaintenanceRecordResponse(StrictModel):
+    id: int
+    action: str
+    reason: str
+    events_deleted: int
+    rows_deleted: int
+    cutoff_timestamp: Optional[float] = None
+    oldest_retained_timestamp: Optional[float] = None
+    db_bytes_before: Optional[int] = None
+    db_bytes_after: Optional[int] = None
+    duration_seconds: float
+    detail: Optional[str] = None
+    created_at: float
+
+
 def _read_policies() -> List[Dict[str, Any]]:
     try:
         with DEFAULT_POLICY_PATH.open("r", encoding="utf-8") as handle:
@@ -199,19 +272,83 @@ def _read_policies() -> List[Dict[str, Any]]:
     return document["policies"]
 
 
-def create_app(store: Optional[SQLiteEventStore] = None) -> FastAPI:
-    database_path = os.getenv("SECURITY_DB_PATH", "phase2_events.db")
-    stale_after_seconds = float(os.getenv("TELEMETRY_STALE_AFTER_SECONDS", "300"))
-    if stale_after_seconds <= 0:
-        stale_after_seconds = 300.0
-    event_store = store or SQLiteEventStore(database_path)
+def create_app(
+    store: Optional[SQLiteEventStore] = None,
+    config: Optional[Settings] = None,
+) -> FastAPI:
+    """
+    Build the application.
+
+    Both the store and the settings are injectable so the suite can exercise
+    authentication, staleness, and alert thresholds without touching `/etc` or the
+    process environment. When neither is given, the layered configuration
+    (defaults < config file < environment) decides -- so a packaged install is
+    configured in exactly one place.
+    """
+    resolved = config or load_process_settings()
+    stale_after_seconds = resolved.stale_after_seconds
+    event_store = store or SQLiteEventStore(
+        resolved.db_path,
+        file_mode=resolved.db_file_mode,
+        enforce_file_mode=resolved.db_enforce_mode,
+    )
     app = FastAPI(
         title="Linux XAI Security Assistant API",
-        version="0.8.0",
+        version="0.9.0",
         description="Read-only security telemetry, detection, explanation, assistant, and policy views.",
     )
     app.state.store = event_store
+    app.state.settings = resolved
+    # Constructed at startup, not per request: a token file that cannot be read, or
+    # a token too short to be a credential, must stop the service coming up rather
+    # than surface as a 500 on whichever request happens to arrive first.
+    app.state.authenticator = TokenAuthenticator(resolved)
     app.mount("/dashboard", StaticFiles(directory=str(ROOT / "dashboard"), html=True), name="dashboard")
+
+    open_paths = frozenset(unprotected_paths())
+
+    @app.middleware("http")
+    async def require_token(request: Request, call_next):
+        """
+        Gate every telemetry-bearing path on a valid token.
+
+        Implemented as middleware rather than a per-route dependency so that a
+        route added later is protected by default. Forgetting a dependency on one
+        new endpoint would silently expose it; there is nothing to forget here.
+
+        The static dashboard is excluded because it is markup and JavaScript with
+        no telemetry in it -- the data it renders comes from `/api/*`, which is
+        gated. The browser supplies the token from there.
+        """
+        path = request.url.path
+        authenticator: TokenAuthenticator = app.state.authenticator
+        gated = path == "/metrics" or path.startswith("/api/")
+        if not gated or path in open_paths:
+            return await call_next(request)
+        if authenticator.required and not authenticator.configured:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": (
+                        "API authentication is required but no tokens are configured; set api_token_file "
+                        "or api_tokens"
+                    )
+                },
+            )
+        presented = extract_token(request.headers.get("authorization"), request.headers.get("x-api-key"))
+        if not authenticator.verify(presented):
+            # WWW-Authenticate is what makes a 401 actionable to a generic client,
+            # and the body names the two accepted headers so a human debugging a
+            # curl does not have to read this file.
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "missing or invalid API token; send Authorization: Bearer <token> or X-API-Key"},
+                headers={"WWW-Authenticate": 'Bearer realm="linux-xai-security"'},
+            )
+        return await call_next(request)
+
+    def _snapshot() -> metrics_module.MetricsSnapshot:
+        return metrics_module.collect_snapshot(event_store, resolved)
 
     @app.get("/", include_in_schema=False)
     def root() -> RedirectResponse:
@@ -220,6 +357,65 @@ def create_app(store: Optional[SQLiteEventStore] = None) -> FastAPI:
     @app.get("/api/health", response_model=HealthResponse)
     def health() -> HealthResponse:
         return HealthResponse(status="ok", read_only=True)
+
+    @app.get("/api/health/live", response_model=LivenessResponse)
+    def liveness() -> LivenessResponse:
+        """
+        Process liveness, for `systemd`/`ExecStartPost` and container probes.
+
+        Answers without touching the database on purpose: a wedged or missing
+        database is a readiness failure, and restarting this process on it would
+        destroy the only component still able to report the problem.
+        """
+        _, detail = metrics_module.liveness(metrics_module.MetricsSnapshot(collected_at=time.time()))
+        return LivenessResponse(**detail)
+
+    @app.get("/api/health/ready", response_model=ReadinessResponse)
+    def readiness() -> JSONResponse:
+        """
+        Whether this instance's answers can be trusted, as 200 or 503.
+
+        The status code carries the verdict so a load balancer or `curl -f` needs
+        no JSON parsing; the body carries every reason so a human needs no second
+        request.
+        """
+        ready, detail = metrics_module.readiness(_snapshot(), resolved)
+        payload = ReadinessResponse(**detail)
+        return JSONResponse(status_code=200 if ready else 503, content=payload.model_dump())
+
+    @app.get("/metrics", response_class=PlainTextResponse, include_in_schema=False)
+    def metrics() -> PlainTextResponse:
+        """Prometheus text exposition of ingestion, loss, storage, and supervision state."""
+        body = metrics_module.render_prometheus(_snapshot())
+        return PlainTextResponse(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")
+
+    @app.get("/api/alerts", response_model=AlertsResponse)
+    def alerts() -> AlertsResponse:
+        snapshot = _snapshot()
+        firing = alerting.evaluate(snapshot, resolved)
+        return AlertsResponse(
+            firing=len(firing),
+            critical=sum(1 for alert in firing if alert.severity == alerting.SEVERITY_CRITICAL),
+            warning=sum(1 for alert in firing if alert.severity == alerting.SEVERITY_WARNING),
+            alerts=[AlertResponse(**alert.to_dict()) for alert in firing],
+            collected_at=snapshot.collected_at,
+        )
+
+    @app.get("/api/sources", response_model=List[SourceStateResponse])
+    def sources() -> List[SourceStateResponse]:
+        """Per-source supervision state: which collector is running, restarting, or given up on."""
+        return event_store.read_source_states()
+
+    @app.get("/api/maintenance", response_model=List[MaintenanceRecordResponse])
+    def maintenance(limit: int = Query(default=50, ge=1, le=500)) -> List[MaintenanceRecordResponse]:
+        """
+        The retention audit trail.
+
+        Exposed because an analyst who cannot find an event needs to distinguish
+        "never collected" from "pruned at 03:00", and those lead to different next
+        steps.
+        """
+        return event_store.read_maintenance_records(limit=limit)
 
     @app.get("/api/telemetry/status", response_model=TelemetryStatusResponse)
     def telemetry_status() -> TelemetryStatusResponse:

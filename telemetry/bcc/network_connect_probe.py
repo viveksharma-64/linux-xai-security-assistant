@@ -17,10 +17,13 @@ import sys
 import time
 
 try:
-    from bcc import BPF
+    from telemetry.bcc.bpf_runtime import load_bpf, require_bpf
 except ImportError:
-    sys.stderr.write("ERROR: bcc not installed\n")
-    raise SystemExit(1)
+    from bpf_runtime import load_bpf, require_bpf
+
+# None when bcc is unavailable; checked in main() rather than here so importing
+# this module does not kill the interpreter. See telemetry/bcc/bpf_runtime.py.
+BPF = load_bpf()
 
 BPF_PROGRAM = r"""
 #include <uapi/linux/ptrace.h>
@@ -96,6 +99,7 @@ def handle_connect_event(cpu, data, size):
 
 def main():
     global b
+    require_bpf(BPF)
     print(json.dumps({
         "event_type": "telemetry_startup",
         "message": "TCP IPv4 connect probe attached.",

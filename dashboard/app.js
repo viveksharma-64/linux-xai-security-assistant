@@ -1,6 +1,31 @@
 const $ = (selector) => document.querySelector(selector);
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>\"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[char]));
-const getJson = async (url) => { const response = await fetch(url); if (!response.ok) throw new Error(`${response.status}`); return response.json(); };
+
+// The API requires a bearer token; the static dashboard does not, because it holds
+// no telemetry. The token is kept in sessionStorage rather than localStorage so it
+// dies with the tab -- a shared workstation should not leave a working credential
+// behind for the next person who opens the browser.
+const TOKEN_KEY = "linuxXaiApiToken";
+const apiToken = () => sessionStorage.getItem(TOKEN_KEY) || "";
+
+function promptForToken(message) {
+  const token = window.prompt(message || "API token:", "");
+  if (token) sessionStorage.setItem(TOKEN_KEY, token.trim());
+  return token ? token.trim() : "";
+}
+
+const getJson = async (url) => {
+  const send = (token) => fetch(url, token ? { headers: { Authorization: `Bearer ${token}` } } : undefined);
+  let response = await send(apiToken());
+  if (response.status === 401) {
+    // Asked for once, on the first refusal, rather than at page load: an instance
+    // configured with api_require_auth false should not demand a token nobody set.
+    const token = promptForToken("This API requires a token. Paste it to continue:");
+    if (token) response = await send(token);
+  }
+  if (!response.ok) throw new Error(`${response.status}`);
+  return response.json();
+};
 
 // A dropped-event count on its own cannot tell an analyst whether telemetry is
 // being lost right now or was lost once an hour ago -- and a gap in the evidence

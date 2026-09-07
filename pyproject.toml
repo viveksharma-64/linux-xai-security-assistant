@@ -66,9 +66,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Test runner for the regression suite. Kept deliberately small: every addition
-# here is a dependency an offline Kali host must be able to satisfy.
-dev = ["pytest>=9.1,<10"]
+# Test and CI tooling. Kept deliberately small: every addition here is a
+# dependency an offline Kali host must be able to satisfy. `httpx` is the
+# transport Starlette's TestClient uses; it is declared so the API tests import
+# on a clean checkout rather than only where FastAPI happened to pull it in.
+dev = [
+    "pytest>=9.1,<10",
+    "pytest-cov>=5,<8",
+    "httpx>=0.28,<0.29",
+    "ruff>=0.6,<0.15",
+    "mypy>=1.11,<2",
+    "types-PyYAML>=6,<7",
+]
 
 [project.urls]
 Homepage = "https://github.com/vivek-kumar-sharma/linux-xai-security-assistant"
@@ -79,6 +88,10 @@ Homepage = "https://github.com/vivek-kumar-sharma/linux-xai-security-assistant"
 linux-xai-api = "api.__main__:main"
 # Supervised bounded ingestion service.
 linux-xai-ingest = "pipeline.live_ingestion:main"
+# Unattended supervised daemon: multi-collector supervision with restart backoff
+# and crash-loop degradation, in-process retention, and transition-only alerting.
+# This is the entrypoint the packaged systemd unit runs; see deploy/systemd/.
+linux-xai-service = "pipeline.service:main"
 
 [tool.setuptools]
 # Explicit package list. Auto-discovery is not used because the repository root
@@ -126,4 +139,61 @@ filterwarnings = [
     # Python 3.14. It originates in /usr/lib/python3/dist-packages/bcc and is
     # not actionable from this repository.
     "ignore:Due to '_pack_'.*:DeprecationWarning",
+]
+# The API-authentication tests opt the gate back on with this marker; conftest
+# turns auth off for every other test because they predate it.
+markers = [
+    "api_auth: exercise the API with authentication enabled",
+]
+
+[tool.ruff]
+# Advisory in CI (see .github/workflows/ci.yml): the linter is not installable on
+# the offline build host, so it cannot be a merge gate until a maintainer with it
+# installed has baselined the pre-existing tree. Config lives here so `ruff check`
+# is uniform wherever it does run.
+target-version = "py311"
+line-length = 120
+extend-exclude = [".venv", "ml/models", "dashboard"]
+
+[tool.ruff.lint]
+# E/F/W: pyflakes + pycodestyle. I: import order. B: bugbear. UP: pyupgrade.
+select = ["E", "F", "W", "I", "B", "UP"]
+# E501 (line length) is reported, not enforced: several config tables are wide by
+# design and reflowing them would hurt readability more than it helps.
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests bind fixtures and construct objects for their side effects.
+"tests/*" = ["B011"]
+
+[tool.mypy]
+# Advisory in CI, same reason as ruff. Scoped and lenient on purpose: this is a
+# large tree that was not written against a type checker, so the value here is
+# catching regressions in the Phase B modules, not retrofitting annotations
+# everywhere at once.
+python_version = "3.11"
+ignore_missing_imports = true
+warn_redundant_casts = true
+warn_unused_ignores = false
+no_implicit_optional = true
+check_untyped_defs = true
+
+[tool.coverage.run]
+branch = true
+source = [
+    "api",
+    "observability",
+    "pipeline",
+    "storage",
+]
+# eBPF probes need a live kernel and libbcc, so they never execute under CI and
+# would only dilute the percentage with unreachable lines.
+omit = ["telemetry/bcc/*", "*/__main__.py"]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
 ]

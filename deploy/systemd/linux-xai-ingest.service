@@ -1,0 +1,85 @@
+# Supervised telemetry ingestion: the unattended daemon that must survive a week
+# of injected collector kills with no data loss or manual intervention.
+#
+# It supervises the eBPF collector subprocesses (restart with backoff, crash-loop
+# degradation, on-disk quarantine of batches a failed DB write would otherwise
+# lose), prunes and size-caps the database in-process, and logs alert transitions.
+# Retention runs inside this process on a timer, so there is deliberately no
+# separate .timer unit to drift out of sync with it.
+#
+# Paths below assume an install under /opt/linux-xai-security with a virtualenv at
+# .venv; adjust ExecStart and WorkingDirectory to match your layout. See
+# deploy/README.md.
+
+[Unit]
+Description=Linux XAI Security Assistant - supervised telemetry ingestion
+Documentation=file:///opt/linux-xai-security/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=linux-xai
+Group=linux-xai
+WorkingDirectory=/opt/linux-xai-security
+
+# The eBPF probes are attached by the collector subprocesses this service spawns.
+# Ambient capabilities are the mechanism that lets an unprivileged service hand a
+# child exactly the kernel rights it needs and nothing else -- no setuid binary,
+# no root. CAP_BPF + CAP_PERFMON cover kernels >= 5.8; CAP_SYS_ADMIN is the
+# fallback older kernels and some BCC operations still require. Trim this set to
+# the minimum your kernel accepts and delete the rest.
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_SYS_RESOURCE
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_SYS_RESOURCE
+# Ambient caps survive execve without file capabilities, so a child can still be
+# denied the ability to *gain* new privileges via setuid.
+NoNewPrivileges=yes
+
+# /var/lib/linux-xai-security, created 0700 and owned by linux-xai. This is the
+# only writable location; the evidence database lives here at mode 0600.
+StateDirectory=linux-xai-security
+StateDirectoryMode=0700
+Environment=SECURITY_DB_PATH=/var/lib/linux-xai-security/events.db
+Environment=SECURITY_CONFIG_FILE=/etc/linux-xai-security/config.yaml
+Environment=PYTHONUNBUFFERED=1
+
+# One --source per collector: NAME=COMMAND, where COMMAND emits JSONL on stdout.
+# A crashed collector is restarted here; a permanently broken one is marked
+# degraded and the service exits non-zero so Restart= re-runs the whole set.
+ExecStart=/opt/linux-xai-security/.venv/bin/linux-xai-service \
+  --source process_exec=/opt/linux-xai-security/.venv/bin/python telemetry/bcc/process_exec_probe.py \
+  --source network_connect=/opt/linux-xai-security/.venv/bin/python telemetry/bcc/network_connect_probe.py \
+  --source network_state=/opt/linux-xai-security/.venv/bin/python telemetry/bcc/network_state_probe.py \
+  --source ipc_pipe=/opt/linux-xai-security/.venv/bin/python telemetry/bcc/ipc_pipe_probe.py
+
+Restart=always
+RestartSec=5
+# SIGTERM is handled: the service drains, flushes, and persists collector health
+# before exiting, so give it room before SIGKILL.
+TimeoutStopSec=30
+
+# --- sandbox -----------------------------------------------------------------
+# Read-only root with a single writable state dir. Directives that would break
+# eBPF are deliberately left off with the reason, so they are not "fixed" back on
+# by someone tightening the file without a kernel to test against.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=no          # BCC needs /dev and /sys/kernel/debug access
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no  # the BPF verifier/JIT maps executable memory
+SystemCallArchitectures=native
+# bpf() and perf_event_open() live in @privileged/@debug; @module stays blocked.
+SystemCallFilter=@system-service @privileged @debug
+SystemCallFilter=~@module @swap @reboot @clock
+
+[Install]
+WantedBy=multi-user.target

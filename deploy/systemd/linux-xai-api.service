@@ -1,0 +1,72 @@
+# Read-only API and dashboard host.
+#
+# This process never attaches a probe and never writes evidence: it serves the
+# authenticated JSON API, the Prometheus metrics endpoint, and the static
+# dashboard. It therefore runs with no capabilities and a much tighter sandbox
+# than the ingestion service. It shares the state directory read/write only
+# because SQLite's WAL mode needs to create -wal/-shm sidecars and take a lock to
+# read; it performs no INSERTs.
+#
+# It binds loopback by default. Expose it through a reverse proxy that terminates
+# TLS rather than moving the bind address off 127.0.0.1.
+
+[Unit]
+Description=Linux XAI Security Assistant - read-only API and dashboard
+Documentation=file:///opt/linux-xai-security/deploy/README.md
+After=linux-xai-ingest.service
+Wants=linux-xai-ingest.service
+
+[Service]
+Type=simple
+User=linux-xai
+Group=linux-xai
+WorkingDirectory=/opt/linux-xai-security
+
+# Authentication is on by default and fails closed: with no token configured the
+# API returns 503 rather than serving the evidence feed open. The token file is
+# 0600 and owned by linux-xai; the service refuses to start if it is group- or
+# world-readable.
+Environment=SECURITY_DB_PATH=/var/lib/linux-xai-security/events.db
+Environment=SECURITY_CONFIG_FILE=/etc/linux-xai-security/config.yaml
+Environment=SECURITY_API_TOKEN_FILE=/etc/linux-xai-security/tokens
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/linux-xai-security/.venv/bin/linux-xai-api
+
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+
+# --- sandbox -----------------------------------------------------------------
+# No capabilities at all, and no path to gain any.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+StateDirectory=linux-xai-security
+StateDirectoryMode=0700
+# WAL sidecars require write access to the directory even for a reader.
+ReadWritePaths=/var/lib/linux-xai-security
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @module @swap @reboot @clock
+
+[Install]
+WantedBy=multi-user.target

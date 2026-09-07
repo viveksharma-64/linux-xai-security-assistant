@@ -63,6 +63,7 @@ from detection.detector import DetectionEngine
 from explainability.explainer import FindingExplainer
 from observability import configure_logging
 from pipeline.event_stream import CanonicalNormalizer, Event
+from pipeline.quarantine import BatchQuarantine
 from policy.engine import PolicyEngine
 from storage.sqlite_store import SQLiteEventStore
 
@@ -140,6 +141,12 @@ class CollectorHealth:
     kernel_lost_event_count: int = 0
     first_kernel_loss_timestamp: Optional[float] = None
     last_kernel_loss_timestamp: Optional[float] = None
+    # Batches the database refused, set aside for replay. Counted separately from
+    # every other loss figure because it is the only one that is recoverable: the
+    # events still exist on disk, and the operator's action is a replay rather
+    # than an investigation into a gap.
+    quarantined_batch_count: int = 0
+    quarantined_event_count: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -278,6 +285,9 @@ class LiveIngestionService:
         analysis_pipeline: Optional[Callable[[list[Event]], None]] = None,
         health_interval_seconds: float = 1.0,
         backpressure_timeout_seconds: float = 2.0,
+        ingest_batch_size: int = 50,
+        quarantine: Optional[BatchQuarantine] = None,
+        source_name: Optional[str] = None,
     ):
         if queue_size <= 0:
             raise ValueError("queue_size must be positive")
@@ -285,6 +295,8 @@ class LiveIngestionService:
             raise ValueError("health_interval_seconds must be positive")
         if backpressure_timeout_seconds < 0:
             raise ValueError("backpressure_timeout_seconds must not be negative")
+        if ingest_batch_size <= 0:
+            raise ValueError("ingest_batch_size must be positive")
         self.source = source
         self.store = store
         self.queue: Queue[object] = Queue(maxsize=queue_size)
@@ -295,6 +307,14 @@ class LiveIngestionService:
         # loss. 0 restores the old drop-immediately behaviour for callers that
         # would rather shed load than add latency.
         self.backpressure_timeout_seconds = backpressure_timeout_seconds
+        # Events per write transaction, and per analysis pass. One knob for both
+        # because they were the same number before batching existed, and splitting
+        # them would let an operator tune the write path into a state where
+        # analysis windows silently changed size.
+        self.ingest_batch_size = ingest_batch_size
+        self.analysis_batch_size = ingest_batch_size
+        self.quarantine = quarantine
+        self.source_name = source_name
         self._stop = threading.Event()
         self._producer_done = threading.Event()
         self._health_lock = threading.Lock()
@@ -304,6 +324,8 @@ class LiveIngestionService:
         self._queue_depth = 0
         self._queue_high_water_mark = 0
         self._last_health_write = 0.0
+        # Sticky, unlike `_stop`, which `start()` may clear.
+        self._stop_requested = False
 
     def start(self) -> None:
         if self._producer and self._producer.is_alive():
@@ -317,7 +339,17 @@ class LiveIngestionService:
                 queue_capacity=self.queue.maxsize,
             )
         self._persist_health()
-        self._stop.clear()
+        # Deliberately not an unconditional clear. A stop that arrived before the
+        # threads existed has to survive `start()`: clearing it would resurrect a
+        # collector the operator (or systemd) already asked to shut down, and the
+        # producer would run on with nothing left to stop it. A caller that starts a
+        # service which has already run once is asking for a restart, so that case
+        # does clear -- the distinction is whether a lifecycle ever began.
+        if self._producer is None and self._stop_requested:
+            LOGGER.info("ingestion_start_skipped reason=stop_requested_before_start")
+        else:
+            self._stop_requested = False
+            self._stop.clear()
         self._producer_done.clear()
         self._queue_depth = 0
         self._queue_high_water_mark = 0
@@ -335,12 +367,18 @@ class LiveIngestionService:
         return self.health()
 
     def stop(self) -> None:
-        with self._health_lock:
-            if self._health.status in {"stopped", "failed", "unknown"}:
-                return
-            self._health.status = "stopping"
-            self._health.detail = "shutdown requested"
+        # The event and the source close happen unconditionally, before the health
+        # bookkeeping. Guarding them behind the status check meant a stop that
+        # arrived before `start()` -- status still "unknown" -- was dropped whole:
+        # the flag was never set, the source was never closed, and the collector
+        # then ran until the process was killed. Health status is the only part that
+        # is conditional, so a terminal status is not overwritten by "stopping".
+        self._stop_requested = True
         self._stop.set()
+        with self._health_lock:
+            if self._health.status not in {"stopped", "failed", "unknown"}:
+                self._health.status = "stopping"
+                self._health.detail = "shutdown requested"
         close = getattr(self.source, "close", None)
         if callable(close):
             close()
@@ -529,6 +567,7 @@ class LiveIngestionService:
             )
 
     def _consume(self) -> None:
+        pending: list[Event] = []
         batch: list[Event] = []
         try:
             while True:
@@ -537,6 +576,13 @@ class LiveIngestionService:
                 except Empty:
                     if self._producer_done.is_set():
                         break
+                    # Idle: flush what is held rather than waiting for the batch to
+                    # fill. Otherwise a quiet host's last few events would sit in
+                    # memory indefinitely -- unqueryable, and lost on a crash --
+                    # which is the opposite of what batching is for. The durability
+                    # bound is therefore this poll interval, not the batch size.
+                    pending = self._flush(pending, batch)
+                    batch = self._maybe_analyse(batch)
                     self._persist_health()
                     continue
                 if item is _SENTINEL:
@@ -546,17 +592,12 @@ class LiveIngestionService:
                     with self._health_lock:
                         self._health.malformed_count += 1
                     continue
-                inserted = self.store.write(event)
-                with self._health_lock:
-                    self._health.processed_count += 1
-                    self._health.last_event_timestamp = event.timestamp
-                    if not inserted:
-                        self._health.duplicate_count += 1
-                batch.append(event)
-                if len(batch) >= 50:
-                    self._process_batch(batch)
-                    batch = []
+                pending.append(event)
+                if len(pending) >= self.ingest_batch_size:
+                    pending = self._flush(pending, batch)
+                    batch = self._maybe_analyse(batch)
                 self._persist_health()
+            self._flush(pending, batch)
             self._process_batch(batch)
         except Exception as error:
             self._set_error(error)
@@ -567,6 +608,89 @@ class LiveIngestionService:
                     self._health.detail = "collector stopped cleanly"
                 self._health.stopped_at = time.time()
             self._persist_health(force=True)
+
+    def _flush(self, pending: list[Event], batch: list[Event]) -> list[Event]:
+        """
+        Persist a batch of events in one transaction, then queue them for analysis.
+
+        One transaction per batch instead of one per event is the whole point: a
+        durable single-event write costs a WAL append plus an fsync-class barrier
+        each, and at collector rates that barrier -- not normalization, not
+        indexing -- was the ingest ceiling. Batching amortises it across the batch
+        while keeping the same durability guarantee for everything in it.
+
+        Events reach `batch` (the analysis queue) only after they are committed, so
+        a finding can never cite an event that is not in the database.
+
+        Returns the new pending list so the caller cannot accidentally keep using
+        a list whose contents were already written.
+        """
+        if not pending:
+            return pending
+        try:
+            result = self.store.write_events(pending)
+        except Exception as error:
+            # A batch that the database refuses is not the consumer's to lose: the
+            # quarantine writes it aside so it can be replayed after the cause is
+            # fixed. Without a handler here one malformed-for-SQLite batch would
+            # kill the consumer thread and stop ingestion entirely.
+            self._quarantine_batch(pending, error)
+            return []
+
+        now_events = len(pending)
+        with self._health_lock:
+            self._health.processed_count += result.inserted + result.duplicates
+            self._health.duplicate_count += result.duplicates
+            self._health.malformed_count += result.rejected_count
+            self._health.last_event_timestamp = pending[-1].timestamp
+        if result.rejected:
+            for _, reason in result.rejected[:1]:
+                LOGGER.warning(
+                    "telemetry events rejected before write: rejected=%d of %d reason=%s",
+                    result.rejected_count,
+                    now_events,
+                    reason,
+                )
+        batch.extend(pending)
+        return []
+
+    def _maybe_analyse(self, batch: list[Event]) -> list[Event]:
+        if len(batch) < self.analysis_batch_size:
+            return batch
+        self._process_batch(batch)
+        return []
+
+    def _quarantine_batch(self, events: list[Event], error: Exception) -> None:
+        """
+        Hand a rejected batch to the quarantine, and record that it happened.
+
+        Reported at error level even when the quarantine accepts it: a quarantined
+        batch is evidence that is in the database's place but not in the database,
+        and an operator who never hears about it will not replay it.
+        """
+        detail = f"{type(error).__name__}: {error}"
+        stored = False
+        if self.quarantine is not None:
+            try:
+                stored = self.quarantine.store(events, detail, source=self.source_name)
+            except Exception as quarantine_error:  # pragma: no cover - defensive
+                LOGGER.error(
+                    "quarantine_write_failed events=%d write_error=%s quarantine_error=%s",
+                    len(events),
+                    detail,
+                    f"{type(quarantine_error).__name__}: {quarantine_error}",
+                )
+        with self._health_lock:
+            self._health.quarantined_batch_count += 1
+            self._health.quarantined_event_count += len(events)
+            self._health.error = detail
+            self._health.detail = "batch quarantined after a failed write"
+        LOGGER.error(
+            "telemetry batch quarantined: events=%d persisted=%s error=%s",
+            len(events),
+            stored,
+            detail,
+        )
 
     def _process_batch(self, batch: list[Event]) -> None:
         if self.analysis_pipeline is None or not batch:

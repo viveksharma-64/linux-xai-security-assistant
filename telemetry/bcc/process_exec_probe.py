@@ -32,13 +32,14 @@ import sys
 import time
 
 try:
-    from bcc import BPF
+    from telemetry.bcc.bpf_runtime import load_bpf, require_bpf
 except ImportError:
-    sys.stderr.write(
-        "ERROR: could not import bcc. Install with:\n"
-        "    sudo apt update && sudo apt install -y bpfcc-tools python3-bpfcc\n"
-    )
-    sys.exit(1)
+    from bpf_runtime import load_bpf, require_bpf
+
+# None when bcc is unavailable; checked in main() rather than here so importing
+# this module for its event-formatting helpers does not kill the interpreter.
+# See telemetry/bcc/bpf_runtime.py.
+BPF = load_bpf()
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +162,7 @@ def handle_connect_event(cpu, data, size):
 
 def main():
     global b
+    require_bpf(BPF)
     print(
         json.dumps(
             {"event_type": "probe_startup", "message": "loading BPF program..."}

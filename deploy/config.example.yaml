@@ -1,0 +1,74 @@
+# Linux XAI Security Assistant - example configuration.
+#
+# Install to /etc/linux-xai-security/config.yaml (0644 is fine; this file holds
+# no secrets -- the API tokens live in a separate 0600 file). Every key is
+# optional: an omitted key uses the built-in default shown in the comment. An
+# unknown key or an unparseable value is a startup error, not a silent fallback,
+# because a misread security setting is worse than a failed start.
+#
+# Precedence is defaults < this file < environment. The systemd units set the
+# paths below via the environment, so uncommenting them here is only needed for a
+# non-packaged install.
+
+# --- storage -----------------------------------------------------------------
+# The evidence database. The systemd unit points this at the state directory.
+# db_path: "/var/lib/linux-xai-security/events.db"
+#
+# File mode for the database. MUST be quoted: unquoted, YAML parses 0600 as octal
+# and 600 as decimal, so the two spellings would mean different modes. Quoted, it
+# is always octal, matching chmod. Group/other access is refused outright (the
+# database holds command lines, paths, and usernames).
+# db_file_mode: "0600"        # default 0600; 0400 also accepted
+# db_enforce_mode: true       # refuse to open a database with looser permissions
+
+# --- api ---------------------------------------------------------------------
+# api_host: "127.0.0.1"       # keep on loopback; front with a TLS reverse proxy
+# api_port: 8000
+#
+# Authentication is on by default and fails closed. Provide tokens through a file
+# (preferred: a 0600 file is not visible in `systemctl show` or /proc/PID/environ
+# the way an env var is), one token per line, blank lines and # comments ignored.
+# Multiple lines are all accepted at once, which is how a token is rotated with no
+# outage. Tokens shorter than 16 characters are refused so a placeholder cannot be
+# the control.
+api_require_auth: true
+# api_token_file: "/etc/linux-xai-security/tokens"
+# api_tokens: null            # inline alternative, comma-separated (less private)
+
+# --- telemetry freshness -----------------------------------------------------
+# How old the newest event may be before readiness reports the instance not ready
+# and the stale-telemetry alert fires.
+# stale_after_seconds: 300.0
+
+# --- ingestion ---------------------------------------------------------------
+# queue_size: 1024            # bounded; backpressure, then accounted drops
+# backpressure_timeout_seconds: 2.0
+# health_interval_seconds: 1.0
+# ingest_batch_size: 50
+
+# --- supervision -------------------------------------------------------------
+# restart_initial_backoff_seconds: 1.0   # doubles each crash: 1,2,4,8,...
+# restart_max_backoff_seconds: 60.0
+# restart_healthy_runtime_seconds: 60.0  # a run this long resets the backoff ladder
+# crash_loop_threshold: 5                # crashes within the window -> degraded
+# crash_loop_window_seconds: 300.0
+#
+# Batches a failed database write would otherwise lose are written here instead,
+# self-describing and 0600, capped so a full disk is not made worse. Unset by
+# default; set it to enable on-disk quarantine.
+# quarantine_dir: "/var/lib/linux-xai-security/quarantine"
+# quarantine_max_batches: 128
+
+# --- retention ---------------------------------------------------------------
+# Runs in-process on retention_interval_seconds; no separate timer.
+# retention_max_age_days: 30.0     # 0 keeps events indefinitely (age pruning off)
+# retention_max_db_bytes: 2147483648   # 2 GiB size cap; oldest events pruned first
+# retention_interval_seconds: 3600.0
+# retention_vacuum_interval_seconds: 86400.0
+# retention_prune_batch: 5000
+
+# --- alerting (transition-only logging) --------------------------------------
+# alert_min_free_disk_bytes: 536870912    # 512 MiB absolute floor -> critical
+# alert_min_free_disk_ratio: 0.05         # 5% relative floor -> warning
+# alert_max_queue_fill_ratio: 0.8         # sustained fill precedes drops -> warning
+# alert_collector_silence_seconds: 120.0  # no health update this long -> wedged

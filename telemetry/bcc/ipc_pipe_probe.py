@@ -15,10 +15,14 @@ except ImportError:
     from perf_loss import PerfBufferLossReporter
 
 try:
-    from bcc import BPF
+    from telemetry.bcc.bpf_runtime import load_bpf, require_bpf
 except ImportError:
-    sys.stderr.write("ERROR: bcc not installed\n")
-    raise SystemExit(1)
+    from bpf_runtime import load_bpf, require_bpf
+
+# None when bcc is unavailable; checked in main() rather than here so importing
+# this module for normalize_pipe_event() does not kill the interpreter. See
+# telemetry/bcc/bpf_runtime.py.
+BPF = load_bpf()
 
 
 BPF_PROGRAM = r"""
@@ -154,6 +158,7 @@ loss_reporter = PerfBufferLossReporter(
 
 def main() -> int:
     global b
+    require_bpf(BPF)
     print(json.dumps({
         "event_type": "telemetry_startup",
         "message": "pipe/pipe2 syscall kprobe attached.",
