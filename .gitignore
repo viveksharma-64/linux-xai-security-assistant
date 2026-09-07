@@ -50,3 +50,8 @@ logs/
 .zshrc
 .gitconfig
 .ripgreprc
+
+# Local submission/presentation artifacts (not part of the source tree)
+/.gitmodules
+/Linux_XAI_Security_Assistant_Submission.pptx
+/linux-xai-architecture.png
