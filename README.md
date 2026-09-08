@@ -23,15 +23,16 @@ Each clause maps to code, and the honest gaps are marked rather than hidden:
 |---|---|---|
 | Learn normal system behavior | `baseline/` behavioral baseline (ML present but inactive) | Implemented |
 | Detect security threats in real time | `detection/` fusion over streaming collectors (6 of 7 sources stream) | Implemented |
-| Detect system failures in real time | `system_health` events are collected but not yet scored | **Not implemented** |
+| Detect system failures in real time | `detection/system_failure.py` windowed scoring of `system_health`/`service_state` | **Implemented** (detection only) |
 | Explain why anomalies are detected | `explainability/` evidence + advisory `assistant/` | Implemented |
 | Recommend or perform corrective actions | `assistant/` advises and `policy/` emits fail-closed dry-run decisions | **Recommend only** — performing actions is deliberately not built |
 
-The two gaps are documented positions, not oversights. Performing corrective
-actions in particular is intentionally out of scope: it would conflict with the
+The remaining gap is a documented position, not an oversight. Performing
+corrective actions is intentionally out of scope: it would conflict with the
 safety principles below — observation-only collectors, an advisory assistant,
-and fail-closed dry-run policy. [AGENTS.md](AGENTS.md) carries the full
-clause-by-clause traceability.
+and fail-closed dry-run policy. System-failure detection holds the same line: it
+surfaces findings for a human operator and performs no restart, kill, freeze, or
+throttle. [AGENTS.md](AGENTS.md) carries the full clause-by-clause traceability.
 
 ## Submission snapshot
 
@@ -39,6 +40,7 @@ clause-by-clause traceability.
 |---|---|
 | Telemetry | All planned families are **LIVE VERIFIED** on Kali Linux 2026.3 / kernel `7.1.5+kali` |
 | Detection | Deterministic baseline, rules, context, and fusion are implemented |
+| System-failure detection | Windowed, hysteresis-gated scoring of resource-exhaustion and service-failure telemetry; **detection only** — findings for an operator, no active response |
 | Explainability | Persisted evidence reconstruction and analyst-facing explanations are implemented |
 | Assistant | Optional, provider-neutral, evidence-grounded narration; never a decision-maker |
 | Policy | Fail-closed, dry-run, advisory-only; no remediation executor exists |
@@ -160,6 +162,40 @@ measured, versioned, and tamper-evident rather than asserted:
 The full roll-up, chain/migration verifications, and reproduction commands are
 in [docs/PHASE_C_RESULTS.md](docs/PHASE_C_RESULTS.md) and the generated
 [docs/DETECTION_EFFICACY.md](docs/DETECTION_EFFICACY.md).
+
+## System-failure detection
+
+The system-failure requirement is met on the same read-only terms as the rest of
+the pipeline: failures are **detected and surfaced, never acted on**.
+`detection/system_failure.py` scores the `system_health` and `service_state`
+telemetry the collectors already emit and writes findings through the existing
+`detection_findings` store — no new schema, no new migration.
+
+- **What it flags** — memory exhaustion (a high band and a lower medium band), an
+  available-memory floor, sustained CPU saturation, and a near-full disk, plus
+  service failures, with repeated failures of one unit inside a lookback labelled
+  a crash loop rather than a string of unrelated failures.
+- **Fixed windows with hysteresis** — scoring runs over epoch-aligned 300s
+  windows. A condition must breach for `failure_consecutive_windows` windows
+  before a finding is emitted, and fall below a distinct lower clear threshold for
+  `failure_clear_windows` windows before it resolves; the dead-band between the
+  two stops a value hovering at the line from flapping. The hysteresis is
+  window-idempotent, so the many ingestion batches that make up one window advance
+  the counters exactly once.
+- **Missing telemetry is unknown, never healthy** — a null CPU, disk, or memory
+  reading is scored as neither a failure nor healthy, and a window with no health
+  or service events produces no finding.
+- **Detection-only by construction** — failure findings carry
+  `mode="system_failure"` with the failure magnitude in `risk_score` and zero
+  behaviour/rule/context scores. They are persisted for the operator but are
+  deliberately **not** routed through the assistant or policy: policy is the
+  response-proposal stage, and that is the boundary this feature does not cross.
+  No ATT&CK technique is asserted — the category is availability, and the
+  T1489/T1499 relationship is recorded only as an interpretation note.
+
+All thresholds and the window/hysteresis counts are configurable (`failure_*` in
+[deploy/config.example.yaml](deploy/config.example.yaml), `SECURITY_FAILURE_*` in
+the environment) and validated fail-closed on load.
 
 ## Quick start: run the project
 
@@ -412,7 +448,7 @@ pytest -q tests/test_journal_stream.py tests/test_ml_integration.py
 
 Measured on Python 3.14.6 with pytest 9.1.1:
 
-- Full suite: **468 passed, 4 skipped** (~21s)
+- Full suite: **507 passed, 4 skipped** (~22s)
 - The 4 skips are `tests/test_ml_integration.py`, which requires scikit-learn
 - Streaming journald: 92 passed, including two integration tests that exercise
   the real `journalctl` cursor semantics on systemd 261
@@ -426,6 +462,12 @@ Measured on Python 3.14.6 with pytest 9.1.1:
   and migration-8 additive/idempotent schema (`tests/test_efficacy.py`,
   `test_rules.py`, `test_rule_catalog.py`, `test_evidence_chain.py`,
   `test_schema_migrations.py`)
+- System-failure detection added coverage for empty/unknown/partial telemetry,
+  hysteresis breach and reset, window idempotency across batches, the flap
+  dead-band, memory bands and the available-memory floor, CPU and disk breaches,
+  single/collapsed/crash-loop service failures, the persisted detection-only
+  finding shape, config validation, and pipeline integration
+  (`tests/test_system_failure.py`)
 
 Re-measure before restating those numbers. Tests are never weakened, skipped, or
 removed to make a run look clean.
@@ -438,7 +480,7 @@ removed to make a run look clean.
 | `pipeline/` | Canonical Event model, normalization, bounded ingestion, and the supervised multi-collector service with write-failure quarantine |
 | `storage/` | SQLite persistence (mode `0600` enforced), ML provenance, and age/byte-cap retention |
 | `baseline/` | Explicit verified-normal behavioral baseline |
-| `detection/` | Deterministic rules and evidence fusion |
+| `detection/` | Deterministic rules, evidence fusion, and detection-only system-failure scoring |
 | `ml/` | Canonical window schema, training, scoring, evaluation |
 | `explainability/` | Evidence reconstruction and bounded explanations |
 | `assistant/` | Optional provider-neutral advisory narration |

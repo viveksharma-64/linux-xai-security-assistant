@@ -2,8 +2,8 @@
 
 **Project**: AI-Powered Explainable Linux Security Assistant for kernel-level intrusion and behavioral threat detection  
 **Environment**: Kali Linux 2026.3, kernel `7.1.5+kali`, x86_64  
-**Current state**: Telemetry implementation and controlled live validation are complete. Phase B operational readiness is complete: supervised multi-collector ingestion, an authenticated read-only API, self-bounding retention, observability, and systemd deployment, with the test suite as the CI gate. Phase C detection credibility is complete: published precision/recall against a seeded corpus, versioned MITRE-mapped rules with per-rule tests, a tamper-evident evidence hash-chain, and a documented verified-normal corpus program on a credible path to the (unchanged) ML gate. ML infrastructure is implemented, tested, and intentionally inactive pending independent normal-data acceptance.  
-**Last consolidated update**: 2026-09-07
+**Current state**: Telemetry implementation and controlled live validation are complete. Phase B operational readiness is complete: supervised multi-collector ingestion, an authenticated read-only API, self-bounding retention, observability, and systemd deployment, with the test suite as the CI gate. Phase C detection credibility is complete: published precision/recall against a seeded corpus, versioned MITRE-mapped rules with per-rule tests, a tamper-evident evidence hash-chain, and a documented verified-normal corpus program on a credible path to the (unchanged) ML gate. ML infrastructure is implemented, tested, and intentionally inactive pending independent normal-data acceptance. System-failure detection (R3) is now implemented on strictly detection-only terms: `detection/system_failure.py` scores `system_health`/`service_state` over fixed windows and surfaces failures as findings, taking no active response.  
+**Last consolidated update**: 2026-09-08
 
 ## Problem statement and requirement traceability
 
@@ -24,15 +24,18 @@ boundaries above.
 |---|---|---|---|
 | R1 | Learns normal system behavior | `baseline/behavior_analyzer.py` and the baseline engine; per-`EventType` windowed baselines. ML (`ml/`) is implemented but intentionally inactive. | **Satisfied** (deterministic baseline). |
 | R2 | Detects security threats in real time | `detection/detector.py` deterministic fusion over streaming telemetry; explained findings persisted via `storage/sqlite_store.py`. Real-time now covers the kernel collectors (exec, network, IPC) and both streaming journald collectors (auth, service). | **Satisfied**, with one narrowed gap — see Gap B. |
-| R3 | Detects system failures in real time | `system_health` events are collected (`telemetry/bcc/telemetry_basic.py`) and stored, but **no baseline or detector scores them**: there is no failure-detection path at the detection layer. | **Gap A — not implemented.** |
+| R3 | Detects system failures in real time | `detection/system_failure.py` scores `system_health`/`service_state` over fixed 300s windows with hysteresis and persists failure findings via `storage/sqlite_store.py` (`mode="system_failure"`, no schema change). Detection surfaces failures for an operator; taking an active response is R5, not this clause. | **Satisfied** (detection only). |
 | R4 | Explains why anomalies are detected | `explainability/explainer.py` builds evidence and rationale for each finding; `assistant/service.py` renders an advisory, human-readable explanation. | **Satisfied.** |
 | R5 | Recommends or performs corrective actions | *Recommend:* `assistant/service.py` (advisory) and `policy/engine.py` (deterministic, fail-closed, approval-gated **dry-run** decisions). *Perform:* not built — `response/` is empty and no executor exists. | **Partial (Gap C):** recommend yes; perform deliberately absent. |
 
 Gap notes:
 
-- **Gap A (system-failure detection).** The telemetry exists; the detection side does
-  not. Closing it means adding a baseline/detector path for `system_health`, not
-  relabelling existing security-threat findings as failures.
+- **Gap A (system-failure detection) — closed.** `detection/system_failure.py`
+  now scores the `system_health`/`service_state` telemetry over fixed 300s windows
+  and persists failure findings; it does **not** relabel existing security-threat
+  findings as failures. It stays strictly detection-only — findings surface for an
+  operator and are not routed through the assistant or policy — so closing it did
+  not weaken any boundary below. See "System-failure detection (R3)" below.
 - **Gap B (real-time coverage).** Six of the seven telemetry families stream in real
   time. File access (`telemetry/auditd/file_access_monitor.py`) remains a one-shot
   query and is not yet a live source. This is the only remaining non-real-time family.
@@ -90,6 +93,23 @@ measured, versioned, tamper-evident. Components and their load-bearing invariant
 
 Rationale and the full measured roll-up live in `docs/PHASE_C_RESULTS.md`; the generated efficacy numbers in `docs/DETECTION_EFFICACY.md`.
 
+## System-failure detection (R3)
+
+System-failure detection closes Gap A on the same read-only terms as the rest of
+the pipeline. `detection/system_failure.py` scores the telemetry the collectors
+already emit and persists findings through the existing store. Load-bearing
+invariants — do not weaken these:
+
+- **Detection-only, by construction.** Failures surface as findings; nothing is terminated, restarted, killed, frozen, blocked, or throttled, and no groundwork for that is laid. This is the non-negotiable scope of the feature. Findings carry `mode="system_failure"`, put the failure magnitude in `risk_score`, and set behaviour/rule/context scores to `0.0`. They are persisted and readable but are **not** routed through the explainer, assistant, or policy — policy is the response-proposal stage, and that boundary is exactly what this feature must not cross. Do not add an active-response path here.
+- **No schema change.** Findings reuse `detection_findings` via `store.write_detection_finding(...)`; there is no new column and no new migration. A single `system_failure` evidence signal carries the condition, detail, and threshold context.
+- **Fixed 300s windows, epoch-aligned.** `_window_start_for(ts)` matches `baseline/behavior_analyzer.py` (`int(ts // 300) * 300`). `score_batch` buckets a batch's `system_health`/`service_state` events by window and scores windows in ascending order.
+- **Window-idempotent hysteresis with a dead-band.** A condition must breach for `failure_consecutive_windows` windows before emitting and clear below a *distinct lower* threshold (`breach × failure_clear_ratio`, inverted for a floor like available memory) for `failure_clear_windows` windows before resolving. The counter advances at most once per distinct, strictly-increasing `window_start`, so the many ~50-event ingestion batches inside one 300s window cannot over-count — "N windows" is wall-clock time, not batch count.
+- **Missing telemetry is unknown.** A null cpu/disk/memory field is scored as neither failure nor healthy (that dimension is simply not observed for the window); a window with no health/service events yields no finding.
+- **Stable-identity provenance dedup.** `_provenance_hash` folds only the stable identity (detector version, window bounds, entity, condition, severity), not the fluctuating observed values, so re-scoring the same window+condition dedups to one row through the store's existing provenance-hash path.
+- **No ATT&CK assertion.** Category is availability; T1489/T1499 are interpretation-only notes, not asserted technique mappings.
+- **Config-driven and fail-closed.** All thresholds and the window/hysteresis counts are `failure_*` settings (`SECURITY_FAILURE_*` env), documented in `deploy/config.example.yaml` and validated on load (percentages ≤ 100, medium band below high, `failure_clear_ratio` in `(0, 1]`, positive window counts).
+- **Wired ahead of the no-risk early return.** `DatabaseAnalysisPipeline.process` runs `failure_scorer.score_batch(events)` before the behaviour-risk early return, so a health/service-only batch still produces failure findings. Pinned by `tests/test_system_failure.py`, including two pipeline integration tests.
+
 ## Telemetry status
 
 All planned telemetry families are **LIVE VERIFIED**. No telemetry category remains unverified.
@@ -131,7 +151,8 @@ IPC canonical persistence validation succeeded using the controlled evidence: `p
 - Streaming journald tests: `pytest -q tests/test_journal_stream.py` — **92 passed**, no skips (the two `journalctl`-guarded integration tests do run here and agree with the fake).
 - Phase B operational-readiness tests cover the supervised service, supervisor, quarantine, retention, layered config, metrics, alerts, and API authentication (`tests/test_service.py`, `test_supervisor.py`, `test_quarantine.py`, `test_retention.py`, `test_config.py`, `test_metrics.py`, `test_alerts.py`, `test_api_auth.py`).
 - Phase C detection-credibility tests cover the efficacy harness + contamination guard, per-rule matching, catalog integrity, the evidence hash-chain (continuity, tamper, dedup-no-link, suppressed-chained, backfill==runtime), and migration-8 additive/idempotent schema (`tests/test_efficacy.py`, `test_rules.py`, `test_rule_catalog.py`, `test_evidence_chain.py`, `test_schema_migrations.py`).
-- Full suite, measured on Python 3.14.6 / pytest 9.1.1: **468 passed, 4 skipped in ~21s**. The only skips are `tests/test_ml_integration.py` (scikit-learn absent). Re-measure before restating this number; report the actual output, and do not hide, weaken, or remove tests to claim a clean run.
+- System-failure detection tests cover empty/unknown/partial telemetry, hysteresis breach + reset, window idempotency across batches, the flap dead-band and breach directionality, memory bands + the available-memory floor, CPU and disk breaches, single/result-failure/collapsed/crash-loop service failures, the persisted detection-only finding shape (`mode`, zero scores, single signal), config validation, and two pipeline integration tests (`tests/test_system_failure.py`).
+- Full suite, measured on Python 3.14.6 / pytest 9.1.1: **507 passed, 4 skipped in ~22s**. The only skips are `tests/test_ml_integration.py` (scikit-learn absent). Re-measure before restating this number; report the actual output, and do not hide, weaken, or remove tests to claim a clean run.
 - `PYTHONPATH=.` is no longer required: `[tool.pytest.ini_options] pythonpath = ["."]` in `pyproject.toml` makes bare `pytest` work. Verified with `env -u PYTHONPATH python3 -m pytest -q`.
 - Live BCC validation requires an interactive privileged Kali terminal. The agent sandbox may lack usable sudo credentials even where a user terminal can attach probes.
 

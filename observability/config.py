@@ -150,6 +150,31 @@ class Settings:
     alert_max_queue_fill_ratio: float = 0.8
     alert_collector_silence_seconds: float = 120.0
 
+    # --- system-failure detection -----------------------------------------
+    # Availability-impacting host/service conditions surfaced as findings by
+    # detection/system_failure.py. Detection only -- these thresholds decide
+    # what gets *recorded*, never what gets *done*. Percentages are matched
+    # against the collector's system_health payload (cpu/mem/disk _percent);
+    # a null field is treated as unknown, never as a breach.
+    failure_memory_high_pct: float = 90.0
+    failure_memory_medium_pct: float = 80.0
+    failure_memory_min_available_mb: int = 128
+    failure_cpu_high_pct: float = 95.0
+    failure_disk_full_pct: float = 99.0
+    # Hysteresis: a sustained condition must breach for this many consecutive
+    # 300s windows before a finding is emitted, and must fall below a distinct
+    # lower clear threshold (breach * clear_ratio, inverted for "lower is
+    # worse") for this many windows before it clears. Discrete events (a unit
+    # entering the failed state) bypass hysteresis. The window count -- not the
+    # ingestion batch count -- is what advances, so these mean wall-clock time.
+    failure_consecutive_windows: int = 2
+    failure_clear_windows: int = 2
+    failure_clear_ratio: float = 0.9
+    # Repeated service failures inside this lookback are labelled a crash loop
+    # rather than a single failure. The lookback spans window boundaries.
+    failure_crash_loop_threshold: int = 3
+    failure_crash_loop_window_seconds: float = 600.0
+
     def replace(self, **overrides: Any) -> "Settings":
         merged = {f.name: getattr(self, f.name) for f in fields(self)}
         merged.update(overrides)
@@ -190,6 +215,16 @@ _FIELD_SPECS: Dict[str, Tuple[str, str, Callable[[Any, str], Any]]] = {
     "alert_min_free_disk_ratio": ("alert_min_free_disk_ratio", "SECURITY_ALERT_MIN_FREE_DISK_RATIO", _as_float),
     "alert_max_queue_fill_ratio": ("alert_max_queue_fill_ratio", "SECURITY_ALERT_MAX_QUEUE_FILL_RATIO", _as_float),
     "alert_collector_silence_seconds": ("alert_collector_silence_seconds", "SECURITY_ALERT_COLLECTOR_SILENCE", _as_float),
+    "failure_memory_high_pct": ("failure_memory_high_pct", "SECURITY_FAILURE_MEMORY_HIGH_PCT", _as_float),
+    "failure_memory_medium_pct": ("failure_memory_medium_pct", "SECURITY_FAILURE_MEMORY_MEDIUM_PCT", _as_float),
+    "failure_memory_min_available_mb": ("failure_memory_min_available_mb", "SECURITY_FAILURE_MEMORY_MIN_AVAILABLE_MB", _as_int),
+    "failure_cpu_high_pct": ("failure_cpu_high_pct", "SECURITY_FAILURE_CPU_HIGH_PCT", _as_float),
+    "failure_disk_full_pct": ("failure_disk_full_pct", "SECURITY_FAILURE_DISK_FULL_PCT", _as_float),
+    "failure_consecutive_windows": ("failure_consecutive_windows", "SECURITY_FAILURE_CONSECUTIVE_WINDOWS", _as_int),
+    "failure_clear_windows": ("failure_clear_windows", "SECURITY_FAILURE_CLEAR_WINDOWS", _as_int),
+    "failure_clear_ratio": ("failure_clear_ratio", "SECURITY_FAILURE_CLEAR_RATIO", _as_float),
+    "failure_crash_loop_threshold": ("failure_crash_loop_threshold", "SECURITY_FAILURE_CRASH_LOOP_THRESHOLD", _as_int),
+    "failure_crash_loop_window_seconds": ("failure_crash_loop_window_seconds", "SECURITY_FAILURE_CRASH_LOOP_WINDOW", _as_float),
 }
 
 
@@ -240,6 +275,15 @@ def _validate(settings: Settings) -> Settings:
         ("retention_interval_seconds", settings.retention_interval_seconds),
         ("retention_prune_batch", settings.retention_prune_batch),
         ("stale_after_seconds", settings.stale_after_seconds),
+        ("failure_memory_high_pct", settings.failure_memory_high_pct),
+        ("failure_memory_medium_pct", settings.failure_memory_medium_pct),
+        ("failure_memory_min_available_mb", settings.failure_memory_min_available_mb),
+        ("failure_cpu_high_pct", settings.failure_cpu_high_pct),
+        ("failure_disk_full_pct", settings.failure_disk_full_pct),
+        ("failure_consecutive_windows", settings.failure_consecutive_windows),
+        ("failure_clear_windows", settings.failure_clear_windows),
+        ("failure_crash_loop_threshold", settings.failure_crash_loop_threshold),
+        ("failure_crash_loop_window_seconds", settings.failure_crash_loop_window_seconds),
     )
     for key, value in positive:
         if value <= 0:
@@ -276,6 +320,30 @@ def _validate(settings: Settings) -> Settings:
         raise ConfigError(
             f"db_file_mode: {settings.db_file_mode:04o} grants group or other access to the "
             "evidence database; use 0600 or 0400"
+        )
+
+    # System-failure thresholds are matched against 0-100 percentages, so a
+    # threshold above 100 could never fire and almost certainly reflects a typo
+    # (e.g. a byte count pasted into a percent field). CPU is intentionally not
+    # capped: a collector that sums per-core utilisation can exceed 100.
+    for key, value in (
+        ("failure_memory_high_pct", settings.failure_memory_high_pct),
+        ("failure_memory_medium_pct", settings.failure_memory_medium_pct),
+        ("failure_disk_full_pct", settings.failure_disk_full_pct),
+    ):
+        if value > 100.0:
+            raise ConfigError(f"{key}: is a percentage and must be <= 100, got {value!r}")
+    if settings.failure_memory_medium_pct >= settings.failure_memory_high_pct:
+        raise ConfigError(
+            "failure_memory_medium_pct must be below failure_memory_high_pct "
+            f"({settings.failure_memory_medium_pct} >= {settings.failure_memory_high_pct})"
+        )
+    # A clear ratio of 1.0 means no dead-band (a value clears the instant it
+    # dips below the breach threshold); above 1.0 the clear threshold would sit
+    # above the breach threshold and the condition could never clear.
+    if not 0.0 < settings.failure_clear_ratio <= 1.0:
+        raise ConfigError(
+            f"failure_clear_ratio: must be in (0, 1], got {settings.failure_clear_ratio!r}"
         )
     return settings
 

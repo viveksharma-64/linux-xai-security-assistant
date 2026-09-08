@@ -72,3 +72,24 @@ api_require_auth: true
 # alert_min_free_disk_ratio: 0.05         # 5% relative floor -> warning
 # alert_max_queue_fill_ratio: 0.8         # sustained fill precedes drops -> warning
 # alert_collector_silence_seconds: 120.0  # no health update this long -> wedged
+
+# --- system-failure detection ------------------------------------------------
+# Detection only: exhausted memory, a saturated CPU, a full disk, or a failing
+# service surfaces as a finding for a human operator. Nothing here restarts,
+# kills, or throttles anything. Detection runs over fixed 300s windows; a
+# condition must hold for failure_consecutive_windows windows before a finding is
+# emitted and must fall below a lower clear threshold (breach x failure_clear_ratio,
+# or the inverse for a floor like available memory) for failure_clear_windows
+# windows before it is considered resolved -- the gap between the two is a
+# dead-band that stops a value hovering at the line from flapping. Missing
+# telemetry is treated as unknown: never healthy, never a failure.
+# failure_memory_high_pct: 90.0            # memory-used %; >= this is the high band
+# failure_memory_medium_pct: 80.0         # memory-used %; must stay below the high band
+# failure_memory_min_available_mb: 128    # available memory floor (MiB); at/below breaches
+# failure_cpu_high_pct: 95.0              # cpu-used %; only scored when the sample carries cpu
+# failure_disk_full_pct: 99.0             # disk-used %; >= this is a full-disk failure
+# failure_consecutive_windows: 2          # windows a breach must persist before emitting
+# failure_clear_windows: 2                # windows below the clear line before resolved
+# failure_clear_ratio: 0.9                # clear threshold = breach x this; the dead-band
+# failure_crash_loop_threshold: 3         # unit failures in the lookback -> crash loop, not a single failure
+# failure_crash_loop_window_seconds: 600.0  # crash-loop lookback; spans window boundaries

@@ -60,6 +60,7 @@ from typing import Any, Callable, Iterable, Iterator, Optional, Union
 from assistant.service import AssistantService
 from baseline.behavior_analyzer import BehaviorAnalyzer
 from detection.detector import DetectionEngine
+from detection.system_failure import SystemFailureScorer
 from explainability.explainer import FindingExplainer
 from observability import configure_logging
 from pipeline.event_stream import CanonicalNormalizer, Event
@@ -256,10 +257,20 @@ class DatabaseAnalysisPipeline:
         self.assistant = AssistantService(None, store=store)
         policy_file = policy_path or str(Path(__file__).parents[1] / "policy" / "default_policy.yaml")
         self.policy = PolicyEngine.from_yaml(store, policy_file)
+        # Availability/system-failure findings are scored independently of the
+        # behaviour path. This is DETECTION ONLY: findings are persisted for an
+        # analyst but never routed through the explainer/assistant/policy stages,
+        # which propose responses -- system failures get no automated response.
+        self.failure_scorer = SystemFailureScorer(store)
 
     def process(self, events: list[Event]) -> None:
         if not events:
             return
+        # Score system failures first, and unconditionally. A window carrying
+        # only SYSTEM_HEALTH/SERVICE_STATE telemetry produces no behaviour risks,
+        # so it would be dropped by the early return below; availability
+        # detection must not depend on there being a behaviour risk to report.
+        self.failure_scorer.score_batch(events)
         monitoring = self.analyzer.monitor(events)
         if not monitoring["risks"]:
             return
