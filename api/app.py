@@ -380,6 +380,12 @@ class IntegrityResponse(StrictModel):
     findings: ChainVerdictResponse
     policy: ChainVerdictResponse
     triage: ChainVerdictResponse
+    # The model lifecycle log. Reported alongside the evidence chains because it
+    # answers a question of the same kind: whether an ML model was ever allowed to
+    # influence a finding, and on what measurement. It also carries the content
+    # hash of each drift assessment, so a break here can mean an edited
+    # assessment as well as an edited lifecycle row.
+    ml_lifecycle: ChainVerdictResponse
     # A single overall verdict for the dashboard's banner: false if any chain is
     # broken. The per-chain detail carries the break location and reason.
     ok: bool
@@ -889,7 +895,7 @@ def create_app(
     @app.get("/api/integrity", response_model=IntegrityResponse)
     def integrity() -> IntegrityResponse:
         """
-        The tamper-evidence verdict for all three append-only chains.
+        The tamper-evidence verdict for all four append-only chains.
 
         Recomputes each chain from on-disk columns and reports `{ok, checked,
         break_seq, reason}` per chain plus an overall `ok`. A false anywhere means
@@ -899,11 +905,13 @@ def create_app(
         findings = event_store.verify_findings_chain()
         policy = event_store.verify_policy_chain()
         triage = event_store.verify_triage_chain()
+        ml_lifecycle = event_store.verify_ml_lifecycle_chain()
         return IntegrityResponse(
             findings=ChainVerdictResponse(**findings),
             policy=ChainVerdictResponse(**policy),
             triage=ChainVerdictResponse(**triage),
-            ok=bool(findings["ok"] and policy["ok"] and triage["ok"]),
+            ml_lifecycle=ChainVerdictResponse(**ml_lifecycle),
+            ok=bool(findings["ok"] and policy["ok"] and triage["ok"] and ml_lifecycle["ok"]),
         )
 
     @app.get("/api/efficacy/operational", response_model=OperationalEfficacyResponse)

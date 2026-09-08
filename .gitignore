@@ -22,6 +22,8 @@ htmlcov/
 state/
 ml/models/*.pkl
 ml/models/*.joblib
+ml/models/*.model.json
+ml/models/*.arrays.npz
 linux-xai-ml-captures/
 
 # Runtime output and local secrets

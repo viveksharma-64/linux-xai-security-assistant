@@ -675,6 +675,97 @@ def _apply_triage_annotations(conn: sqlite3.Connection) -> None:
     )
 
 
+def _apply_ml_lifecycle(conn: sqlite3.Connection) -> None:
+    """
+    Drift assessments and a hash-chained model lifecycle log.
+
+    The ML model previously had provenance (training windows, artifact checksum)
+    but no history: nothing recorded that a model was evaluated, why it was or was
+    not eligible for activation, or that its input distribution had since moved.
+    Both tables here are that record, and both are append-only -- a model's state
+    is the latest row, never an edit of an earlier one.
+
+    `ml_model_lifecycle` is hash-chained on the same rules as the evidence and
+    triage layers (see `storage/evidence_chain.py`), because it is the audit answer
+    to "when did this model begin influencing findings, and on what evidence".
+    `activation_eligible` is a *recorded* verdict copied from the activation gate,
+    never an input to it: nothing in this table can activate a model, and the
+    writer refuses a row that claims eligibility the gate did not return. The
+    permitted `to_state` values are pinned in the schema, matching how the store
+    already constrains enumerated columns (`action`, `verified_normal`, `active`).
+
+    `ml_drift_assessments` is append-only but deliberately unchained: it is bulk
+    statistical output written in batches by an operator-run check, and a second
+    chain would add a second verify surface without adding tamper-evidence.
+    Instead each assessment is committed to by the chained `drift_assessed`
+    lifecycle row written in the same transaction, which stores the assessment's
+    id and a `content_hash` of its core columns; `verify_ml_lifecycle_chain`
+    recomputes those bindings, so editing an assessment after the fact fails
+    verification. `status` includes an explicit `insufficient_data` value: too
+    little comparison data is a refusal with reasons, not a quiet "no drift".
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ml_drift_assessments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model_id TEXT NOT NULL,
+            comparison_dataset_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN ('no_drift_detected', 'drift_detected', 'insufficient_data')
+            ),
+            method TEXT NOT NULL,
+            alpha REAL NOT NULL,
+            reference_window_count INTEGER NOT NULL,
+            comparison_window_count INTEGER NOT NULL,
+            drifted_feature_count INTEGER NOT NULL,
+            out_of_range_rate REAL,
+            features_json TEXT NOT NULL,
+            reasons_json TEXT NOT NULL,
+            actor TEXT,
+            created_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ml_drift_assessments_model "
+        "ON ml_drift_assessments(model_id, id)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ml_model_lifecycle (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model_id TEXT NOT NULL,
+            from_state TEXT,
+            to_state TEXT NOT NULL CHECK (
+                to_state IN (
+                    'trained', 'evaluated', 'eligible', 'ineligible', 'active',
+                    'drift_assessed', 'retraining_required', 'drifted', 'retired'
+                )
+            ),
+            reason TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            activation_eligible INTEGER NOT NULL DEFAULT 0
+                CHECK (activation_eligible IN (0, 1)),
+            actor TEXT,
+            created_at REAL NOT NULL,
+            chain_seq INTEGER,
+            chain_prev_hash TEXT,
+            chain_hash TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ml_model_lifecycle_model "
+        "ON ml_model_lifecycle(model_id, id)"
+    )
+    # Same partial unique index the other chains carry: a duplicated sequence is a
+    # constraint error, not a silent fork.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_ml_model_lifecycle_chain "
+        "ON ml_model_lifecycle(chain_seq) WHERE chain_seq IS NOT NULL"
+    )
+
+
 MIGRATIONS: Tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -720,6 +811,11 @@ MIGRATIONS: Tuple[Migration, ...] = (
         version=9,
         description="append-only hash-chained triage annotation layer (analyst acknowledge/annotate/disposition/suppress)",
         apply=_apply_triage_annotations,
+    ),
+    Migration(
+        version=10,
+        description="ML drift assessments and append-only hash-chained model lifecycle log",
+        apply=_apply_ml_lifecycle,
     ),
 )
 

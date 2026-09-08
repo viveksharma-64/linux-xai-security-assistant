@@ -44,11 +44,12 @@ throttle. [AGENTS.md](AGENTS.md) carries the full clause-by-clause traceability.
 | Explainability | Persisted evidence reconstruction and analyst-facing explanations are implemented |
 | Assistant | Optional, provider-neutral, evidence-grounded narration; never a decision-maker |
 | Policy | Fail-closed, dry-run, advisory-only; no remediation executor exists |
-| ML | Implemented and tested, but the current Isolation Forest is **inactive** and not approved for activation |
+| ML | Implemented and tested, with a governed artifact/drift/lifecycle layer; the current Isolation Forest is **inactive** and not approved for activation |
 | Dashboard | Read-only, **authenticated** FastAPI API and browser dashboard over persisted SQLite data |
 | Operational readiness (Phase B) | Supervised multi-collector ingestion, authenticated API, self-bounding retention, metrics/alerts, and systemd deployment; the test suite gates CI |
 | Detection credibility (Phase C) | Published precision/recall on a seeded corpus, versioned MITRE-mapped rules with per-rule tests, and a tamper-evident append-only evidence hash-chain |
 | Analyst experience (Phase D) | Append-only, hash-chained triage (acknowledge/annotate/disposition/suppress) that never mutates the evidence record; authenticated default-deny writes; integrity alarm; faithful export; and operational efficacy from dispositions, decoupled from the ML gate |
+| ML lifecycle (Phase E, track 1) | Code-free `iforest-native.v1` model artifact (no pickle), a stdlib KS/Holm drift check that refuses rather than guesses, and an append-only hash-chained model lifecycle log — with the activation gate untouched |
 
 ### LIVE VERIFIED telemetry
 
@@ -225,12 +226,15 @@ chains.
   authorized, not who they are.
 - **Faithful export** — `GET /api/triage/export` emits a complete JSON document
   (`schema: linux-xai-security/triage-export/v1`) with every finding, its
-  evidence, its full append-only annotation history, and the verdicts of all
-  three hash chains. Suppressed findings are included and marked, never omitted.
+  evidence, its full append-only annotation history, and the verdicts of the three
+  hash chains that cover the exported record (findings, policy, triage). The
+  ML-lifecycle chain is deliberately not folded in: it says nothing about the
+  integrity of these findings, and adding it would silently change a released
+  export schema. Suppressed findings are included and marked, never omitted.
 - **Integrity alarm** — `GET /api/integrity` returns the `verify_chain` verdict
-  for the findings, policy, and triage chains. The console raises an unmissable
-  banner **only** when a chain fails to verify, and stays silent when all three
-  are intact, so it never cries wolf.
+  for the findings, policy, triage, and ML-lifecycle chains. The console raises an
+  unmissable banner **only** when a chain fails to verify, and stays silent when
+  all four are intact, so it never cries wolf.
 - **Operational efficacy, decoupled from the gate** — `GET
   /api/efficacy/operational` (`detection/operational_efficacy.py`) reports what
   analyst dispositions can honestly support: counts and **precision** over
@@ -247,6 +251,53 @@ headers, response body still a JSON array), safe DOM construction throughout (no
 wipes an open investigation, keyboard navigation of the findings table, and an
 ARIA live region that announces new findings and integrity alarms without
 stealing focus.
+
+## ML lifecycle: artifacts, drift, and the log (Phase E, track 1)
+
+A model needs a governed life, not just a file on disk. Track 1 adds three pieces
+and activates nothing — the gate is unchanged and the ML subsystem is still
+inactive. Full detail in [docs/ML_LIFECYCLE.md](docs/ML_LIFECYCLE.md).
+
+- **A model artifact that cannot carry code.** `iforest-native.v1` is two files:
+  `<model_id>.model.json` (the descriptor — schema identity, threshold and its
+  provenance, forest scalars) and `<model_id>.arrays.npz` (the numbers). One root
+  of trust, one hop: `ml_models.artifact_checksum` pins the descriptor's bytes and
+  the descriptor pins the arrays, so no schema change was needed. The order is
+  **verify, then parse** — checksum before `json.loads`, array checksum before
+  `np.load(..., allow_pickle=False)`. The previous format loaded through
+  `pickle.loads`, where that checksum was the *only* thing between a swapped
+  artifact and arbitrary code execution.
+- **Scoring no longer needs scikit-learn.** `ml/iforest.py` reimplements Isolation
+  Forest scoring in numpy, bitwise-identical to sklearn (including its float32
+  routing cast), so `is_anomaly = raw <= threshold` cannot change meaning between
+  a training host and a scoring host. Training still needs sklearn; the estimator
+  is reduced to arrays once, where sklearn exists. Identical arrays also produce
+  byte-identical files, so the checksum doubles as a reproducibility check —
+  something `pickle` never offered.
+- **A drift check that refuses rather than guesses.** `ml/drift.py` asks one
+  narrow question — is each feature's distribution in a newer verified-normal
+  dataset distinguishable from the training distribution? — with a per-feature
+  exact two-sample Kolmogorov–Smirnov test and Holm–Bonferroni correction across
+  all 34 features (stdlib only; no scipy). Distinguishability is a **FACT**;
+  whether to retrain is a labelled **INTERPRETATION**. Too little data, a schema
+  mismatch, unverified windows, or a comparison set that reuses the model's own
+  training windows all yield `insufficient_data` **with reasons**, never a
+  reassuring "no drift" — and `scripts/ml_drift_check.py` exits non-zero so a
+  scheduled run cannot log "checked" and move on.
+- **An append-only log of how a model got where it is.** `ml/lifecycle.py` records
+  `trained → evaluated → (eligible | ineligible) → active → (drifted | retired)`,
+  hash-chained in the same one fold as the evidence chains. The log **records; it
+  does not decide**: no append can activate a model, `activation_eligible` comes
+  only from a fresh call to the acceptance gate, and drift can append exactly two
+  states — `drift_assessed` and `retraining_required`. Drift raises the question; a
+  human answers it by training a new model and putting it through the same gate.
+
+Run a drift check (read-only unless you pass `--record`):
+
+```bash
+python3 scripts/ml_drift_check.py --db events.db --model-id iforest-... \
+    --comparison-db corpus/normal.db --comparison-dataset verified-normal-...
+```
 
 ## Quick start: run the project
 
@@ -481,12 +532,14 @@ Operational properties that matter when reading the output:
 
 The ML subsystem uses the deterministic `canonical-window.v1` schema with
 explicit verified-normal provenance, reproducible Isolation Forest training,
-artifact checksums, schema checks, feature-range diagnostics, and held-out
-evaluation.
+authenticated code-free artifacts, schema checks, feature-range diagnostics,
+held-out evaluation, drift assessment, and an append-only lifecycle log.
 
 The current experiment, `iforest-6ef9e765-8bc8-4bfc-b8d5-e1ebd18730e7`, is
 **inactive**. Its historical evaluation produced 2 false positives from 5
-normal holdouts (40% FPR), which fails the fixed 5% requirement.
+normal holdouts (40% FPR), which fails the fixed 5% requirement. Its artifact is
+a pre-Phase-E pickle and is no longer loadable; since it was never active and is
+not activation-eligible, nothing in service was affected.
 
 A future model may be considered for activation only after independent,
 operator-reviewed normal holdouts satisfy all of the following:
@@ -496,7 +549,8 @@ operator-reviewed normal holdouts satisfy all of the following:
 - at least 60 independent holdout windows.
 
 No threshold changes, activation, or baseline contamination are allowed merely
-to make a model pass.
+to make a model pass. Drift assessment and the lifecycle log feed this gate's
+paperwork; they are never a way around it.
 
 ## Tests
 
@@ -515,8 +569,10 @@ pytest -q tests/test_journal_stream.py tests/test_ml_integration.py
 
 Measured on Python 3.14.6 with pytest 9.1.1:
 
-- Full suite: **544 passed, 4 skipped** (~24s)
-- The 4 skips are `tests/test_ml_integration.py`, which requires scikit-learn
+- Full suite: **648 passed, 5 skipped** (~25s)
+- The 5 skips are all scikit-learn-gated: `tests/test_ml_integration.py` (4) and
+  the sklearn-parity test in `tests/test_ml_artifact.py` (1). That file reports
+  **56 passed** under an interpreter that has scikit-learn installed
 - Streaming journald: 92 passed, including two integration tests that exercise
   the real `journalctl` cursor semantics on systemd 261
 - Phase B added coverage for the supervised service, quarantine, retention,
@@ -545,6 +601,19 @@ Measured on Python 3.14.6 with pytest 9.1.1:
   explanation factors, and migration 9 (`tests/test_triage.py`,
   `test_operational_efficacy.py`, `test_api_app.py`, `test_explainer.py`,
   `test_schema_migrations.py`, `test_evidence_chain.py`)
+- Phase E track 1 added coverage for the native artifact (checksum-before-parse in
+  both hops, refusal of a traversing array filename, `0600` on both files,
+  reproducible bytes, and a source-level ban on code-executing deserializers and
+  on `allow_pickle=True` anywhere in `ml/` — plus a hand-built toy artifact that
+  exercises the loader and the scoring math with **no** scikit-learn), the drift
+  check (KS statistics and Holm thresholds against independently verified
+  literals, every named `insufficient_data` refusal, and that a drift result
+  cannot mutate a model or threshold), the lifecycle log (chain tamper detection,
+  the recomputed drift binding, the store-level refusal of an ungated `active`
+  row, and the gate's constants pinned as literals), the fourth chain in
+  `/api/integrity`, and migration 10 (`tests/test_ml_artifact.py`,
+  `test_ml_drift.py`, `test_ml_lifecycle.py`, `test_api_app.py`,
+  `test_schema_migrations.py`)
 
 Re-measure before restating those numbers. Tests are never weakened, skipped, or
 removed to make a run look clean.
@@ -558,7 +627,7 @@ removed to make a run look clean.
 | `storage/` | SQLite persistence (mode `0600` enforced), ML provenance, and age/byte-cap retention |
 | `baseline/` | Explicit verified-normal behavioral baseline |
 | `detection/` | Deterministic rules, evidence fusion, detection-only system-failure scoring, and operational efficacy from analyst dispositions (decoupled from the ML gate) |
-| `ml/` | Canonical window schema, training, scoring, evaluation |
+| `ml/` | Canonical window schema, training, code-free model artifacts, scoring, evaluation, drift assessment, and the model lifecycle log |
 | `explainability/` | Evidence reconstruction and bounded explanations |
 | `assistant/` | Optional provider-neutral advisory narration |
 | `policy/` | Deterministic fail-closed dry-run policy |
@@ -572,7 +641,7 @@ removed to make a run look clean.
 ## Data handling
 
 Raw telemetry databases, normal-data captures, Python environments, cache
-files, and model binaries are excluded through `.gitignore`. They may contain
+files, and model artifacts are excluded through `.gitignore`. They may contain
 host-sensitive data and must not be treated as verified-normal training data
 without explicit provenance and operator approval.
 
@@ -593,6 +662,9 @@ without explicit provenance and operator approval.
   precision/recall/FP-per-day and the seeded corpus manifest.
 - [docs/NORMAL_CORPUS_PROGRAM.md](docs/NORMAL_CORPUS_PROGRAM.md) — the
   verified-normal capture/review program and the (unchanged) ML activation gate.
+- [docs/ML_LIFECYCLE.md](docs/ML_LIFECYCLE.md) — the code-free model artifact
+  format, the drift check and its refusals, the append-only lifecycle log, and the
+  trust boundaries around them.
 - `docs/PHASE*_RESULTS.md` — historical phase evidence. Their older telemetry
   limitations are clearly marked as superseded; AGENTS.md is authoritative.
 - `docs/phase1_sample_events.jsonl` — synthetic fixture only, never live

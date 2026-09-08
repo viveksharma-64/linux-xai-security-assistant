@@ -1,13 +1,10 @@
 """Explicit verified-normal dataset capture and Isolation Forest training."""
 
-import hashlib
 import os
-import pickle
 import platform
 import sys
 import time
 import uuid
-from pathlib import Path
 from typing import Any, Sequence
 
 try:
@@ -23,7 +20,9 @@ except ImportError:
     StandardScaler = None
     SKLEARN_AVAILABLE = False
 
+from ml.artifact import ARTIFACT_FORMAT, write_artifact
 from ml.feature_schema import FEATURE_NAMES, SCHEMA_VERSION, extract_features, schema_hash
+from ml.iforest import export_from_sklearn
 from pipeline.event_stream import Event
 from storage.sqlite_store import SQLiteEventStore
 
@@ -100,27 +99,30 @@ def train_isolation_forest(
     # calibration; activation must be assessed from separate reviewed-normal data.
     threshold = 0.0
     model_id = f"iforest-{uuid.uuid4()}"
-    artifact = {
-        "model": model, "scaler": scaler, "feature_names": list(FEATURE_NAMES),
-        "schema_version": SCHEMA_VERSION, "schema_hash": expected_hash,
-        "decision_min": float(np.min(decisions)), "decision_max": float(np.max(decisions)), "threshold": threshold,
-        "threshold_provenance": "isolation_forest_decision_boundary; not independently calibrated",
-        "calibration": {
+    # Persisted as numbers, not as pickled objects: see ml/artifact.py. The
+    # sklearn estimator is reduced to tree arrays here, on the machine that has
+    # sklearn, and never needs to be reconstructed to score.
+    written = write_artifact(
+        artifact_directory,
+        model_id,
+        export_from_sklearn(model, scaler),
+        feature_names=FEATURE_NAMES,
+        schema_version=SCHEMA_VERSION,
+        schema_hash=expected_hash,
+        threshold=threshold,
+        threshold_provenance="isolation_forest_decision_boundary; not independently calibrated",
+        calibration={
             "status": "requires_independent_verified_normal_holdouts",
             "max_normal_fpr": 0.05,
             "minimum_holdout_windows": 60,
         },
-    }
-    directory = Path(artifact_directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    artifact_path = directory / f"{model_id}.pkl"
-    payload = pickle.dumps(artifact, protocol=pickle.HIGHEST_PROTOCOL)
-    checksum = hashlib.sha256(payload).hexdigest()
-    artifact_path.write_bytes(payload)
+        decision_min=float(np.min(decisions)),
+        decision_max=float(np.max(decisions)),
+    )
     metadata = {
         "id": model_id, "version": "iforest.canonical-window.v1", "algorithm": "IsolationForest",
         "hyperparameters": {"n_estimators": n_estimators, "contamination": contamination, "random_state": random_state, "n_jobs": 1},
-        "artifact_path": str(artifact_path), "artifact_checksum": checksum,
+        "artifact_path": written["artifact_path"], "artifact_checksum": written["artifact_checksum"],
         "schema_version": SCHEMA_VERSION, "schema_hash": expected_hash,
         "training_window_ids": [window["id"] for window in windows],
         "runtime": {"python": sys.version.split()[0], "sklearn": sklearn.__version__, "numpy": np.__version__},
@@ -133,4 +135,8 @@ def train_isolation_forest(
         "active": bool(activate), "created_at": time.time(),
     }
     store.write_ml_model(metadata)
-    return metadata
+    # The artifact format and the array file's own digest are reported but not
+    # stored in a new column: `artifact_checksum` pins the descriptor, and the
+    # descriptor pins the arrays, so one recorded value covers both files.
+    return {**metadata, "artifact_format": ARTIFACT_FORMAT, "arrays_path": written["arrays_path"],
+            "arrays_checksum": written["arrays_checksum"]}

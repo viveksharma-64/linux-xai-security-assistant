@@ -108,6 +108,49 @@ TRIAGE_CHAIN_COLUMNS: Sequence[str] = (
     "created_at",
 )
 
+# Persisted columns of ml_model_lifecycle covered by the chain, same rules. The
+# lifecycle log records how a model moved from trained to evaluated to eligible
+# (or not) to active, and it is the record an auditor reads to answer "when did
+# this model start influencing findings, and on what evidence". That question is
+# only answerable if the log cannot be edited after the fact, so it is chained.
+# `activation_eligible` is the gate's own verdict copied in as a *recorded fact*:
+# the log never causes an activation, and a row claiming eligibility that the
+# gate did not return is refused at the writer rather than chained.
+ML_LIFECYCLE_CHAIN_COLUMNS: Sequence[str] = (
+    "model_id",
+    "from_state",
+    "to_state",
+    "reason",
+    "evidence_json",
+    "activation_eligible",
+    "actor",
+    "created_at",
+)
+
+# Core columns of one ml_drift_assessments row, hashed into the lifecycle row
+# that accompanies it (see `content_hash`). Drift assessments are append-only but
+# deliberately unchained: they are bulk statistical output, written in batches by
+# an operator-run check, and giving them their own chain would mean a second
+# verify surface with no extra tamper-evidence. Instead every assessment is
+# committed to by the chained lifecycle row written in the same transaction, so
+# editing an assessment after the fact breaks a hash in the lifecycle chain.
+# Excludes the surrogate `id`, which the lifecycle row records separately.
+ML_DRIFT_CORE_COLUMNS: Sequence[str] = (
+    "model_id",
+    "comparison_dataset_id",
+    "status",
+    "method",
+    "alpha",
+    "reference_window_count",
+    "comparison_window_count",
+    "drifted_feature_count",
+    "out_of_range_rate",
+    "features_json",
+    "reasons_json",
+    "actor",
+    "created_at",
+)
+
 
 def serialize_core(columns: Sequence[str], row: Mapping[str, Any]) -> str:
     """
@@ -128,6 +171,19 @@ def serialize_core(columns: Sequence[str], row: Mapping[str, Any]) -> str:
         separators=(",", ":"),
         ensure_ascii=True,
     )
+
+
+def content_hash(columns: Sequence[str], row: Mapping[str, Any]) -> str:
+    """
+    Digest the given columns of one row, using the same canonical serialization.
+
+    For binding an unchained append-only row into a chained one: the chained row
+    stores this digest, so the unchained row it points at cannot be edited without
+    breaking the chain. Reuses `serialize_core` rather than introducing a second
+    hashing convention, for the same reason the writer and the backfill share one
+    fold -- two conventions eventually disagree.
+    """
+    return hashlib.sha256(serialize_core(columns, row).encode("utf-8")).hexdigest()
 
 
 def link_hash(seq: int, prev_hash: str, serialized: str) -> str:

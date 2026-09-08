@@ -226,9 +226,10 @@ def test_detections_reject_invalid_query_params_with_422(tmp_path):
     assert client.get("/api/detections?disposition=maybe").status_code == 422
 
 
-def test_integrity_reports_all_three_chains_intact(tmp_path):
+def test_integrity_reports_all_four_chains_intact(tmp_path):
     # A freshly written record verifies: findings and policy chains have content,
-    # the triage chain is empty (which is a valid append-only log), all ok.
+    # the triage and ML lifecycle chains are empty (which is a valid append-only
+    # log, and the expected state where no model has been trained), all ok.
     store, _ = _setup(tmp_path)
     client = TestClient(create_app(store))
     body = client.get("/api/integrity").json()
@@ -236,6 +237,7 @@ def test_integrity_reports_all_three_chains_intact(tmp_path):
     assert body["findings"]["ok"] is True and body["findings"]["checked"] == 1
     assert body["policy"]["ok"] is True and body["policy"]["checked"] == 1
     assert body["triage"]["ok"] is True and body["triage"]["checked"] == 0
+    assert body["ml_lifecycle"]["ok"] is True and body["ml_lifecycle"]["checked"] == 0
     assert body["findings"]["break_seq"] is None
 
 

@@ -368,7 +368,7 @@ async function selectFinding(id, { focusDetail = true } = {}) {
 // --- Integrity alarm ---------------------------------------------------------
 function renderIntegrity(integrity) {
   const banner = $("#integrity-banner");
-  const chains = ["findings", "policy", "triage"];
+  const chains = ["findings", "policy", "triage", "ml_lifecycle"];
   const broken = chains.filter((name) => integrity[name] && integrity[name].ok === false);
   if (!broken.length) {
     banner.hidden = true;

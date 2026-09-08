@@ -13,8 +13,11 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 from pipeline.event_stream import CanonicalNormalizer, Event, EventStore
 from storage.evidence_chain import (
     FINDING_CHAIN_COLUMNS,
+    ML_DRIFT_CORE_COLUMNS,
+    ML_LIFECYCLE_CHAIN_COLUMNS,
     POLICY_CHAIN_COLUMNS,
     TRIAGE_CHAIN_COLUMNS,
+    content_hash,
     next_link,
     verify_chain,
 )
@@ -37,6 +40,33 @@ _TRIAGE_ACTIONS = frozenset(
     {"acknowledge", "annotate", "disposition", "suppress", "unsuppress"}
 )
 _TRIAGE_DISPOSITIONS = frozenset({"true-positive", "false-positive", "benign"})
+
+# The append-only ML lifecycle vocabulary, kept in step with the CHECK constraint
+# on ml_model_lifecycle (migration 10) and with ml/lifecycle.py. `active` is in
+# the list because the log must be able to *record* an activation; it is not a
+# path to causing one -- nothing reads this table to decide whether a model
+# scores, and the writer below refuses an `active` row that does not carry the
+# activation gate's own eligibility verdict.
+_ML_LIFECYCLE_STATES = frozenset(
+    {
+        "trained",
+        "evaluated",
+        "eligible",
+        "ineligible",
+        "active",
+        "drift_assessed",
+        "retraining_required",
+        "drifted",
+        "retired",
+    }
+)
+
+# The only states a drift assessment may record. Drift feeds the lifecycle; it
+# never concludes anything about activation, so these are additionally forbidden
+# from carrying an eligibility verdict.
+_ML_DRIFT_LIFECYCLE_STATES = frozenset({"drift_assessed", "retraining_required"})
+
+_ML_DRIFT_STATUSES = frozenset({"no_drift_detected", "drift_detected", "insufficient_data"})
 
 # Allowlisted sort expressions for read_detection_findings_page. The value is
 # interpolated into SQL, so it must only ever come from this fixed map, never
@@ -645,6 +675,276 @@ class SQLiteEventStore(EventStore):
         for key in ("hyperparameters_json", "training_window_ids_json", "runtime_json", "evaluation_json"):
             record[key.removesuffix("_json")] = json.loads(record.pop(key))
         record["active"] = bool(record["active"])
+        return record
+
+    def write_ml_lifecycle_transition(
+        self,
+        model_id: str,
+        to_state: str,
+        *,
+        reason: str,
+        evidence: Optional[Dict[str, Any]] = None,
+        from_state: Optional[str] = None,
+        activation_eligible: bool = False,
+        actor: Optional[str] = None,
+        created_at: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Append one model lifecycle event and fold it into the lifecycle hash chain.
+
+        Append-only, like the triage layer: a model's state is the latest row and a
+        correction is a later row, never an edit. Returns the stored row including
+        its `chain_*` fields.
+
+        Two refusals keep this a record rather than a control surface:
+
+        * `activation_eligible=True` requires the caller to supply the activation
+          gate's own returned verdict under `evidence['acceptance']`, so an
+          eligibility claim in the audit log always carries the numbers behind it
+          (the same shape of check `create_ml_dataset` makes on `verified_normal`);
+        * a `to_state` reachable from drift may never carry an eligibility verdict,
+          and `active` may never be recorded without one -- so no drift assessment
+          can log its way to an activation.
+
+        Enforcing this here rather than only in `ml/lifecycle.py` means the check
+        holds for every writer, including a future one.
+        """
+        if to_state not in _ML_LIFECYCLE_STATES:
+            raise ValueError(f"unknown ML lifecycle state: {to_state!r}")
+        if from_state is not None and from_state not in _ML_LIFECYCLE_STATES:
+            raise ValueError(f"unknown ML lifecycle state: {from_state!r}")
+        if not reason:
+            raise ValueError("ML lifecycle transitions require a reason")
+        payload = dict(evidence or {})
+        if activation_eligible and not isinstance(payload.get("acceptance"), dict):
+            raise ValueError("an eligible ML lifecycle row must carry the activation gate verdict")
+        if activation_eligible and to_state in _ML_DRIFT_LIFECYCLE_STATES:
+            raise ValueError(f"{to_state} may not assert activation eligibility")
+        if to_state == "active" and not activation_eligible:
+            raise ValueError("an active ML lifecycle row requires the activation gate verdict")
+        created_at = float(created_at) if created_at is not None else time.time()
+
+        with self._chain_lock:
+            with self._transaction() as conn:
+                row_id = self._insert_ml_lifecycle(
+                    conn, model_id, to_state, from_state, reason, payload,
+                    activation_eligible, actor, created_at,
+                )
+                return self._decode_ml_lifecycle_row(
+                    conn.execute("SELECT * FROM ml_model_lifecycle WHERE id = ?", (row_id,)).fetchone()
+                )
+
+    def _insert_ml_lifecycle(
+        self,
+        conn: sqlite3.Connection,
+        model_id: str,
+        to_state: str,
+        from_state: Optional[str],
+        reason: str,
+        evidence: Dict[str, Any],
+        activation_eligible: bool,
+        actor: Optional[str],
+        created_at: float,
+    ) -> int:
+        """Insert one lifecycle row and chain it; caller holds the chain lock."""
+        cursor = conn.execute(
+            """
+            INSERT INTO ml_model_lifecycle (
+                model_id, from_state, to_state, reason, evidence_json,
+                activation_eligible, actor, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (str(model_id), from_state, to_state, reason,
+             json.dumps(evidence, sort_keys=True), int(bool(activation_eligible)), actor, created_at),
+        )
+        row_id = int(cursor.lastrowid)
+        self._extend_chain(conn, "ml_model_lifecycle", ML_LIFECYCLE_CHAIN_COLUMNS, row_id)
+        return row_id
+
+    def write_ml_drift_assessment(
+        self,
+        assessment: Dict[str, Any],
+        *,
+        from_state: Optional[str] = None,
+        actor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Append one drift assessment together with the lifecycle row that commits to it.
+
+        Both writes happen in one transaction under the chain lock, because the
+        binding is the tamper-evidence: `ml_drift_assessments` is unchained, so the
+        `drift_assessed` lifecycle row stores the assessment's id and a
+        `content_hash` of its core columns. `verify_ml_lifecycle_chain` recomputes
+        those bindings, so editing an assessment afterwards fails verification, and
+        dropping one leaves a chained row pointing at a missing id.
+
+        The hash is taken over the row as *stored*, not as passed in, so it matches
+        what a later verification recomputes after SQLite's type affinity has been
+        applied -- the same discipline `_extend_chain` follows.
+
+        Returns `{"assessment", "lifecycle"}`. Writing an assessment never changes
+        a model's threshold, artifact, or `active` flag; this method touches only
+        the two append-only tables.
+        """
+        required = ("model_id", "comparison_dataset_id", "status", "method", "alpha",
+                    "reference_window_count", "comparison_window_count",
+                    "drifted_feature_count", "features", "reasons", "created_at")
+        missing = [key for key in required if key not in assessment]
+        if missing:
+            raise ValueError(f"ML drift assessment missing fields: {', '.join(missing)}")
+        if assessment["status"] not in _ML_DRIFT_STATUSES:
+            raise ValueError(f"unknown ML drift status: {assessment['status']!r}")
+        out_of_range_rate = assessment.get("out_of_range_rate")
+
+        with self._chain_lock:
+            with self._transaction() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO ml_drift_assessments (
+                        model_id, comparison_dataset_id, status, method, alpha,
+                        reference_window_count, comparison_window_count,
+                        drifted_feature_count, out_of_range_rate, features_json,
+                        reasons_json, actor, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (str(assessment["model_id"]), str(assessment["comparison_dataset_id"]),
+                     assessment["status"], str(assessment["method"]), float(assessment["alpha"]),
+                     int(assessment["reference_window_count"]), int(assessment["comparison_window_count"]),
+                     int(assessment["drifted_feature_count"]),
+                     None if out_of_range_rate is None else float(out_of_range_rate),
+                     json.dumps(assessment["features"], sort_keys=True),
+                     json.dumps(assessment["reasons"], sort_keys=True),
+                     actor, float(assessment["created_at"])),
+                )
+                assessment_id = int(cursor.lastrowid)
+                stored = dict(
+                    conn.execute(
+                        "SELECT * FROM ml_drift_assessments WHERE id = ?", (assessment_id,)
+                    ).fetchone()
+                )
+                lifecycle_id = self._insert_ml_lifecycle(
+                    conn,
+                    str(assessment["model_id"]),
+                    "drift_assessed",
+                    from_state,
+                    f"drift assessment recorded: {assessment['status']}",
+                    {
+                        "drift_assessment_id": assessment_id,
+                        "assessment_hash": content_hash(ML_DRIFT_CORE_COLUMNS, stored),
+                        "status": assessment["status"],
+                        "drifted_feature_count": int(assessment["drifted_feature_count"]),
+                        "comparison_dataset_id": str(assessment["comparison_dataset_id"]),
+                    },
+                    False,
+                    actor,
+                    float(assessment["created_at"]),
+                )
+                return {
+                    "assessment": self._decode_ml_drift_row(stored),
+                    "lifecycle": self._decode_ml_lifecycle_row(
+                        conn.execute(
+                            "SELECT * FROM ml_model_lifecycle WHERE id = ?", (lifecycle_id,)
+                        ).fetchone()
+                    ),
+                }
+
+    def read_ml_drift_assessments(
+        self, model_id: Optional[str] = None, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Read drift assessments newest-first; read-only, and never a scoring input."""
+        clause = "WHERE model_id = ? " if model_id else ""
+        parameters: List[Any] = [model_id] if model_id else []
+        parameters.append(max(1, int(limit)))
+        with self._transaction() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM ml_drift_assessments {clause}ORDER BY id DESC LIMIT ?",
+                parameters,
+            ).fetchall()
+        return [self._decode_ml_drift_row(dict(row)) for row in rows]
+
+    def read_ml_lifecycle(
+        self, model_id: Optional[str] = None, limit: int = 500
+    ) -> List[Dict[str, Any]]:
+        """Read lifecycle rows oldest-first, so the sequence reads as a history."""
+        clause = "WHERE model_id = ? " if model_id else ""
+        parameters: List[Any] = [model_id] if model_id else []
+        parameters.append(max(1, int(limit)))
+        with self._transaction() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM ml_model_lifecycle {clause}ORDER BY chain_seq ASC, id ASC LIMIT ?",
+                parameters,
+            ).fetchall()
+        return [self._decode_ml_lifecycle_row(row) for row in rows]
+
+    def verify_ml_lifecycle_chain(self) -> Dict[str, Any]:
+        """
+        Recompute the ml_model_lifecycle hash chain from on-disk columns.
+
+        Same contract as `verify_findings_chain`, over the append-only model
+        lifecycle log, plus one check the other chains do not need: every
+        `drift_assessed` row commits to the `content_hash` of the assessment
+        written with it, and `ml_drift_assessments` carries no chain of its own, so
+        those bindings are recomputed here. Without this second pass the commitment
+        would be inert -- editing an assessment leaves every lifecycle hash valid,
+        because the edit is outside the chained columns. A recorded hash is only
+        tamper-evidence if something recomputes it.
+
+        A broken link is reported ahead of any binding: once the sequence itself is
+        untrustworthy, so is the set of commitments read out of it. `checked` counts
+        lifecycle links, as in the other chains.
+        """
+        with self._transaction() as conn:
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM ml_model_lifecycle ORDER BY chain_seq ASC, id ASC"
+                ).fetchall()
+            ]
+            verification = verify_chain(ML_LIFECYCLE_CHAIN_COLUMNS, rows)
+            if not verification["ok"]:
+                return verification
+            # Raw rows, not `_decode_ml_drift_row`: the hash was taken over the
+            # stored columns, so `features_json` must stay the JSON text it was
+            # hashed as rather than the list it decodes to.
+            assessments = {
+                int(row["id"]): dict(row)
+                for row in conn.execute("SELECT * FROM ml_drift_assessments").fetchall()
+            }
+        for row in rows:
+            if row["to_state"] != "drift_assessed":
+                continue
+            evidence = json.loads(row["evidence_json"] or "{}")
+            assessment_id = evidence.get("drift_assessment_id")
+            recorded = evidence.get("assessment_hash")
+            stored = assessments.get(assessment_id)
+            if stored is None:
+                return {
+                    "ok": False,
+                    "checked": verification["checked"],
+                    "break_seq": row["chain_seq"],
+                    "reason": f"drift assessment {assessment_id!r} is missing (chained row {row['chain_seq']})",
+                }
+            if content_hash(ML_DRIFT_CORE_COLUMNS, stored) != recorded:
+                return {
+                    "ok": False,
+                    "checked": verification["checked"],
+                    "break_seq": row["chain_seq"],
+                    "reason": f"drift assessment {assessment_id} does not match the hash chained at seq {row['chain_seq']}",
+                }
+        return verification
+
+    @staticmethod
+    def _decode_ml_drift_row(row: Any) -> Dict[str, Any]:
+        record = dict(row)
+        for key in ("features_json", "reasons_json"):
+            record[key.removesuffix("_json")] = json.loads(record.pop(key))
+        return record
+
+    @staticmethod
+    def _decode_ml_lifecycle_row(row: Any) -> Dict[str, Any]:
+        record = dict(row)
+        record["evidence"] = json.loads(record.pop("evidence_json"))
+        record["activation_eligible"] = bool(record["activation_eligible"])
         return record
 
     def write_feature_record(self, feature_data: Dict[str, Any]) -> None:

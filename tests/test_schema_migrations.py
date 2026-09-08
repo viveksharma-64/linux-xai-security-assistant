@@ -728,6 +728,187 @@ def test_triage_action_and_disposition_are_constrained_at_the_schema(tmp_path):
         conn.close()
 
 
+def test_ml_lifecycle_tables_are_created_at_the_latest_version(tmp_path):
+    """
+    Migration 10 adds the drift-assessment table and the chained lifecycle log. On
+    a fresh database both are present, indexed per model, and the lifecycle chain
+    verifies as empty -- the correct state on a default install, where no model has
+    been trained and the ML path is off.
+    """
+    db = tmp_path / "ml_lifecycle_fresh.db"
+    store = SQLiteEventStore(str(db))
+
+    assert {"ml_drift_assessments", "ml_model_lifecycle"} <= _tables(db)
+    assert {
+        "id",
+        "model_id",
+        "comparison_dataset_id",
+        "status",
+        "method",
+        "alpha",
+        "reference_window_count",
+        "comparison_window_count",
+        "drifted_feature_count",
+        "out_of_range_rate",
+        "features_json",
+        "reasons_json",
+        "actor",
+        "created_at",
+    } <= _columns(db, "ml_drift_assessments")
+    assert {
+        "id",
+        "model_id",
+        "from_state",
+        "to_state",
+        "reason",
+        "evidence_json",
+        "activation_eligible",
+        "actor",
+        "created_at",
+        "chain_seq",
+        "chain_prev_hash",
+        "chain_hash",
+    } <= _columns(db, "ml_model_lifecycle")
+
+    conn = sqlite3.connect(str(db))
+    try:
+        indexes = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+        }
+    finally:
+        conn.close()
+    assert "idx_ml_drift_assessments_model" in indexes
+    assert "idx_ml_model_lifecycle_model" in indexes
+    assert "idx_ml_model_lifecycle_chain" in indexes
+    assert store.verify_ml_lifecycle_chain()["ok"] is True
+
+
+def test_ml_lifecycle_tables_added_to_an_existing_database(tmp_path):
+    """
+    Migration 10 over a version-9 database. Both tables are created empty (there is
+    no history to reconstruct for a model trained before the log existed, and
+    inventing one would be worse than an absent record), the evidence and triage
+    chains already present are untouched, and reopening does not apply 10 twice.
+    """
+    db = tmp_path / "ml_lifecycle_upgrade.db"
+
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.isolation_level = None
+        migrations._ensure_version_table(conn)
+        migrations._apply_baseline(conn)
+        migrations._apply_backpressure_telemetry(conn)
+        migrations._apply_event_identity(conn)
+        migrations._apply_kernel_loss_telemetry(conn)
+        migrations._apply_hot_path_indexes(conn)
+        migrations._apply_maintenance_log(conn)
+        migrations._apply_collector_sources(conn)
+        migrations._apply_evidence_chain(conn)
+        migrations._apply_triage_annotations(conn)
+        # A model registered before the lifecycle log existed: it keeps its
+        # provenance and its inactive posture, and gains no history it never had.
+        conn.execute(
+            """
+            INSERT INTO ml_models (
+                id, version, algorithm, hyperparameters_json, artifact_path,
+                artifact_checksum, schema_version, schema_hash,
+                training_window_ids_json, runtime_json, evaluation_json,
+                active, created_at
+            ) VALUES ('legacy-model', 'v1', 'isolation_forest', '{}',
+                      '/models/legacy.model.json', 'ab', 'canonical-window.v1', 'sh',
+                      '[1, 2, 3]', '{}', '{}', 0, 100.0)
+            """
+        )
+        for version in range(1, 10):
+            conn.execute(
+                f"INSERT INTO {SCHEMA_MIGRATIONS_TABLE} (version, description, applied_at) "
+                "VALUES (?, ?, 0.0)",
+                (version, f"v{version}"),
+            )
+    finally:
+        conn.close()
+
+    store = SQLiteEventStore(str(db))
+
+    assert store.schema_version == LATEST_VERSION == 10
+    assert {"ml_drift_assessments", "ml_model_lifecycle"} <= _tables(db)
+    assert store.verify_ml_lifecycle_chain() == {
+        "ok": True,
+        "checked": 0,
+        "break_seq": None,
+        "reason": None,
+    }
+    assert store.read_ml_drift_assessments() == []
+    assert store.read_ml_lifecycle() == []
+    # The pre-existing model is still there, and still inactive: a migration does
+    # not activate anything.
+    assert store.verify_triage_chain()["ok"] is True
+    conn = sqlite3.connect(str(db))
+    try:
+        assert conn.execute("SELECT active FROM ml_models WHERE id = 'legacy-model'").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+    # Reopening re-runs migrate(): version 10 must not apply twice.
+    SQLiteEventStore(str(db))
+    conn = sqlite3.connect(str(db))
+    try:
+        (rows,) = conn.execute(
+            f"SELECT COUNT(*) FROM {SCHEMA_MIGRATIONS_TABLE} WHERE version = ?",
+            (LATEST_VERSION,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert rows == 1, "migration 10 recorded itself more than once"
+
+
+def test_ml_lifecycle_vocabulary_is_constrained_at_the_schema(tmp_path):
+    """
+    The lifecycle states, drift statuses, and the eligibility flag are pinned by
+    CHECK constraints, so a direct writer bypassing the store's own validation
+    still cannot record a state outside the declared path or an eligibility value
+    that is neither true nor false.
+    """
+    db = tmp_path / "ml_lifecycle_checks.db"
+    SQLiteEventStore(str(db)).close()
+
+    conn = sqlite3.connect(str(db))
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO ml_model_lifecycle (model_id, to_state, reason, evidence_json, created_at) "
+                "VALUES ('m', 'promoted', 'why not', '{}', 100.0)"
+            )
+        # Not a boolean: the flag is read as a verdict, so a third value would make
+        # "is this model eligible" unanswerable.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO ml_model_lifecycle "
+                "(model_id, to_state, reason, evidence_json, activation_eligible, created_at) "
+                "VALUES ('m', 'eligible', 'gate passed', '{}', 2, 100.0)"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO ml_drift_assessments ("
+                "model_id, comparison_dataset_id, status, method, alpha, reference_window_count, "
+                "comparison_window_count, drifted_feature_count, features_json, reasons_json, created_at) "
+                "VALUES ('m', 'cmp', 'probably_fine', 'ks', 0.01, 12, 40, 0, '[]', '[]', 100.0)"
+            )
+        # A declared state and a declared status are accepted.
+        conn.execute(
+            "INSERT INTO ml_model_lifecycle (model_id, to_state, reason, evidence_json, created_at) "
+            "VALUES ('m', 'trained', 'trained on 12 windows', '{}', 100.0)"
+        )
+        conn.execute(
+            "INSERT INTO ml_drift_assessments ("
+            "model_id, comparison_dataset_id, status, method, alpha, reference_window_count, "
+            "comparison_window_count, drifted_feature_count, features_json, reasons_json, created_at) "
+            "VALUES ('m', 'cmp', 'insufficient_data', 'ks', 0.01, 12, 5, 0, '[]', '[]', 100.0)"
+        )
+    finally:
+        conn.close()
+
+
 def test_host_index_exists_for_per_host_queries(tmp_path):
     """
     Filtering by host is the common analyst query once a file holds more than
