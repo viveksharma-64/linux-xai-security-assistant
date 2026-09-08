@@ -14,10 +14,19 @@ function promptForToken(message) {
   return token ? token.trim() : "";
 }
 
-const getJson = async (url) => {
+// Which finding the analyst has opened, remembered across background refreshes so a
+// refresh re-applies the row highlight instead of silently dropping it. The detail
+// pane itself is never rebuilt by a refresh, so an open investigation stays put.
+let selectedFindingId = null;
+
+// interactive is false for background refreshes. A periodic tick that meets a 401 must
+// fail quietly rather than raising a token prompt on its own -- otherwise an
+// auth-required instance would pop a dialog at the analyst on every interval.
+const getJson = async (url, interactive = true) => {
   const send = (token) => fetch(url, token ? { headers: { Authorization: `Bearer ${token}` } } : undefined);
   let response = await send(apiToken());
   if (response.status === 401) {
+    if (!interactive) throw new Error("401");
     // Asked for once, on the first refusal, rather than at page load: an instance
     // configured with api_require_auth false should not demand a token nobody set.
     const token = promptForToken("This API requires a token. Paste it to continue:");
@@ -75,10 +84,16 @@ function renderTelemetry(status) {
 function renderFindings(findings) {
   $("#finding-count").textContent = `${findings.length} persisted`;
   $("#findings-body").innerHTML = findings.length ? findings.map((finding) => `<tr data-id="${finding.id}"><td>#${finding.id}</td><td class="severity">${escapeHtml(finding.severity)}</td><td><span class="risk-meter"><i style="width:${Math.round(finding.risk_score * 100)}%"></i></span>${finding.risk_score.toFixed(4)}</td><td>${escapeHtml(finding.entity_type)}:${escapeHtml(finding.entity_key)}</td><td>${new Date(finding.window_end * 1000).toLocaleString()}</td></tr>`).join("") : `<tr><td colspan="5" class="empty-state">No persisted detection findings.</td></tr>`;
-  document.querySelectorAll("#findings-body tr[data-id]").forEach((row) => row.addEventListener("click", () => selectFinding(Number(row.dataset.id), row)));
+  // Re-apply the open finding's highlight after a rebuild so a background refresh does
+  // not visually deselect the row the analyst is reading.
+  document.querySelectorAll("#findings-body tr[data-id]").forEach((row) => {
+    if (Number(row.dataset.id) === selectedFindingId) row.classList.add("selected");
+    row.addEventListener("click", () => selectFinding(Number(row.dataset.id), row));
+  });
 }
 
 async function selectFinding(id, row) {
+  selectedFindingId = id;
   document.querySelectorAll("#findings-body tr").forEach((item) => item.classList.remove("selected")); row.classList.add("selected");
   $("#selected-id").textContent = `Finding #${id}`;
   try {
@@ -92,13 +107,24 @@ async function selectFinding(id, row) {
   } catch (error) { $("#detail-content").textContent = "Unable to load persisted finding detail."; }
 }
 
-async function load() {
+async function load(interactive = true) {
   try {
-    const [status, telemetry, findings] = await Promise.all([getJson("/api/status"), getJson("/api/telemetry/status"), getJson("/api/detections")]);
+    const [status, telemetry, findings] = await Promise.all([getJson("/api/status", interactive), getJson("/api/telemetry/status", interactive), getJson("/api/detections", interactive)]);
     renderStatus(status); renderTelemetry(telemetry); renderFindings(findings);
   } catch (error) {
     $("#health-badge").textContent = "API unavailable";
-    $("#detail-content").textContent = "The read-only API is unavailable.";
+    // Only claim the detail pane on the first, interactive load; a transient failure
+    // during a background refresh must not wipe an open investigation.
+    if (interactive) $("#detail-content").textContent = "The read-only API is unavailable.";
   }
 }
+
+// The API re-queries SQLite on every request, so re-running load() surfaces the rows
+// the collector has persisted since the last tick -- the dashboard tails the evidence
+// record without a manual reload. Background ticks are non-interactive (never prompt)
+// and are paused while the tab is hidden, so a backgrounded dashboard issues no
+// requests; returning to the tab refreshes immediately.
+const REFRESH_INTERVAL_MS = 10000;
 load();
+setInterval(() => { if (document.visibilityState === "visible") load(false); }, REFRESH_INTERVAL_MS);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") load(false); });
