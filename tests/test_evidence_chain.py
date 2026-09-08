@@ -326,3 +326,108 @@ def test_backfill_matches_runtime_finding_hashes(tmp_path):
     assert all(backfill_hashes)
     # The backfilled chain verifies through the store's own reader as well.
     assert SQLiteEventStore(backfill_db).verify_findings_chain()["ok"] is True
+
+
+# ------------------------------------------------------ store: triage chain
+#
+# The triage annotation layer (migration 9) is append-only and hash-chained on
+# the same rules as the evidence tables, but it is deliberately separate: writing
+# triage must never touch a finding row or the finding/policy chains. These pin
+# that the triage trail is itself tamper-evident, that a correction is a new link
+# rather than an edit, and -- crucially -- that annotating a finding leaves the
+# evidence chain byte-for-byte unchanged.
+
+
+def test_empty_triage_chain_verifies_ok(tmp_path):
+    store = SQLiteEventStore(str(tmp_path / "e.db"))
+    verdict = store.verify_triage_chain()
+    assert verdict == {"ok": True, "checked": 0, "break_seq": None, "reason": None}
+
+
+def test_triage_annotations_are_chained_and_contiguous(tmp_path):
+    store = SQLiteEventStore(str(tmp_path / "e.db"))
+    fid = store.write_detection_finding(_finding("nc", provenance="p0"))
+    store.write_triage_annotation(fid, "acknowledge", actor="analyst-a")
+    store.write_triage_annotation(fid, "annotate", note="looks like a real reverse shell")
+    store.write_triage_annotation(fid, "disposition", disposition="true-positive")
+
+    verdict = store.verify_triage_chain()
+    assert verdict["ok"] is True
+    assert verdict["checked"] == 3
+
+    annotations = store.read_triage_annotations(finding_id=fid)
+    assert [a["chain_seq"] for a in annotations] == [0, 1, 2]
+    assert annotations[0]["chain_prev_hash"] == GENESIS_PREV_HASH
+    assert annotations[1]["chain_prev_hash"] == annotations[0]["chain_hash"]
+    assert annotations[2]["chain_prev_hash"] == annotations[1]["chain_hash"]
+
+
+def test_triage_correction_is_a_new_link_not_an_edit(tmp_path):
+    store = SQLiteEventStore(str(tmp_path / "e.db"))
+    fid = store.write_detection_finding(_finding("nc", provenance="p0"))
+    # An analyst dispositions true-positive, then reconsiders and corrects to
+    # false-positive. The correction is a *second* row, not an overwrite: the
+    # first disposition remains in the immutable history, and latest wins.
+    store.write_triage_annotation(fid, "disposition", disposition="true-positive")
+    store.write_triage_annotation(fid, "disposition", disposition="false-positive")
+
+    history = store.read_triage_annotations(finding_id=fid)
+    assert [a["disposition"] for a in history] == ["true-positive", "false-positive"]
+    assert store.verify_triage_chain()["checked"] == 2  # two links, not one edited link
+    assert store.read_latest_triage_state()[fid]["disposition"] == "false-positive"
+
+
+def test_triage_writes_leave_the_evidence_chain_untouched(tmp_path):
+    store = SQLiteEventStore(str(tmp_path / "e.db"))
+    fid = store.write_detection_finding(_finding("nc", provenance="p0"))
+    before = store.read_detection_finding(fid)["chain_hash"]
+
+    store.write_triage_annotation(fid, "suppress", note="known internal scanner")
+    store.write_triage_annotation(fid, "disposition", disposition="benign")
+
+    after = store.read_detection_finding(fid)
+    # The finding row and its chain link are identical; triage lives elsewhere.
+    assert after["chain_hash"] == before
+    assert after["suppressed"] is False  # config column never flipped by triage
+    assert store.verify_findings_chain()["ok"] is True
+
+
+def test_mutating_a_triage_row_breaks_verification(tmp_path):
+    db = str(tmp_path / "e.db")
+    store = SQLiteEventStore(db)
+    fid = store.write_detection_finding(_finding("nc", provenance="p0"))
+    store.write_triage_annotation(fid, "annotate", note="original note")
+    store.write_triage_annotation(fid, "disposition", disposition="true-positive")
+    store.close()
+
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("UPDATE triage_annotations SET note = 'rewritten' WHERE chain_seq = 0")
+        conn.commit()
+    finally:
+        conn.close()
+
+    verdict = SQLiteEventStore(db).verify_triage_chain()
+    assert verdict["ok"] is False
+    assert verdict["break_seq"] == 0
+    assert "hash mismatch" in verdict["reason"]
+
+
+def test_deleting_a_triage_row_is_detected(tmp_path):
+    db = str(tmp_path / "e.db")
+    store = SQLiteEventStore(db)
+    fid = store.write_detection_finding(_finding("nc", provenance="p0"))
+    for _ in range(3):
+        store.write_triage_annotation(fid, "annotate", note="n")
+    store.close()
+
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("DELETE FROM triage_annotations WHERE chain_seq = 1")
+        conn.commit()
+    finally:
+        conn.close()
+
+    verdict = SQLiteEventStore(db).verify_triage_chain()
+    assert verdict["ok"] is False
+    assert "non-contiguous" in verdict["reason"]

@@ -9,11 +9,23 @@
 <body>
   <header class="topbar">
     <div>
-      <p class="eyebrow">C-DAC / LINUX SECURITY ASSISTANT</p>
+      <p class="eyebrow">LINUX XAI SECURITY ASSISTANT</p>
       <h1>Security Console</h1>
     </div>
-    <div class="read-only">READ-ONLY VIEW</div>
+    <div class="topbar-right">
+      <div class="read-only" title="Evidence is immutable and hash-chained. Triage annotations are append-only.">READ-ONLY VIEW</div>
+      <div id="last-updated" class="last-updated" aria-live="off">Loading…</div>
+    </div>
   </header>
+
+  <!-- Integrity alarm: populated only when a chain fails to verify. Empty and
+       hidden when all three chains are intact, so it never cries wolf. -->
+  <div id="integrity-banner" class="integrity-banner" role="alert" hidden></div>
+
+  <!-- Polite announcements (new findings, integrity state) for assistive tech.
+       Never takes focus; never fights the background refresh. -->
+  <div id="live-region" class="visually-hidden" aria-live="polite" aria-atomic="true"></div>
+
   <main>
     <section class="status-grid" id="status-cards" aria-label="System status"></section>
     <section class="content-grid">
@@ -29,15 +41,67 @@
       </article>
     </section>
     <section class="panel findings-panel">
-      <div class="panel-heading"><h2>Detection findings</h2><span id="finding-count" class="muted"></span></div>
-      <div class="table-wrap"><table><thead><tr><th>ID</th><th>Severity</th><th>Risk</th><th>Entity</th><th>Window</th></tr></thead><tbody id="findings-body"></tbody></table></div>
+      <div class="panel-heading">
+        <h2>Detection findings</h2>
+        <span id="finding-count" class="muted"></span>
+      </div>
+      <div class="filter-bar" role="group" aria-label="Filter and sort findings">
+        <label>Severity
+          <select id="filter-severity">
+            <option value="">any</option>
+            <option value="LOW">LOW</option>
+            <option value="MEDIUM">MEDIUM</option>
+            <option value="HIGH">HIGH</option>
+            <option value="CRITICAL">CRITICAL</option>
+          </select>
+        </label>
+        <label>Disposition
+          <select id="filter-disposition">
+            <option value="">any</option>
+            <option value="none">untriaged</option>
+            <option value="true-positive">true-positive</option>
+            <option value="false-positive">false-positive</option>
+            <option value="benign">benign</option>
+          </select>
+        </label>
+        <label>Sort
+          <select id="sort-field">
+            <option value="window_start">window</option>
+            <option value="risk_score">risk</option>
+            <option value="severity">severity</option>
+            <option value="id">id</option>
+            <option value="entity_type">entity type</option>
+          </select>
+        </label>
+        <label>Order
+          <select id="sort-order">
+            <option value="desc">desc</option>
+            <option value="asc">asc</option>
+          </select>
+        </label>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>ID</th><th>Severity</th><th>Risk</th><th>Entity</th><th>Window</th><th>Triage</th></tr></thead>
+          <tbody id="findings-body" role="listbox" aria-label="Detection findings" tabindex="0"></tbody>
+        </table>
+      </div>
+      <div class="pager" role="group" aria-label="Pagination">
+        <button id="page-prev" type="button">Prev</button>
+        <span id="page-status" class="muted"></span>
+        <button id="page-next" type="button">Next</button>
+      </div>
     </section>
     <section class="detail-grid">
-      <article class="panel detail-panel"><div class="panel-heading"><h2>Evidence detail</h2><span id="selected-id" class="muted">Select a finding</span></div><div id="detail-content" class="empty-state">Select a finding above to inspect persisted evidence.</div></article>
+      <article class="panel detail-panel" id="detail-panel" tabindex="-1" aria-label="Evidence detail">
+        <div class="panel-heading"><h2>Evidence detail</h2><span id="selected-id" class="muted">Select a finding</span></div>
+        <div id="triage-controls" class="triage-controls" hidden></div>
+        <div id="detail-content" class="empty-state">Select a finding above to inspect persisted evidence.</div>
+      </article>
       <article class="panel detail-panel"><div class="panel-heading"><h2>Policy decision</h2><span class="muted">No actions available</span></div><div id="policy-content" class="empty-state">Policy decisions appear here when persisted.</div></article>
     </section>
   </main>
-  <footer>Live verified: process execution, post-exec context, file access, TCP/network, authentication/session, system/service lifecycle, and pipes/streams/IPC.</footer>
+  <footer id="source-footer">Observed telemetry sources load here.</footer>
   <script src="/dashboard/app.js"></script>
 </body>
 </html>

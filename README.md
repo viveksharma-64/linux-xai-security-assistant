@@ -48,6 +48,7 @@ throttle. [AGENTS.md](AGENTS.md) carries the full clause-by-clause traceability.
 | Dashboard | Read-only, **authenticated** FastAPI API and browser dashboard over persisted SQLite data |
 | Operational readiness (Phase B) | Supervised multi-collector ingestion, authenticated API, self-bounding retention, metrics/alerts, and systemd deployment; the test suite gates CI |
 | Detection credibility (Phase C) | Published precision/recall on a seeded corpus, versioned MITRE-mapped rules with per-rule tests, and a tamper-evident append-only evidence hash-chain |
+| Analyst experience (Phase D) | Append-only, hash-chained triage (acknowledge/annotate/disposition/suppress) that never mutates the evidence record; authenticated default-deny writes; integrity alarm; faithful export; and operational efficacy from dispositions, decoupled from the ML gate |
 
 ### LIVE VERIFIED telemetry
 
@@ -197,6 +198,56 @@ All thresholds and the window/hysteresis counts are configurable (`failure_*` in
 [deploy/config.example.yaml](deploy/config.example.yaml), `SECURITY_FAILURE_*` in
 the environment) and validated fail-closed on load.
 
+## Analyst experience (Phase D)
+
+Phase D adds an analyst workflow — acknowledge, annotate, disposition, suppress —
+on top of the immutable record without ever mutating it. The apparent conflict
+with immutability is resolved by keeping triage in a **separate, append-only
+annotation layer** that never touches a finding row or the finding/policy hash
+chains.
+
+- **Append-only triage layer** — triage writes land in `triage_annotations`
+  (migration 9), itself an append-only hash chain
+  (`verify_triage_chain()`). A correction is a new append event, never an edit;
+  the latest annotation per finding wins for effective state. The immutable
+  `detection_findings` rows and their chain are left byte-for-byte unchanged, so
+  the READ-ONLY (evidence) guarantee survives. The console distinguishes
+  *evidence: immutable and tamper-evident* from *triage: append-only
+  annotations*.
+- **Suppress is presentation-only** — `suppress`/`unsuppress` set an effective
+  alerting state; they **never** delete a finding, hide it from a read, or drop
+  it from the export. A suppressed finding stays in the record, is returned by
+  the API, and is exported **included and marked** (`triage.effective_suppressed`).
+- **Authenticated, default-deny writes** — the five triage actions are `POST`
+  under `/api/triage/{id}/...` and require a token (401 without one). No triage
+  route is destructive: there is no `PUT`/`DELETE`/`PATCH`. `actor` is a
+  self-reported claim, labelled as such — the token proves the writer is
+  authorized, not who they are.
+- **Faithful export** — `GET /api/triage/export` emits a complete JSON document
+  (`schema: linux-xai-security/triage-export/v1`) with every finding, its
+  evidence, its full append-only annotation history, and the verdicts of all
+  three hash chains. Suppressed findings are included and marked, never omitted.
+- **Integrity alarm** — `GET /api/integrity` returns the `verify_chain` verdict
+  for the findings, policy, and triage chains. The console raises an unmissable
+  banner **only** when a chain fails to verify, and stays silent when all three
+  are intact, so it never cries wolf.
+- **Operational efficacy, decoupled from the gate** — `GET
+  /api/efficacy/operational` (`detection/operational_efficacy.py`) reports what
+  analyst dispositions can honestly support: counts and **precision** over
+  *reviewed fired findings only*, plus a labelled reviewed-false-positive rate.
+  It deliberately does **not** recompute population FPR or recall (dispositions
+  cover only fired findings — there are no observed true negatives) and never
+  imports the seeded corpus harness or the ML acceptance gate. Dispositions feed
+  operational reporting; they cannot move a gate threshold.
+
+The console is also hardened and made more usable: server-side
+filter/sort/pagination on `/api/detections` (page metadata in `X-Total-Count`
+headers, response body still a JSON array), safe DOM construction throughout (no
+`innerHTML`), a last-updated indicator with a stale/disconnected badge that never
+wipes an open investigation, keyboard navigation of the findings table, and an
+ARIA live region that announces new findings and integrity alarms without
+stealing focus.
+
 ## Quick start: run the project
 
 The application has two runtime pieces: a privileged collector/ingestion
@@ -323,12 +374,28 @@ GET /api/alerts
 GET /api/sources
 GET /api/maintenance
 GET /api/events?limit=100
-GET /api/detections
+GET /api/detections                 # filter/sort/paginate; page metadata in X-Total-Count
 GET /api/detections/{id}
 GET /api/explanations/{id}
 GET /api/assistant/{id}
 GET /api/policies
 GET /api/policy-decisions
+GET /api/integrity                   # verify_chain verdicts: findings, policy, triage
+GET /api/efficacy/operational        # precision/counts from dispositions (not the ML gate)
+GET /api/triage/{id}                 # append-only history + effective state
+GET /api/triage/export               # faithful record; suppressed findings included and marked
+```
+
+The only non-`GET` routes are the append-only triage writes, each `POST` only
+and token-gated (default-deny). None is destructive — there is no
+`PUT`/`DELETE`/`PATCH`, and none mutates a finding row or a hash chain:
+
+```text
+POST /api/triage/{id}/acknowledge    {note?, actor?}
+POST /api/triage/{id}/annotate       {note, actor?}
+POST /api/triage/{id}/disposition    {disposition: true-positive|false-positive|benign, note?, actor?}
+POST /api/triage/{id}/suppress       {reason, actor?}    # presentation only; never drops the finding
+POST /api/triage/{id}/unsuppress     {reason, actor?}
 ```
 
 ## Running individual verified collectors
@@ -448,7 +515,7 @@ pytest -q tests/test_journal_stream.py tests/test_ml_integration.py
 
 Measured on Python 3.14.6 with pytest 9.1.1:
 
-- Full suite: **507 passed, 4 skipped** (~22s)
+- Full suite: **544 passed, 4 skipped** (~24s)
 - The 4 skips are `tests/test_ml_integration.py`, which requires scikit-learn
 - Streaming journald: 92 passed, including two integration tests that exercise
   the real `journalctl` cursor semantics on systemd 261
@@ -468,6 +535,16 @@ Measured on Python 3.14.6 with pytest 9.1.1:
   single/collapsed/crash-loop service failures, the persisted detection-only
   finding shape, config validation, and pipeline integration
   (`tests/test_system_failure.py`)
+- Phase D added coverage for the append-only triage layer (chained writes,
+  corrections as new events, suppress/unsuppress effective state, suppress never
+  dropping a finding from a read or export, auth-required writes, and the finding
+  row plus finding/policy chains unchanged after triage), operational efficacy
+  from dispositions with a static guarantee it never imports the corpus harness
+  or ML gate, the new `/api/integrity` and `/api/efficacy/operational` routes,
+  detections pagination/filter/sort with `X-Total-Count`, the three new labelled
+  explanation factors, and migration 9 (`tests/test_triage.py`,
+  `test_operational_efficacy.py`, `test_api_app.py`, `test_explainer.py`,
+  `test_schema_migrations.py`, `test_evidence_chain.py`)
 
 Re-measure before restating those numbers. Tests are never weakened, skipped, or
 removed to make a run look clean.
@@ -480,13 +557,13 @@ removed to make a run look clean.
 | `pipeline/` | Canonical Event model, normalization, bounded ingestion, and the supervised multi-collector service with write-failure quarantine |
 | `storage/` | SQLite persistence (mode `0600` enforced), ML provenance, and age/byte-cap retention |
 | `baseline/` | Explicit verified-normal behavioral baseline |
-| `detection/` | Deterministic rules, evidence fusion, and detection-only system-failure scoring |
+| `detection/` | Deterministic rules, evidence fusion, detection-only system-failure scoring, and operational efficacy from analyst dispositions (decoupled from the ML gate) |
 | `ml/` | Canonical window schema, training, scoring, evaluation |
 | `explainability/` | Evidence reconstruction and bounded explanations |
 | `assistant/` | Optional provider-neutral advisory narration |
 | `policy/` | Deterministic fail-closed dry-run policy |
 | `observability/` | Layered config, Prometheus-style metrics, and disk/queue/silence alerting |
-| `api/`, `dashboard/` | Read-only, authenticated analyst API and interface |
+| `api/`, `dashboard/` | Authenticated analyst API and interface: read-only over the immutable evidence record, with append-only, default-deny triage writes |
 | `deploy/` | systemd units, example config, and the deployment guide |
 | `scripts/` | Environment check, ingestion benchmark, and collector-kill soak harness |
 | `tests/` | Focused unit and integration regression tests |

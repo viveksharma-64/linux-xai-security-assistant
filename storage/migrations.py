@@ -616,6 +616,65 @@ def _backfill_chain(conn: sqlite3.Connection, table: str, columns) -> None:
         prev_hash = link["chain_hash"]
 
 
+def _apply_triage_annotations(conn: sqlite3.Connection) -> None:
+    """
+    A separate, append-only, hash-chained layer for analyst triage.
+
+    Phase D lets an analyst acknowledge, annotate, disposition, and suppress a
+    finding. None of that may touch the evidence: a `detection_findings` row and
+    the finding/policy chains are immutable, and a triage action that edited a
+    finding -- or flipped its `suppressed` column -- would break the very
+    tamper-evidence the store exists to provide. So triage lives here instead,
+    as its own event log. A correction is a new row, never an edit; the effective
+    disposition of a finding is the latest annotation, computed on read.
+
+    Chained on the same rules as the evidence tables (see `_apply_evidence_chain`
+    and `storage/evidence_chain.py`), so the triage trail is as tamper-evident as
+    what it annotates: a deleted or altered disposition is as detectable as a
+    deleted finding. Unlike migration 8, this table is created with its `chain_*`
+    columns present from the start and starts empty, so there is nothing to
+    backfill -- the runtime writer folds each row in as it is appended.
+
+    `action` is constrained to the append-only vocabulary at the storage layer,
+    matching how the schema already pins other enumerated columns
+    (`verified_normal`, `active`). `disposition` is only meaningful for
+    `action='disposition'` and is otherwise NULL. `actor` is a self-reported
+    claim: authentication proves the writer is authorized, not who they are, so
+    the value is recorded as stated and chained so it cannot later be rewritten.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS triage_annotations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            finding_id INTEGER NOT NULL,
+            action TEXT NOT NULL CHECK (
+                action IN ('acknowledge', 'annotate', 'disposition', 'suppress', 'unsuppress')
+            ),
+            disposition TEXT CHECK (
+                disposition IS NULL
+                OR disposition IN ('true-positive', 'false-positive', 'benign')
+            ),
+            note TEXT,
+            actor TEXT,
+            created_at REAL NOT NULL,
+            chain_seq INTEGER,
+            chain_prev_hash TEXT,
+            chain_hash TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_triage_annotations_finding "
+        "ON triage_annotations(finding_id, id)"
+    )
+    # Same partial unique index the evidence chains carry: a duplicated sequence
+    # is a constraint error, not a silent fork.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_triage_annotations_chain "
+        "ON triage_annotations(chain_seq) WHERE chain_seq IS NOT NULL"
+    )
+
+
 MIGRATIONS: Tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -656,6 +715,11 @@ MIGRATIONS: Tuple[Migration, ...] = (
         version=8,
         description="append-only hash chain over evidence tables plus finding correlation and suppression",
         apply=_apply_evidence_chain,
+    ),
+    Migration(
+        version=9,
+        description="append-only hash-chained triage annotation layer (analyst acknowledge/annotate/disposition/suppress)",
+        apply=_apply_triage_annotations,
     ),
 )
 

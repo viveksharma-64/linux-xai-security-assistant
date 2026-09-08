@@ -591,6 +591,143 @@ def test_migration_8_backfill_skips_already_chained_rows(tmp_path):
     assert reopened.verify_findings_chain()["ok"] is True
 
 
+def test_triage_annotations_table_is_created_at_the_latest_version(tmp_path):
+    """
+    Migration 9 adds the append-only triage layer. On a fresh database it is
+    present with its chain columns from the start (nothing to backfill), indexed
+    for per-finding history, and verifies as an empty chain.
+    """
+    db = tmp_path / "triage_fresh.db"
+    store = SQLiteEventStore(str(db))
+
+    assert "triage_annotations" in _tables(db)
+    assert {
+        "id",
+        "finding_id",
+        "action",
+        "disposition",
+        "note",
+        "actor",
+        "created_at",
+        "chain_seq",
+        "chain_prev_hash",
+        "chain_hash",
+    } <= _columns(db, "triage_annotations")
+
+    conn = sqlite3.connect(str(db))
+    try:
+        indexes = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+        }
+    finally:
+        conn.close()
+    assert "idx_triage_annotations_finding" in indexes
+    assert "idx_triage_annotations_chain" in indexes
+    assert store.verify_triage_chain()["ok"] is True
+
+
+def test_triage_annotations_added_to_an_existing_database(tmp_path):
+    """
+    Migration 9 over a version-8 database -- the shape a deployment upgrading into
+    this release is in. The table is created empty (no backfill), the evidence
+    already present is untouched, and reopening does not apply migration 9 twice.
+    """
+    db = tmp_path / "triage_upgrade.db"
+
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.isolation_level = None
+        migrations._ensure_version_table(conn)
+        migrations._apply_baseline(conn)
+        migrations._apply_backpressure_telemetry(conn)
+        migrations._apply_event_identity(conn)
+        migrations._apply_kernel_loss_telemetry(conn)
+        migrations._apply_hot_path_indexes(conn)
+        migrations._apply_maintenance_log(conn)
+        migrations._apply_collector_sources(conn)
+        # A finding written before the evidence-chain migration -- no chain columns
+        # yet. The migration-8 backfill will fold it into the chain, exactly as a
+        # real v7 database upgrading into this release would be.
+        conn.execute(
+            """
+            INSERT INTO detection_findings (
+                source_risk_id, window_start, window_end, entity_type,
+                entity_key, risk_score, severity, behavior_score,
+                rule_score, context_score, evidence_json, explanation,
+                mode, provenance_hash, detector_version, created_at
+            ) VALUES (1, 1000.0, 1300.0, 'command', 'nc', 0.7, 'HIGH',
+                      0.7, 0.7, 0.7, '[]', 'seed', 'detection', 'ph', 'detector.v1', 100.0)
+            """
+        )
+        migrations._apply_evidence_chain(conn)
+        for version in range(1, 9):
+            conn.execute(
+                f"INSERT INTO {SCHEMA_MIGRATIONS_TABLE} (version, description, applied_at) "
+                "VALUES (?, ?, 0.0)",
+                (version, f"v{version}"),
+            )
+    finally:
+        conn.close()
+
+    store = SQLiteEventStore(str(db))
+
+    assert store.schema_version == LATEST_VERSION
+    assert "triage_annotations" in _tables(db)
+    # No backfill: a brand-new table starts empty and verifies as an empty chain.
+    assert store.verify_triage_chain() == {
+        "ok": True,
+        "checked": 0,
+        "break_seq": None,
+        "reason": None,
+    }
+    # The finding chain that predated migration 9 is left intact.
+    assert store.verify_findings_chain()["ok"] is True
+    assert len(store.read_detection_findings()) == 1
+
+    # Reopening re-runs migrate(): version 9 must not apply twice.
+    SQLiteEventStore(str(db))
+    conn = sqlite3.connect(str(db))
+    try:
+        (rows,) = conn.execute(
+            f"SELECT COUNT(*) FROM {SCHEMA_MIGRATIONS_TABLE} WHERE version = ?",
+            (LATEST_VERSION,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert rows == 1, "migration 9 recorded itself more than once"
+
+
+def test_triage_action_and_disposition_are_constrained_at_the_schema(tmp_path):
+    """
+    The append-only vocabulary is pinned by CHECK constraints at the storage
+    layer, matching how the schema already pins other enumerated columns. This is
+    defense-in-depth beneath the API's Literal validation: even a direct writer
+    cannot record an action or disposition outside the allowlist.
+    """
+    db = tmp_path / "triage_checks.db"
+    SQLiteEventStore(str(db)).close()
+
+    conn = sqlite3.connect(str(db))
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO triage_annotations (finding_id, action, created_at) "
+                "VALUES (1, 'delete', 100.0)"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO triage_annotations (finding_id, action, disposition, created_at) "
+                "VALUES (1, 'disposition', 'maybe', 100.0)"
+            )
+        # A valid action with a valid disposition is accepted.
+        conn.execute(
+            "INSERT INTO triage_annotations (finding_id, action, disposition, created_at) "
+            "VALUES (1, 'disposition', 'true-positive', 100.0)"
+        )
+    finally:
+        conn.close()
+
+
 def test_host_index_exists_for_per_host_queries(tmp_path):
     """
     Filtering by host is the common analyst query once a file holds more than

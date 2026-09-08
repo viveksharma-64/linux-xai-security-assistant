@@ -1,15 +1,16 @@
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import yaml
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.auth import TokenAuthenticator, extract_token, unprotected_paths
+from detection.operational_efficacy import operational_efficacy_from_store
 from observability import alerts as alerting
 from observability import metrics as metrics_module
 from observability.config import Settings
@@ -154,6 +155,17 @@ class FindingResponse(StrictModel):
     chain_seq: Optional[int] = None
     chain_prev_hash: Optional[str] = None
     chain_hash: Optional[str] = None
+    # Effective triage state (Phase D, migration 9), folded read-only from the
+    # append-only annotation layer -- never a mutation of the finding row above.
+    # Defaulted so the readers that do not enrich (single lookup falls back to a
+    # targeted fold; `/api/status` counts do not need it) still serialize, and so
+    # a pre-triage client sees benign defaults. `triage_suppressed` is the
+    # *effective* suppression (config `suppressed` OR the latest analyst suppress
+    # not since lifted); the immutable `suppressed` column is left truthful above.
+    triage_disposition: Optional[str] = None
+    triage_acknowledged: bool = False
+    triage_suppressed: bool = False
+    triage_annotation_count: int = 0
 
 
 class ExplanationResponse(StrictModel):
@@ -276,6 +288,128 @@ class MaintenanceRecordResponse(StrictModel):
     duration_seconds: float
     detail: Optional[str] = None
     created_at: float
+
+
+# --------------------------------------------------------------------------- #
+# Triage (Phase D). Analyst write-back is an append-only annotation layer that
+# never mutates a finding row or the evidence chain: an acknowledge, note,
+# disposition, suppress, or unsuppress is a new event, and a correction is a
+# later event, not an edit. `extra="forbid"` (StrictModel) rejects unexpected
+# body fields with 422 rather than silently dropping them. `actor` is a
+# self-reported claim -- the token proves the writer is authorized, not who they
+# are -- and is labeled as such wherever it surfaces.
+# --------------------------------------------------------------------------- #
+
+# The disposition vocabulary as a request/response type. Mirrors
+# storage.sqlite_store._TRIAGE_DISPOSITIONS and detection.operational_efficacy;
+# a Literal gives an automatic 422 on an unknown value and documents the
+# allowlist in the schema. The store re-validates as a defense-in-depth backstop.
+TriageDisposition = Literal["true-positive", "false-positive", "benign"]
+
+# Bounds on free-text fields: long enough for a real analyst note, short enough
+# that the write surface cannot be used to stuff the evidence database.
+_MAX_NOTE = 4000
+_MAX_ACTOR = 256
+
+
+class TriageAcknowledgeRequest(StrictModel):
+    note: Optional[str] = Field(default=None, max_length=_MAX_NOTE)
+    actor: Optional[str] = Field(default=None, max_length=_MAX_ACTOR)
+
+
+class TriageAnnotateRequest(StrictModel):
+    note: str = Field(min_length=1, max_length=_MAX_NOTE)
+    actor: Optional[str] = Field(default=None, max_length=_MAX_ACTOR)
+
+
+class TriageDispositionRequest(StrictModel):
+    disposition: TriageDisposition
+    note: Optional[str] = Field(default=None, max_length=_MAX_NOTE)
+    actor: Optional[str] = Field(default=None, max_length=_MAX_ACTOR)
+
+
+class TriageSuppressRequest(StrictModel):
+    # A reason is required for suppress and unsuppress: suppression is an
+    # alerting/presentation decision the record must justify, never a silent
+    # drop. Stored as the annotation's note.
+    reason: str = Field(min_length=1, max_length=_MAX_NOTE)
+    actor: Optional[str] = Field(default=None, max_length=_MAX_ACTOR)
+
+
+class TriageAnnotationResponse(StrictModel):
+    id: int
+    finding_id: int
+    action: str
+    disposition: Optional[str] = None
+    note: Optional[str] = None
+    actor: Optional[str] = None
+    created_at: float
+    # The triage layer is itself hash-chained (migration 9), so a recorded
+    # disposition is as tamper-evident as the finding it annotates.
+    chain_seq: Optional[int] = None
+    chain_prev_hash: Optional[str] = None
+    chain_hash: Optional[str] = None
+
+
+class TriageStateResponse(StrictModel):
+    finding_id: int
+    disposition: Optional[str] = None
+    acknowledged: bool = False
+    # Config suppression lives on the immutable finding row; analyst suppression
+    # is the latest suppress/unsuppress in the annotation layer. Both are shown,
+    # and `effective_suppressed` is their OR -- the value alerting honours.
+    config_suppressed: bool = False
+    effective_suppressed: bool = False
+    annotation_count: int = 0
+
+
+class TriageHistoryResponse(StrictModel):
+    finding_id: int
+    state: TriageStateResponse
+    annotations: List[TriageAnnotationResponse]
+
+
+class ChainVerdictResponse(StrictModel):
+    ok: bool
+    checked: int
+    break_seq: Optional[int] = None
+    reason: Optional[str] = None
+
+
+class IntegrityResponse(StrictModel):
+    findings: ChainVerdictResponse
+    policy: ChainVerdictResponse
+    triage: ChainVerdictResponse
+    # A single overall verdict for the dashboard's banner: false if any chain is
+    # broken. The per-chain detail carries the break location and reason.
+    ok: bool
+
+
+class OperationalEfficacyCounts(StrictModel):
+    true_positive: int
+    false_positive: int
+    benign: int
+
+
+class OperationalEfficacyResponse(StrictModel):
+    scope: str
+    measures: str
+    total_findings: int
+    reviewed: int
+    unreviewed: int
+    acknowledged: int
+    suppressed: int
+    counts: OperationalEfficacyCounts
+    # Precision and the reviewed false-positive rate are conditioned on reviewed
+    # fired findings; None until something is reviewed (an honest "not yet
+    # measurable", not a zero). Population FPR and recall are not measurable from
+    # dispositions -- they are always None here and reported by the seeded
+    # evaluation and the ML acceptance gate instead. See detection.operational_efficacy.
+    precision: Optional[float] = None
+    reviewed_false_positive_rate: Optional[float] = None
+    population_false_positive_rate: Optional[float] = None
+    recall: Optional[float] = None
+    note: str
 
 
 def _read_policies() -> List[Dict[str, Any]]:
@@ -493,14 +627,73 @@ def create_app(
         return event_store.read_event_records(limit=limit, event_type=event_type)
 
     @app.get("/api/detections", response_model=List[FindingResponse])
-    def detections() -> List[FindingResponse]:
-        return event_store.read_detection_findings()
+    def detections(
+        response: Response,
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        # sort/order/disposition are Literals so an unknown value is a 422 at the
+        # boundary and documents the allowlist; the store re-checks sort/order as
+        # a backstop. The sort allowlist mirrors _FINDING_SORT_EXPRESSIONS.
+        sort: Literal[
+            "id", "window_start", "window_end", "risk_score", "severity", "entity_type"
+        ] = "window_start",
+        order: Literal["asc", "desc"] = "desc",
+        severity: Optional[str] = Query(default=None, min_length=1, max_length=32),
+        entity_type: Optional[str] = Query(default=None, min_length=1, max_length=64),
+        disposition: Optional[
+            Literal["true-positive", "false-positive", "benign", "none"]
+        ] = None,
+        acknowledged: Optional[bool] = None,
+        suppressed: Optional[bool] = None,
+        window_start: Optional[float] = Query(default=None),
+        window_end: Optional[float] = Query(default=None),
+    ) -> List[FindingResponse]:
+        """
+        A filtered, sorted, paginated page of findings, enriched with effective
+        triage state.
+
+        Filtering and sorting are server-side (`read_detection_findings_page`) so
+        the dashboard never fetches the whole table to filter in the browser. The
+        response body stays a JSON array of findings -- the historical shape -- and
+        the page metadata rides in headers (`X-Total-Count`, `X-Limit`,
+        `X-Offset`), which is non-breaking for existing consumers. `disposition`,
+        `acknowledged`, and `suppressed` filter on the *effective* triage state
+        computed from the append-only annotation layer, never a mutated finding.
+        """
+        findings, total = event_store.read_detection_findings_page(
+            limit=limit,
+            offset=offset,
+            sort=sort,
+            order=order,
+            severity=severity,
+            entity_type=entity_type,
+            disposition=disposition,
+            acknowledged=acknowledged,
+            suppressed=suppressed,
+            window_start=window_start,
+            window_end=window_end,
+        )
+        response.headers["X-Total-Count"] = str(total)
+        response.headers["X-Limit"] = str(limit)
+        response.headers["X-Offset"] = str(offset)
+        return findings
 
     @app.get("/api/detections/{finding_id}", response_model=FindingResponse)
     def detection(finding_id: int) -> FindingResponse:
         finding = event_store.read_detection_finding(finding_id)
         if finding is None:
             raise HTTPException(status_code=404, detail="detection finding not found")
+        # Enrich this one finding with its effective triage state so a single-row
+        # read agrees with the paged list. Folded read-only from the annotation
+        # layer; the immutable `suppressed` column above is left untouched, and
+        # `triage_suppressed` is config OR the latest analyst suppress.
+        state = event_store.read_latest_triage_state().get(finding_id, {})
+        finding["triage_disposition"] = state.get("disposition")
+        finding["triage_acknowledged"] = bool(state.get("acknowledged", False))
+        finding["triage_suppressed"] = bool(finding.get("suppressed")) or bool(
+            state.get("suppressed", False)
+        )
+        finding["triage_annotation_count"] = int(state.get("annotation_count", 0))
         return finding
 
     @app.get("/api/explanations/{finding_id}", response_model=ExplanationResponse)
@@ -535,6 +728,196 @@ def create_app(
     @app.get("/api/policy-decisions", response_model=List[PolicyDecisionResponse])
     def policy_decisions() -> List[PolicyDecisionResponse]:
         return event_store.read_policy_decisions()
+
+    # --------------------------------------------------------------------- #
+    # Triage write-back (Phase D). Append-only, authenticated by the same
+    # middleware that gates every /api/ path (default-deny: no token, no write),
+    # POST-only (no PUT/DELETE/PATCH -- nothing edits or destroys), and never a
+    # mutation of the finding row or the evidence chain. Each write records a new
+    # event; a correction is a later event. A missing finding is a 404 before any
+    # write, so the annotation layer never references a finding that does not
+    # exist. Suppress/unsuppress are alerting annotations only -- they never drop a
+    # finding from any read or from the export.
+    # --------------------------------------------------------------------- #
+
+    def _require_finding(finding_id: int) -> None:
+        if event_store.read_detection_finding(finding_id) is None:
+            raise HTTPException(status_code=404, detail="detection finding not found")
+
+    @app.post(
+        "/api/triage/{finding_id}/acknowledge", response_model=TriageAnnotationResponse
+    )
+    def triage_acknowledge(
+        finding_id: int, body: TriageAcknowledgeRequest
+    ) -> TriageAnnotationResponse:
+        _require_finding(finding_id)
+        return event_store.write_triage_annotation(
+            finding_id, "acknowledge", note=body.note, actor=body.actor
+        )
+
+    @app.post(
+        "/api/triage/{finding_id}/annotate", response_model=TriageAnnotationResponse
+    )
+    def triage_annotate(
+        finding_id: int, body: TriageAnnotateRequest
+    ) -> TriageAnnotationResponse:
+        _require_finding(finding_id)
+        return event_store.write_triage_annotation(
+            finding_id, "annotate", note=body.note, actor=body.actor
+        )
+
+    @app.post(
+        "/api/triage/{finding_id}/disposition", response_model=TriageAnnotationResponse
+    )
+    def triage_disposition(
+        finding_id: int, body: TriageDispositionRequest
+    ) -> TriageAnnotationResponse:
+        _require_finding(finding_id)
+        return event_store.write_triage_annotation(
+            finding_id,
+            "disposition",
+            disposition=body.disposition,
+            note=body.note,
+            actor=body.actor,
+        )
+
+    @app.post(
+        "/api/triage/{finding_id}/suppress", response_model=TriageAnnotationResponse
+    )
+    def triage_suppress(
+        finding_id: int, body: TriageSuppressRequest
+    ) -> TriageAnnotationResponse:
+        _require_finding(finding_id)
+        # The reason is the annotation's note: suppression must carry a
+        # justification into the record, never omit the finding from it.
+        return event_store.write_triage_annotation(
+            finding_id, "suppress", note=body.reason, actor=body.actor
+        )
+
+    @app.post(
+        "/api/triage/{finding_id}/unsuppress", response_model=TriageAnnotationResponse
+    )
+    def triage_unsuppress(
+        finding_id: int, body: TriageSuppressRequest
+    ) -> TriageAnnotationResponse:
+        _require_finding(finding_id)
+        return event_store.write_triage_annotation(
+            finding_id, "unsuppress", note=body.reason, actor=body.actor
+        )
+
+    def _triage_state_for(finding: Dict[str, Any], state: Dict[str, Any]) -> TriageStateResponse:
+        config_suppressed = bool(finding.get("suppressed"))
+        return TriageStateResponse(
+            finding_id=int(finding["id"]),
+            disposition=state.get("disposition"),
+            acknowledged=bool(state.get("acknowledged", False)),
+            config_suppressed=config_suppressed,
+            effective_suppressed=config_suppressed or bool(state.get("suppressed", False)),
+            annotation_count=int(state.get("annotation_count", 0)),
+        )
+
+    @app.get("/api/triage/export")
+    def triage_export() -> Dict[str, Any]:
+        """
+        A faithful, complete export of the evidence record and its triage trail.
+
+        Every finding is included -- suppressed ones too, marked as such under
+        `triage.effective_suppressed`. Suppression is a presentation/alerting
+        annotation; it never removes a finding from this document. The three chain
+        verdicts are embedded so a downstream consumer can confirm the export was
+        taken from an intact record. Annotations are grouped in one pass to avoid
+        a per-finding query.
+
+        Declared before `/api/triage/{finding_id}` so the static path wins the
+        route match; otherwise "export" would be parsed as a finding id.
+        """
+        findings = event_store.read_detection_findings()
+        states = event_store.read_latest_triage_state()
+        all_annotations = event_store.read_triage_annotations(limit=5000)
+        by_finding: Dict[int, List[Dict[str, Any]]] = {}
+        for annotation in all_annotations:
+            by_finding.setdefault(int(annotation["finding_id"]), []).append(annotation)
+        exported = []
+        for finding in findings:
+            fid = int(finding["id"])
+            state = states.get(fid, {})
+            config_suppressed = bool(finding.get("suppressed"))
+            exported.append(
+                {
+                    **finding,
+                    "triage": {
+                        "effective_disposition": state.get("disposition"),
+                        "acknowledged": bool(state.get("acknowledged", False)),
+                        "config_suppressed": config_suppressed,
+                        "effective_suppressed": config_suppressed
+                        or bool(state.get("suppressed", False)),
+                        "annotation_count": int(state.get("annotation_count", 0)),
+                        "annotations": by_finding.get(fid, []),
+                    },
+                }
+            )
+        return {
+            "schema": "linux-xai-security/triage-export/v1",
+            "generated_at": time.time(),
+            "chain_integrity": {
+                "findings": event_store.verify_findings_chain(),
+                "policy": event_store.verify_policy_chain(),
+                "triage": event_store.verify_triage_chain(),
+            },
+            "note": (
+                "Faithful complete evidence record. Suppressed findings are "
+                "included and marked (triage.effective_suppressed); suppression is "
+                "a presentation annotation only and never removes a finding from "
+                "the record or this export. 'actor' is a self-reported claim."
+            ),
+            "findings": exported,
+        }
+
+    @app.get("/api/triage/{finding_id}", response_model=TriageHistoryResponse)
+    def triage_history(finding_id: int) -> TriageHistoryResponse:
+        finding = event_store.read_detection_finding(finding_id)
+        if finding is None:
+            raise HTTPException(status_code=404, detail="detection finding not found")
+        annotations = event_store.read_triage_annotations(finding_id=finding_id)
+        state = event_store.read_latest_triage_state().get(finding_id, {})
+        return TriageHistoryResponse(
+            finding_id=finding_id,
+            state=_triage_state_for(finding, state),
+            annotations=annotations,
+        )
+
+    @app.get("/api/integrity", response_model=IntegrityResponse)
+    def integrity() -> IntegrityResponse:
+        """
+        The tamper-evidence verdict for all three append-only chains.
+
+        Recomputes each chain from on-disk columns and reports `{ok, checked,
+        break_seq, reason}` per chain plus an overall `ok`. A false anywhere means
+        a row was mutated, reordered, deleted, or inserted -- the dashboard raises
+        an unmissable banner on that. This mutates nothing.
+        """
+        findings = event_store.verify_findings_chain()
+        policy = event_store.verify_policy_chain()
+        triage = event_store.verify_triage_chain()
+        return IntegrityResponse(
+            findings=ChainVerdictResponse(**findings),
+            policy=ChainVerdictResponse(**policy),
+            triage=ChainVerdictResponse(**triage),
+            ok=bool(findings["ok"] and policy["ok"] and triage["ok"]),
+        )
+
+    @app.get("/api/efficacy/operational", response_model=OperationalEfficacyResponse)
+    def efficacy_operational() -> OperationalEfficacyResponse:
+        """
+        Operational efficacy from analyst dispositions -- measurement, not a gate.
+
+        Reports precision and a reviewed false-positive rate over findings an
+        analyst dispositioned. It is deliberately distinct from the ML acceptance
+        gate and the seeded evaluation, which measure a labelled corpus; population
+        false-positive rate and recall are not measurable here and are reported
+        there instead. Dispositions never move a gate threshold.
+        """
+        return OperationalEfficacyResponse(**operational_efficacy_from_store(event_store))
 
     return app
 

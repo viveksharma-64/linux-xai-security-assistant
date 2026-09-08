@@ -14,6 +14,7 @@ from pipeline.event_stream import CanonicalNormalizer, Event, EventStore
 from storage.evidence_chain import (
     FINDING_CHAIN_COLUMNS,
     POLICY_CHAIN_COLUMNS,
+    TRIAGE_CHAIN_COLUMNS,
     next_link,
     verify_chain,
 )
@@ -26,6 +27,32 @@ LOGGER = logging.getLogger(__name__)
 # amortised, small enough that a full-table scan of a multi-gigabyte database
 # holds only a bounded slice in memory.
 STREAM_PAGE_SIZE = 2000
+
+# The append-only triage vocabulary. Enforced here as a clean boundary check and
+# by CHECK constraints on triage_annotations as the storage backstop (migration
+# 9); kept in step with the API request models and evidence_chain's
+# TRIAGE_CHAIN_COLUMNS. Triage is a separate annotation layer -- these never
+# mutate a finding or its chain.
+_TRIAGE_ACTIONS = frozenset(
+    {"acknowledge", "annotate", "disposition", "suppress", "unsuppress"}
+)
+_TRIAGE_DISPOSITIONS = frozenset({"true-positive", "false-positive", "benign"})
+
+# Allowlisted sort expressions for read_detection_findings_page. The value is
+# interpolated into SQL, so it must only ever come from this fixed map, never
+# from caller input; every filter value by contrast is a bound parameter.
+# `severity` ranks by operational urgency, not lexically (CRITICAL > ... > LOW).
+_FINDING_SORT_EXPRESSIONS = {
+    "id": "id",
+    "window_start": "window_start",
+    "window_end": "window_end",
+    "risk_score": "risk_score",
+    "entity_type": "entity_type",
+    "severity": (
+        "CASE severity WHEN 'CRITICAL' THEN 4 WHEN 'HIGH' THEN 3 "
+        "WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 1 ELSE 0 END"
+    ),
+}
 
 
 class DatabasePermissionError(RuntimeError):
@@ -822,6 +849,34 @@ class SQLiteEventStore(EventStore):
                 finding["suppressed"] = bool(finding["suppressed"])
             return finding
 
+    def read_findings_by_correlation(self, correlation_id: str) -> List[Dict[str, Any]]:
+        """
+        Read the findings sharing one correlation id, in window order.
+
+        A read-only sibling lookup for the explainer's cross-finding narrative:
+        `_assign_correlation` groups a run of windows about one entity under a
+        single id, and this returns that group without materialising the whole
+        table. A falsy id returns nothing (unassigned findings are not a group).
+        Suppressed findings are included, exactly as the record holds them --
+        suppression is a disposition, never a drop.
+        """
+        if not correlation_id:
+            return []
+        with self._transaction() as conn:
+            rows = conn.execute(
+                "SELECT * FROM detection_findings WHERE correlation_id = ? "
+                "ORDER BY window_start ASC, id ASC",
+                (str(correlation_id),),
+            ).fetchall()
+            findings = []
+            for row in rows:
+                finding = dict(row)
+                finding["evidence"] = json.loads(finding.pop("evidence_json"))
+                if "suppressed" in finding:
+                    finding["suppressed"] = bool(finding["suppressed"])
+                findings.append(finding)
+            return findings
+
     def write_explanation(self, explanation: Dict[str, Any]) -> None:
         with self._transaction() as conn:
             conn.execute(
@@ -935,6 +990,260 @@ class SQLiteEventStore(EventStore):
                 ).fetchall()
             ]
         return verify_chain(POLICY_CHAIN_COLUMNS, rows)
+
+    def write_triage_annotation(
+        self,
+        finding_id: int,
+        action: str,
+        *,
+        disposition: Optional[str] = None,
+        note: Optional[str] = None,
+        actor: Optional[str] = None,
+        created_at: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Append one analyst triage event and fold it into the triage hash chain.
+
+        The evidence is never touched: this writes only to the append-only
+        `triage_annotations` layer and returns the stored row (including its
+        `chain_*` fields) so a caller can echo the recorded event back. A
+        correction is a later call, not an edit -- there is no update path.
+        `disposition` is kept only for `action='disposition'` and cleared
+        otherwise, so a stray disposition cannot ride on an acknowledge and skew
+        the computed effective state.
+
+        Same chain-lock discipline as `write_policy_decision`: the head read and
+        the successor write are atomic against concurrent writers, and the
+        partial UNIQUE index on `chain_seq` is the backstop against a fork.
+        """
+        if action not in _TRIAGE_ACTIONS:
+            raise ValueError(f"unknown triage action: {action!r}")
+        disposition = disposition if action == "disposition" else None
+        if action == "disposition" and disposition is None:
+            raise ValueError("disposition action requires a disposition value")
+        if disposition is not None and disposition not in _TRIAGE_DISPOSITIONS:
+            raise ValueError(f"unknown disposition: {disposition!r}")
+        created_at = float(created_at) if created_at is not None else time.time()
+
+        with self._chain_lock:
+            with self._transaction() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO triage_annotations (
+                        finding_id, action, disposition, note, actor, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (int(finding_id), action, disposition, note, actor, created_at),
+                )
+                annotation_id = int(cursor.lastrowid)
+                self._extend_chain(
+                    conn, "triage_annotations", TRIAGE_CHAIN_COLUMNS, annotation_id
+                )
+                return dict(
+                    conn.execute(
+                        "SELECT * FROM triage_annotations WHERE id = ?",
+                        (annotation_id,),
+                    ).fetchone()
+                )
+
+    def verify_triage_chain(self) -> Dict[str, Any]:
+        """
+        Recompute the triage_annotations hash chain from on-disk columns.
+
+        Same contract as `verify_findings_chain`, over the append-only analyst
+        annotation log. Makes the triage trail as tamper-evident as the evidence
+        it annotates: a deleted, reordered, or altered disposition is detected.
+        """
+        with self._transaction() as conn:
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM triage_annotations ORDER BY chain_seq ASC, id ASC"
+                ).fetchall()
+            ]
+        return verify_chain(TRIAGE_CHAIN_COLUMNS, rows)
+
+    def read_triage_annotations(
+        self, finding_id: Optional[int] = None, limit: int = 500
+    ) -> List[Dict[str, Any]]:
+        """
+        The append-only triage history, oldest first, optionally for one finding.
+
+        Ordered by `id` ASC, which is chain order, so corrections read as the
+        narrative they are. Returns raw annotation rows including their `chain_*`
+        fields; effective state is computed separately (`read_latest_triage_state`).
+        """
+        limit = max(1, min(int(limit), 5000))
+        with self._transaction() as conn:
+            if finding_id is None:
+                rows = conn.execute(
+                    "SELECT * FROM triage_annotations ORDER BY id ASC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM triage_annotations WHERE finding_id = ? "
+                    "ORDER BY id ASC LIMIT ?",
+                    (int(finding_id), limit),
+                ).fetchall()
+            return [dict(row) for row in rows]
+
+    def read_latest_triage_state(self) -> Dict[int, Dict[str, Any]]:
+        """
+        The effective triage state of every annotated finding.
+
+        Folds the append-only log into a per-finding summary computed on read:
+        the latest disposition, whether the finding was ever acknowledged,
+        whether it is currently analyst-suppressed (latest suppress not since
+        lifted), and how many annotations it carries. Corrections are later rows,
+        so "latest wins" is just the last row of each kind in `id` order.
+
+        This reads only the analyst annotation layer; it does *not* fold in
+        detection-time config suppression (which lives on the finding row), so a
+        caller combining the two -- export, the API's effective-state fields --
+        does so explicitly. `read_detection_findings_page` computes the same
+        aspects in SQL for server-side filtering; the definitions are kept
+        identical.
+        """
+        state: Dict[int, Dict[str, Any]] = {}
+        with self._transaction() as conn:
+            rows = conn.execute(
+                "SELECT finding_id, action, disposition FROM triage_annotations "
+                "ORDER BY id ASC"
+            ).fetchall()
+        for row in rows:
+            entry = state.setdefault(
+                int(row["finding_id"]),
+                {
+                    "disposition": None,
+                    "acknowledged": False,
+                    "suppressed": False,
+                    "annotation_count": 0,
+                },
+            )
+            entry["annotation_count"] += 1
+            action = row["action"]
+            if action == "acknowledge":
+                entry["acknowledged"] = True
+            elif action == "disposition":
+                entry["disposition"] = row["disposition"]
+            elif action == "suppress":
+                entry["suppressed"] = True
+            elif action == "unsuppress":
+                entry["suppressed"] = False
+            # 'annotate' contributes only to the count and the raw history.
+        return state
+
+    def read_detection_findings_page(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        sort: str = "window_start",
+        order: str = "desc",
+        severity: Optional[str] = None,
+        entity_type: Optional[str] = None,
+        disposition: Optional[str] = None,
+        acknowledged: Optional[bool] = None,
+        suppressed: Optional[bool] = None,
+        window_start: Optional[float] = None,
+        window_end: Optional[float] = None,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """
+        A filtered, sorted, paginated slice of detection_findings plus its total.
+
+        Server-side so the dashboard never fetches the whole table to filter in
+        the browser. Every finding is joined to its *effective* triage state --
+        the latest disposition, whether it was ever acknowledged, and whether it
+        is suppressed (detection-time config OR the latest analyst suppress not
+        since lifted) -- computed from the append-only annotation layer, never
+        from a mutated finding row. Filters may target those computed aspects as
+        well as the finding's own columns; `severity` sorts by rank, not lexically.
+
+        `sort`/`order` are looked up in fixed allowlists and interpolated; every
+        filter value is a bound parameter. Returns `(rows, total)`, where `total`
+        counts the filter matches before paging so the dashboard can page.
+        """
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        sort_expr = _FINDING_SORT_EXPRESSIONS.get(sort)
+        if sort_expr is None:
+            raise ValueError(f"unsortable field: {sort!r}")
+        direction = {"asc": "ASC", "desc": "DESC"}.get(str(order).lower())
+        if direction is None:
+            raise ValueError(f"invalid sort order: {order!r}")
+
+        clauses: List[str] = []
+        values: List[Any] = []
+        if severity is not None:
+            clauses.append("severity = ?")
+            values.append(severity)
+        if entity_type is not None:
+            clauses.append("entity_type = ?")
+            values.append(entity_type)
+        if disposition is not None:
+            if disposition == "none":
+                clauses.append("triage_disposition IS NULL")
+            else:
+                clauses.append("triage_disposition = ?")
+                values.append(disposition)
+        if acknowledged is not None:
+            clauses.append("triage_acknowledged = ?")
+            values.append(1 if acknowledged else 0)
+        if suppressed is not None:
+            clauses.append("triage_suppressed = ?")
+            values.append(1 if suppressed else 0)
+        if window_start is not None:
+            clauses.append("window_start >= ?")
+            values.append(float(window_start))
+        if window_end is not None:
+            clauses.append("window_start <= ?")
+            values.append(float(window_end))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        # The effective triage state is computed inside the CTE so the outer
+        # query can filter and sort on it by name (a WHERE cannot see a SELECT
+        # alias from its own level). Each aspect is an index seek on
+        # idx_triage_annotations_finding. Kept identical to
+        # read_latest_triage_state: latest disposition wins, any acknowledge
+        # sticks, latest suppress/unsuppress wins, config suppression OR-ed in.
+        enriched = (
+            "WITH enriched AS ("
+            "  SELECT f.*, "
+            "    (SELECT d.disposition FROM triage_annotations d "
+            "       WHERE d.finding_id = f.id AND d.action = 'disposition' "
+            "       ORDER BY d.id DESC LIMIT 1) AS triage_disposition, "
+            "    CASE WHEN EXISTS (SELECT 1 FROM triage_annotations a "
+            "       WHERE a.finding_id = f.id AND a.action = 'acknowledge') "
+            "       THEN 1 ELSE 0 END AS triage_acknowledged, "
+            "    CASE WHEN f.suppressed = 1 OR (SELECT s.action FROM triage_annotations s "
+            "       WHERE s.finding_id = f.id AND s.action IN ('suppress', 'unsuppress') "
+            "       ORDER BY s.id DESC LIMIT 1) = 'suppress' "
+            "       THEN 1 ELSE 0 END AS triage_suppressed, "
+            "    (SELECT COUNT(*) FROM triage_annotations c WHERE c.finding_id = f.id) "
+            "       AS triage_annotation_count "
+            "  FROM detection_findings f"
+            ") "
+        )
+        with self._transaction() as conn:
+            total = conn.execute(
+                f"{enriched} SELECT COUNT(*) FROM enriched {where}",
+                values,
+            ).fetchone()[0]
+            rows = conn.execute(
+                f"{enriched} SELECT * FROM enriched {where} "
+                f"ORDER BY {sort_expr} {direction}, id ASC LIMIT ? OFFSET ?",
+                (*values, limit, offset),
+            ).fetchall()
+        findings = []
+        for row in rows:
+            finding = dict(row)
+            finding["evidence"] = json.loads(finding.pop("evidence_json"))
+            finding["suppressed"] = bool(finding["suppressed"])
+            finding["triage_acknowledged"] = bool(finding["triage_acknowledged"])
+            finding["triage_suppressed"] = bool(finding["triage_suppressed"])
+            findings.append(finding)
+        return findings, int(total)
 
     def write_assistant_response(self, response: Dict[str, Any], created_at: Optional[float] = None) -> None:
         import time

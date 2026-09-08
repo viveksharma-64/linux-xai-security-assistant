@@ -91,6 +91,23 @@ POLICY_CHAIN_COLUMNS: Sequence[str] = (
     "advisory_rejection",
 )
 
+# Persisted columns of triage_annotations covered by the chain, same rules. The
+# analyst annotation layer is append-only and separate from the evidence itself:
+# a finding is never edited to record triage, so the finding chain above is left
+# untouched. Recording who/what/when in its own chain makes the triage trail as
+# tamper-evident as the evidence it annotates -- a deleted or altered disposition
+# is as detectable as a deleted finding. `actor` is a self-reported claim (the
+# token proves the writer is authorized, not who they are); it is chained anyway
+# so the claim, once written, cannot be silently rewritten.
+TRIAGE_CHAIN_COLUMNS: Sequence[str] = (
+    "finding_id",
+    "action",
+    "disposition",
+    "note",
+    "actor",
+    "created_at",
+)
+
 
 def serialize_core(columns: Sequence[str], row: Mapping[str, Any]) -> str:
     """
