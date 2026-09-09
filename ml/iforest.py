@@ -211,6 +211,84 @@ class NativeIsolationForest:
         )
         return -scores - self.offset
 
+    def path_length_attribution(self, matrix: np.ndarray) -> list[dict[str, Any]]:
+        """
+        Decompose each row's isolation-path length by the feature tested at each split.
+
+        `decision_function` sums, over trees, `path_lengths[leaf] - 1`, where
+        `path_lengths[leaf] = node_depth(leaf) + c(n_node_samples[leaf])`. So each
+        tree contributes `(node_depth(leaf) - 1) + c(...)`: an integer count of the
+        internal splits on the row's root->leaf path -- each testing exactly one
+        feature -- plus the leaf's average-path-length correction. Regrouping the
+        integer terms by feature is therefore an *exact* additive decomposition of
+        the scored `depths` into per-feature split counts plus a leaf-correction
+        residual, and `total_splits + leaf_correction` reproduces the same `depths`
+        (hence the same score) `decision_function` computed for the row.
+
+        The routing block below is `decision_function`'s verbatim: the same shape
+        check, the same `transform`, and -- load-bearing -- the same float32 cast
+        before comparison. The attributed path is thus bitwise the scored path, so
+        a value within float32 resolution of a threshold is attributed down the
+        branch it was actually scored on, never a divergent float64 re-route.
+
+        Presentation-free by design: returns raw counts and the reconciliation
+        numbers, one dict per row, leaving naming/ranking/capping to
+        `ml/attribution.py`.
+        """
+        rows = np.asarray(matrix, dtype=np.float64)
+        if rows.ndim != 2 or rows.shape[1] != self.n_features:
+            raise NativeIsolationForestError(
+                f"expected rows of {self.n_features} features, got shape {rows.shape}"
+            )
+        scaled = self.transform(rows)
+        # Identical to decision_function (:200): routing sees the float32-cast values.
+        routed = scaled.astype(np.float32).astype(np.float64)
+        results: list[dict[str, Any]] = []
+        for row_index in range(routed.shape[0]):
+            split_counts: dict[int, int] = {}
+            total_splits = 0
+            depths = 0.0
+            for tree, path_lengths in zip(self.trees, self._path_lengths):
+                children_left = tree["children_left"]
+                children_right = tree["children_right"]
+                feature = tree["feature"]
+                threshold = tree["threshold"]
+                tree_features = tree["features"]
+                # Column-permute exactly as decision_function does with
+                # `routed[:, tree["features"]]`, so `feature[node]` indexes the
+                # same value `_apply_tree` would compare.
+                permuted = routed[row_index, tree_features]
+                node = 0
+                while children_left[node] != -1:
+                    local = int(feature[node])
+                    # The global feature index, mapped back through the per-tree
+                    # permutation, so counts are comparable across trees and name
+                    # to the shared schema.
+                    global_feature = int(tree_features[local])
+                    split_counts[global_feature] = split_counts.get(global_feature, 0) + 1
+                    total_splits += 1
+                    # `<=` is _apply_tree's convention (:123); flipping it would
+                    # reroute a sample that lands exactly on a threshold.
+                    if permuted[local] <= threshold[node]:
+                        node = int(children_left[node])
+                    else:
+                        node = int(children_right[node])
+                # Exactly decision_function's per-tree term (:204); accumulated in
+                # the same tree order and the same float64 arithmetic, so `depths`
+                # is bitwise the value it scored.
+                depths += float(path_lengths[node]) - 1.0
+            results.append(
+                {
+                    "split_counts": split_counts,
+                    "total_splits": total_splits,
+                    # The residual, by definition: depths minus the integer split
+                    # total. Equals the summed leaf corrections up to float order.
+                    "leaf_correction": depths - float(total_splits),
+                    "reconstructed_depths": depths,
+                }
+            )
+        return results
+
 
 def export_from_sklearn(model: Any, scaler: Any) -> dict[str, Any]:
     """

@@ -665,6 +665,9 @@ without explicit provenance and operator approval.
 - [docs/ML_LIFECYCLE.md](docs/ML_LIFECYCLE.md) — the code-free model artifact
   format, the drift check and its refusals, the append-only lifecycle log, and the
   trust boundaries around them.
+- [docs/ML_ATTRIBUTION.md](docs/ML_ATTRIBUTION.md) — the opt-in, advisory
+  per-feature decomposition of the Isolation Forest's isolation-path length,
+  exact and reconciling but model-faithful rather than causal.
 - `docs/PHASE*_RESULTS.md` — historical phase evidence. Their older telemetry
   limitations are clearly marked as superseded; AGENTS.md is authoritative.
 - `docs/phase1_sample_events.jsonl` — synthetic fixture only, never live

@@ -131,6 +131,44 @@ def test_detection_and_explanation_include_ml_as_additive_evidence(tmp_path):
     assert any(item["factor"] == "ml_anomaly_evidence" for item in explanation["contributing_factors"])
 
 
+def test_ml_attribution_opt_in_flows_to_finding_and_explanation(tmp_path):
+    # With attribution enabled the same payload the detector passes through verbatim
+    # now carries the model-faithful decomposition, and the explainer's existing
+    # FACT factor surfaces it -- no new signal, no detector change.
+    store, _, metadata = _trained(tmp_path)
+    scorer = MLScorer(store, metadata["id"], attribute=True)
+    risk = {"id": 7, "window_start": 100.0, "window_end": 110.0, "entity_type": "command", "entity_key": "python3", "anomaly_score": 0.7,
+            "contributing_features": {"execution_frequency": 1, "unique_commands": 1, "unique_uids": 1, "burst_activity": {"peak_execs_per_second": 1}}, "explanation": "deterministic behavior risk", "mode": "monitoring"}
+    events = _normal_windows()[0]
+    finding = DetectionEngine(store, ml_scorer=scorer).detect([risk], events)["findings"][0]
+    ml_evidence = finding["evidence"][-1]
+    assert ml_evidence["signal"] == "ml_anomaly"
+    attribution = ml_evidence["model"]["attribution"]
+    assert attribution["method"] == "path-length-split-attribution.v1" and attribution["reconciles"] is True
+    explanation = FindingExplainer(store).explain_finding(finding)
+    factor = next(item for item in explanation["contributing_factors"] if item["factor"] == "ml_anomaly_evidence")
+    assert factor["label"] == "FACT"
+    assert factor["evidence"]["attribution"]["method"] == "path-length-split-attribution.v1"
+    assert "isolation-path length" in factor["statement"]
+
+
+def test_default_scorer_omits_attribution_from_payload_and_factor(tmp_path):
+    # Regression guard on the default path: a scorer built without attribute=True
+    # adds no attribution key to the score payload, so the finding and the
+    # explanation factor are byte-for-byte what they were before this track.
+    store, _, metadata = _trained(tmp_path)
+    scorer = MLScorer(store, metadata["id"])
+    assert "attribution" not in scorer.score(_normal_windows()[0])
+    risk = {"id": 7, "window_start": 100.0, "window_end": 110.0, "entity_type": "command", "entity_key": "python3", "anomaly_score": 0.7,
+            "contributing_features": {"execution_frequency": 1, "unique_commands": 1, "unique_uids": 1, "burst_activity": {"peak_execs_per_second": 1}}, "explanation": "deterministic behavior risk", "mode": "monitoring"}
+    finding = DetectionEngine(store, ml_scorer=scorer).detect([risk], _normal_windows()[0])["findings"][0]
+    assert "attribution" not in finding["evidence"][-1]["model"]
+    explanation = FindingExplainer(store).explain_finding(finding)
+    factor = next(item for item in explanation["contributing_factors"] if item["factor"] == "ml_anomaly_evidence")
+    assert "attribution" not in factor["evidence"]
+    assert factor["statement"].endswith("statistical, not causal explanations.")
+
+
 def test_detection_without_ml_preserves_existing_fusion_behavior(tmp_path):
     store = SQLiteEventStore(str(tmp_path / "fallback.db"))
     risk = {"id": 1, "window_start": 1.0, "window_end": 3.0, "entity_type": "command", "entity_key": "nc", "anomaly_score": 0.5,

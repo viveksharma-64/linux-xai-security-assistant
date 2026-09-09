@@ -435,10 +435,32 @@ class FindingExplainer:
         ]
         if "ml_anomaly" in evidence:
             model = evidence["ml_anomaly"].get("model", {})
+            statement = (
+                "Isolation Forest supplied an additional anomaly-evidence score; listed feature "
+                "deviations are statistical, not causal explanations."
+            )
+            factor_evidence = {
+                "model_version": model.get("model_version"),
+                "schema_hash": model.get("schema_hash"),
+                "threshold": model.get("threshold"),
+                "contributing_feature_deviations": model.get("contributing_feature_deviations", []),
+            }
+            # Surfaced only when the scorer was run with attribution enabled, so the
+            # default factor (text and keys) is unchanged. The extra sentence names
+            # the framing precisely: split participation on the scored isolation
+            # path, which is model-faithful but neither causal nor SHAP-additive.
+            attribution = model.get("attribution")
+            if attribution:
+                factor_evidence["attribution"] = attribution
+                statement += (
+                    " Attribution decomposes the model's isolation-path length by the feature tested "
+                    "at each split (split participation on the scored path), which reconciles to that "
+                    "path length but is not a causal or additive share of the outcome."
+                )
             contributing_factors.append({
                 "label": "FACT", "factor": "ml_anomaly_evidence",
-                "statement": "Isolation Forest supplied an additional anomaly-evidence score; listed feature deviations are statistical, not causal explanations.",
-                "evidence": {"model_version": model.get("model_version"), "schema_hash": model.get("schema_hash"), "threshold": model.get("threshold"), "contributing_feature_deviations": model.get("contributing_feature_deviations", [])},
+                "statement": statement,
+                "evidence": factor_evidence,
             })
         # Additive depth (Phase D), appended so existing factor positions are
         # unchanged: a rule-threshold counterfactual and a cross-finding narrative

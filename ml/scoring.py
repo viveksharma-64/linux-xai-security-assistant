@@ -5,6 +5,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from ml.artifact import MLArtifactError, load_artifact
+from ml.attribution import attribute_anomaly
 from ml.feature_schema import FEATURE_NAMES, SCHEMA_VERSION, extract_features, schema_hash
 from pipeline.event_stream import Event
 from storage.sqlite_store import SQLiteEventStore
@@ -15,7 +16,12 @@ class MLScoringError(RuntimeError):
 
 
 class MLScorer:
-    def __init__(self, store: SQLiteEventStore, model_id: str):
+    def __init__(self, store: SQLiteEventStore, model_id: str, *, attribute: bool = False):
+        # Opt-in-within-opt-in: a scorer must be configured *and* attribution
+        # enabled. Default-off keeps the shipped payload byte-for-byte unchanged
+        # and attribution off the default hot path -- it is advisory metadata an
+        # operator turns on, never a scoring behaviour.
+        self.attribute = attribute
         self.metadata = store.read_ml_model(model_id)
         if self.metadata is None:
             raise MLScoringError("ML model metadata was not found")
@@ -65,7 +71,7 @@ class MLScorer:
         scaled = self.model.transform(vector)[0]
         diagnostics = self._feature_diagnostics(features, scaled)
         deviations = sorted(diagnostics, key=lambda item: item["absolute_zscore"], reverse=True)[:5]
-        return {
+        result = {
             "available": True, "model_id": self.metadata["id"], "model_version": self.metadata["version"],
             "schema_version": SCHEMA_VERSION, "schema_hash": schema_hash(), "raw_score": raw,
             "normalized_score": normalized, "threshold": float(self.artifact["threshold"]),
@@ -76,6 +82,12 @@ class MLScorer:
             "calibration": self.artifact["calibration"],
             "artifact_format": self.artifact["artifact_format"],
         }
+        if self.attribute:
+            # Model-faithful decomposition of the same forest path this score came
+            # from, reusing the already-built feature vector. Additive to the
+            # payload only when enabled; the default dict above is unchanged.
+            result["attribution"] = attribute_anomaly(self.model, vector[0], FEATURE_NAMES)
+        return result
 
 
 def unavailable_evidence(reason: str = "no compatible ML model is configured") -> dict[str, Any]:
