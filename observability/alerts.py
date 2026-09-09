@@ -130,8 +130,8 @@ def evaluate(snapshot: MetricsSnapshot, config: Optional[Settings] = None) -> Li
                 name="kernel_events_lost",
                 severity=SEVERITY_CRITICAL,
                 summary=(
-                    f"{snapshot.kernel_lost_event_count} samples were discarded by the kernel perf "
-                    "ring before userspace read them"
+                    f"{snapshot.kernel_lost_event_count} samples were discarded by the kernel "
+                    "ring buffer before userspace read them"
                 ),
                 value=float(snapshot.kernel_lost_event_count),
                 threshold=0.0,

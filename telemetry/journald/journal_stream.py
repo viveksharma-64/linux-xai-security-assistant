@@ -177,7 +177,13 @@ class CursorStore:
         if not is_valid_cursor(cursor):
             return False
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # The cursor records exactly where this host is in its journal, so the
+            # state directory and the cursor file are kept owner-only. mode=0o700
+            # applies only when mkdir actually creates the directory (exist_ok
+            # leaves an existing one, and its permissions, untouched); fchmod sets
+            # the file mode absolutely (umask cannot widen it) on the fd that
+            # os.replace then renames into place, carrying 0600 with the inode.
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             handle = tempfile.NamedTemporaryFile(
                 mode="w",
                 encoding="utf-8",
@@ -188,6 +194,7 @@ class CursorStore:
             )
             try:
                 with handle:
+                    os.fchmod(handle.fileno(), 0o600)
                     handle.write(cursor)
                     handle.flush()
                     os.fsync(handle.fileno())

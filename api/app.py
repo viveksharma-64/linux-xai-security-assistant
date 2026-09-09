@@ -92,8 +92,9 @@ class StatusResponse(StrictModel):
     first_drop_timestamp: Optional[float] = None
     last_drop_timestamp: Optional[float] = None
     # Kernel-side loss, reported by the collector rather than observed by the
-    # supervisor. Separate from dropped_event_count because a perf ring overrun
-    # and a full ingestion queue are different failures with different fixes.
+    # supervisor. Separate from dropped_event_count because a kernel ring-buffer
+    # overrun (perf or BPF ring) and a full ingestion queue are different
+    # failures with different fixes.
     kernel_lost_event_count: Optional[int] = None
     first_kernel_loss_timestamp: Optional[float] = None
     last_kernel_loss_timestamp: Optional[float] = None

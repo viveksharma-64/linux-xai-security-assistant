@@ -15,9 +15,28 @@ except ImportError:
     from perf_loss import PerfBufferLossReporter
 
 try:
-    from telemetry.bcc.bpf_runtime import load_bpf, require_bpf
+    from telemetry.bcc.ringbuf_loss import RingBufferLossReporter
 except ImportError:
-    from bpf_runtime import load_bpf, require_bpf
+    from ringbuf_loss import RingBufferLossReporter
+
+try:
+    from telemetry.bcc.bpf_runtime import (
+        EVENT_BUFFER_RINGBUF,
+        RINGBUF_POLL_TIMEOUT_MS,
+        load_bpf,
+        request_keyboard_interrupt_on_sigterm,
+        require_bpf,
+        select_event_buffer,
+    )
+except ImportError:
+    from bpf_runtime import (
+        EVENT_BUFFER_RINGBUF,
+        RINGBUF_POLL_TIMEOUT_MS,
+        load_bpf,
+        request_keyboard_interrupt_on_sigterm,
+        require_bpf,
+        select_event_buffer,
+    )
 
 # None when bcc is unavailable; checked in main() rather than here so importing
 # this module for normalize_pipe_event() does not kill the interpreter. See
@@ -45,7 +64,14 @@ struct pipe_event_t {
 };
 
 BPF_HASH(pipe_args, u64, struct pipe_args_t);
+#ifdef USE_RINGBUF
+BPF_RINGBUF_OUTPUT(pipe_events, 8);
+// One-element counter for reservations the kernel refused when the ring was
+// full. The perf build never references it, so it is not compiled in that mode.
+BPF_ARRAY(pipe_events_dropped, u64, 1);
+#else
 BPF_PERF_OUTPUT(pipe_events);
+#endif
 
 int trace_pipe_entry(struct pt_regs *ctx) {
     u64 id = bpf_get_current_pid_tgid();
@@ -77,7 +103,22 @@ int trace_pipe_return(struct pt_regs *ctx) {
         event.read_fd_status = bpf_probe_read_user(&event.read_fd, sizeof(event.read_fd), (void *)state->fildes);
         event.write_fd_status = bpf_probe_read_user(&event.write_fd, sizeof(event.write_fd), (void *)(state->fildes + sizeof(event.read_fd)));
     }
+#ifdef USE_RINGBUF
+    struct pipe_event_t *out = pipe_events.ringbuf_reserve(sizeof(*out));
+    if (!out) {
+        u32 slot = 0;
+        u64 *dropped = pipe_events_dropped.lookup(&slot);
+        if (dropped) { __sync_fetch_and_add(dropped, 1); }
+        // Still drop the per-call state: a refused reservation must not leak a
+        // pipe_args entry that trace_pipe_return would otherwise never reap.
+        pipe_args.delete(&id);
+        return 0;
+    }
+    *out = event;
+    pipe_events.ringbuf_submit(out, 0);
+#else
     pipe_events.perf_submit(ctx, &event, sizeof(event));
+#endif
     pipe_args.delete(&id);
     return 0;
 }
@@ -159,20 +200,51 @@ loss_reporter = PerfBufferLossReporter(
 def main() -> int:
     global b
     require_bpf(BPF)
+    request_keyboard_interrupt_on_sigterm()
+    try:
+        mechanism = select_event_buffer(BPF)
+    except ValueError as error:
+        print(json.dumps({
+            "event_type": "telemetry_error",
+            "message": f"{error}",
+            "timestamp": time.time(),
+        }), file=sys.stderr)
+        return 1
+    # Durable and on stdout so it is ingested: this is the one signal that names
+    # which transport -- and therefore which loss-accounting path -- is in force.
+    # The loss record itself is frozen and does not carry the mechanism.
+    print(json.dumps({
+        "event_type": "telemetry_warning",
+        "message": f"event buffer transport selected: {mechanism}",
+        "buffer_transport": mechanism,
+        "reason": "startup_transport_selection",
+        "timestamp": time.time(),
+        "source": "telemetry_bcc_pipe_syscalls",
+        "version": "1.0",
+    }), flush=True)
     print(json.dumps({
         "event_type": "telemetry_startup",
         "message": "pipe/pipe2 syscall kprobe attached.",
         "timestamp": time.time(),
     }), file=sys.stderr)
+    ring_loss = RingBufferLossReporter(loss_reporter, map_name="pipe_events_dropped")
     try:
-        b = BPF(text=BPF_PROGRAM)
+        if mechanism == EVENT_BUFFER_RINGBUF:
+            b = BPF(text=BPF_PROGRAM, cflags=["-DUSE_RINGBUF"])
+        else:
+            b = BPF(text=BPF_PROGRAM)
         for syscall in ("__x64_sys_pipe", "__x64_sys_pipe2"):
             b.attach_kprobe(event=syscall, fn_name="trace_pipe_entry")
             b.attach_kretprobe(event=syscall, fn_name="trace_pipe_return")
-        # lost_cb is what makes a kernel ring-buffer overrun visible. Without it
-        # the samples the kernel discards leave a hole in this stream that no
-        # counter anywhere records. See telemetry/bcc/perf_loss.py.
-        b["pipe_events"].open_perf_buffer(handle_pipe_event, lost_cb=loss_reporter)
+        if mechanism == EVENT_BUFFER_RINGBUF:
+            # open_ring_buffer has no lost_cb; discards are counted in the BPF
+            # program and read from pipe_events_dropped by ring_loss.poll below.
+            b["pipe_events"].open_ring_buffer(handle_pipe_event)
+        else:
+            # lost_cb is what makes a kernel ring-buffer overrun visible. Without it
+            # the samples the kernel discards leave a hole in this stream that no
+            # counter anywhere records. See telemetry/bcc/perf_loss.py.
+            b["pipe_events"].open_perf_buffer(handle_pipe_event, lost_cb=loss_reporter)
     except Exception as error:
         print(json.dumps({
             "event_type": "telemetry_warning",
@@ -182,10 +254,17 @@ def main() -> int:
         return 1
     try:
         while True:
-            b.perf_buffer_poll()
+            if mechanism == EVENT_BUFFER_RINGBUF:
+                b.ring_buffer_poll(timeout=RINGBUF_POLL_TIMEOUT_MS)
+                ring_loss.poll(b)
+            else:
+                b.perf_buffer_poll()
     except KeyboardInterrupt:
-        # Flushed before the shutdown notice so a loss burst inside the last
-        # reporting window is still reported rather than lost with the process.
+        # A final counter read captures anything dropped in the last window, then
+        # flush before the shutdown notice so that loss is reported rather than
+        # lost with the process. SIGTERM reaches here via the handler above.
+        if mechanism == EVENT_BUFFER_RINGBUF:
+            ring_loss.poll(b)
         loss_reporter.flush()
         print(json.dumps({
             "event_type": "telemetry_shutdown",

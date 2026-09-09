@@ -16,9 +16,28 @@ except ImportError:
     from perf_loss import PerfBufferLossReporter
 
 try:
-    from telemetry.bcc.bpf_runtime import load_bpf, require_bpf
+    from telemetry.bcc.ringbuf_loss import RingBufferLossReporter
 except ImportError:
-    from bpf_runtime import load_bpf, require_bpf
+    from ringbuf_loss import RingBufferLossReporter
+
+try:
+    from telemetry.bcc.bpf_runtime import (
+        EVENT_BUFFER_RINGBUF,
+        RINGBUF_POLL_TIMEOUT_MS,
+        load_bpf,
+        request_keyboard_interrupt_on_sigterm,
+        require_bpf,
+        select_event_buffer,
+    )
+except ImportError:
+    from bpf_runtime import (
+        EVENT_BUFFER_RINGBUF,
+        RINGBUF_POLL_TIMEOUT_MS,
+        load_bpf,
+        request_keyboard_interrupt_on_sigterm,
+        require_bpf,
+        select_event_buffer,
+    )
 
 # None when bcc is unavailable; checked in main() rather than here so importing
 # this module for its address/state formatting helpers does not kill the
@@ -46,7 +65,14 @@ struct state_event_t {
     u16 dport;
     u64 timestamp_ns;
 };
+#ifdef USE_RINGBUF
+BPF_RINGBUF_OUTPUT(state_events, 8);
+// One-element counter for reservations the kernel refused when the ring was
+// full. The perf build never references it, so it is not compiled in that mode.
+BPF_ARRAY(state_events_dropped, u64, 1);
+#else
 BPF_PERF_OUTPUT(state_events);
+#endif
 
 TRACEPOINT_PROBE(sock, inet_sock_set_state) {
     if (args->family != AF_INET || args->protocol != IPPROTO_TCP) {
@@ -73,7 +99,19 @@ TRACEPOINT_PROBE(sock, inet_sock_set_state) {
     // that turns a requested local port such as 18080 into 41030.
     event.dport = args->dport;
     event.timestamp_ns = bpf_ktime_get_ns();
+#ifdef USE_RINGBUF
+    struct state_event_t *out = state_events.ringbuf_reserve(sizeof(*out));
+    if (!out) {
+        u32 slot = 0;
+        u64 *dropped = state_events_dropped.lookup(&slot);
+        if (dropped) { __sync_fetch_and_add(dropped, 1); }
+        return 0;
+    }
+    *out = event;
+    state_events.ringbuf_submit(out, 0);
+#else
     state_events.perf_submit(args, &event, sizeof(event));
+#endif
     return 0;
 }
 """
@@ -145,17 +183,46 @@ loss_reporter = PerfBufferLossReporter(
 def main():
     global b
     require_bpf(BPF)
+    request_keyboard_interrupt_on_sigterm()
+    try:
+        mechanism = select_event_buffer(BPF)
+    except ValueError as error:
+        print(json.dumps({
+            "event_type": "telemetry_error",
+            "message": f"{error}",
+            "timestamp": time.time(),
+        }), file=sys.stderr)
+        return 1
+    # Durable and on stdout so it is ingested: this is the one signal that names
+    # which transport -- and therefore which loss-accounting path -- is in force.
+    # The loss record itself is frozen and does not carry the mechanism.
+    print(json.dumps({
+        "event_type": "telemetry_warning",
+        "message": f"event buffer transport selected: {mechanism}",
+        "buffer_transport": mechanism,
+        "reason": "startup_transport_selection",
+        "timestamp": time.time(),
+        "source": "telemetry_bcc_network_state",
+        "version": "1.0",
+    }), flush=True)
     print(json.dumps({
         "event_type": "telemetry_startup",
         "message": "TCP state tracepoint probe attached.",
         "timestamp": time.time(),
     }), file=sys.stderr)
+    ring_loss = RingBufferLossReporter(loss_reporter, map_name="state_events_dropped")
     try:
-        b = BPF(text=BPF_PROGRAM)
-        # lost_cb is what makes a kernel ring-buffer overrun visible. Without it
-        # the samples the kernel discards leave a hole in this stream that no
-        # counter anywhere records. See telemetry/bcc/perf_loss.py.
-        b["state_events"].open_perf_buffer(handle_state_event, lost_cb=loss_reporter)
+        if mechanism == EVENT_BUFFER_RINGBUF:
+            b = BPF(text=BPF_PROGRAM, cflags=["-DUSE_RINGBUF"])
+            # open_ring_buffer has no lost_cb; discards are counted in the BPF
+            # program and read from state_events_dropped by ring_loss.poll below.
+            b["state_events"].open_ring_buffer(handle_state_event)
+        else:
+            b = BPF(text=BPF_PROGRAM)
+            # lost_cb is what makes a kernel ring-buffer overrun visible. Without it
+            # the samples the kernel discards leave a hole in this stream that no
+            # counter anywhere records. See telemetry/bcc/perf_loss.py.
+            b["state_events"].open_perf_buffer(handle_state_event, lost_cb=loss_reporter)
     except Exception as error:
         print(json.dumps({
             "event_type": "telemetry_error",
@@ -166,10 +233,17 @@ def main():
 
     try:
         while True:
-            b.perf_buffer_poll()
+            if mechanism == EVENT_BUFFER_RINGBUF:
+                b.ring_buffer_poll(timeout=RINGBUF_POLL_TIMEOUT_MS)
+                ring_loss.poll(b)
+            else:
+                b.perf_buffer_poll()
     except KeyboardInterrupt:
-        # Flushed before the shutdown notice so a loss burst inside the last
-        # reporting window is still reported rather than lost with the process.
+        # A final counter read captures anything dropped in the last window, then
+        # flush before the shutdown notice so that loss is reported rather than
+        # lost with the process. SIGTERM reaches here via the handler above.
+        if mechanism == EVENT_BUFFER_RINGBUF:
+            ring_loss.poll(b)
         loss_reporter.flush()
         print(json.dumps({
             "event_type": "telemetry_shutdown",
