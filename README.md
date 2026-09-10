@@ -299,6 +299,18 @@ python3 scripts/ml_drift_check.py --db events.db --model-id iforest-... \
     --comparison-db corpus/normal.db --comparison-dataset verified-normal-...
 ```
 
+**Seeing the recorded state (Phase E, track 5).** `GET /api/models` and `GET
+/api/models/{id}` render what the lifecycle log already holds — a model's
+provenance, its transition history, the activation-gate verdict, and its latest
+drift summary — so an analyst can see *whether the model behind a score is fit for
+this host*, not just *why a finding scored*. The surface is strictly read-only and
+additive: it re-computes no gate (`activation_eligible` is surfaced verbatim from
+the recorded rows), writes no row, and adds no migration. It exposes
+`artifact_checksum` but withholds `artifact_path`, so the read surface never leaks
+host filesystem layout. On a default install the list is `[]` — the honest answer,
+since detection runs deterministically until a model passes the gate — and the
+console's "ML models" panel says exactly that.
+
 ## Quick start: run the project
 
 The application has two runtime pieces: a privileged collector/ingestion
@@ -431,8 +443,10 @@ GET /api/explanations/{id}
 GET /api/assistant/{id}
 GET /api/policies
 GET /api/policy-decisions
-GET /api/integrity                   # verify_chain verdicts: findings, policy, triage
+GET /api/integrity                   # verify_chain verdicts: findings, policy, triage, ml_lifecycle
 GET /api/efficacy/operational        # precision/counts from dispositions (not the ML gate)
+GET /api/models                      # model provenance + recorded lifecycle state (never artifact_path)
+GET /api/models/{id}                 # provenance, transition history, gate verdict, latest drift, chain
 GET /api/triage/{id}                 # append-only history + effective state
 GET /api/triage/export               # faithful record; suppressed findings included and marked
 ```

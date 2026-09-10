@@ -3,6 +3,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from api.app import create_app
+from ml.feature_schema import SCHEMA_VERSION, schema_hash
 from detection.detector import DetectionEngine
 from assistant.service import AssistantService
 from explainability.explainer import FindingExplainer
@@ -239,6 +240,119 @@ def test_integrity_reports_all_four_chains_intact(tmp_path):
     assert body["triage"]["ok"] is True and body["triage"]["checked"] == 0
     assert body["ml_lifecycle"]["ok"] is True and body["ml_lifecycle"]["checked"] == 0
     assert body["findings"]["break_seq"] is None
+
+
+def _seed_model(store, model_id="model-1", *, active=False):
+    # Provenance row (migration 10). The artifact is never opened -- the transparency
+    # surface reads recorded columns, not the file -- so a nonexistent path is fine and
+    # deliberately never surfaced by the API. Mirrors tests/test_ml_drift.py:_model.
+    store.write_ml_model({
+        "id": model_id,
+        "version": "1",
+        "algorithm": "IsolationForest",
+        "hyperparameters": {"n_estimators": 100, "random_state": 42},
+        "artifact_path": "/nonexistent/model.model.json",
+        "artifact_checksum": "a" * 64,
+        "schema_version": SCHEMA_VERSION,
+        "schema_hash": schema_hash(),
+        "training_window_ids": [1, 2, 3],
+        "runtime": {"python": "3.11"},
+        "evaluation": {},
+        "active": active,
+        "created_at": 2000.0,
+    })
+    return {
+        "id": model_id,
+        "artifact_checksum": "a" * 64,
+        "artifact_format": "iforest-native.v1",
+        "schema_hash": schema_hash(),
+        "schema_version": SCHEMA_VERSION,
+        "training_window_ids": [1, 2, 3],
+        "hyperparameters": {"n_estimators": 100, "random_state": 42},
+    }
+
+
+def test_models_endpoint_is_empty_on_a_default_install(tmp_path):
+    # No model has passed the gate, so detection runs deterministically and the
+    # transparency surface honestly reports an empty list -- not an error.
+    store, _ = _setup(tmp_path)
+    client = TestClient(create_app(store))
+    assert client.get("/api/models").json() == []
+    assert client.get("/api/models/does-not-exist").status_code == 404
+
+
+def test_models_endpoint_lists_and_details_an_eligible_model(tmp_path):
+    from ml.lifecycle import record_activation_gate, record_evaluated, record_trained
+
+    store, _ = _setup(tmp_path)
+    metadata = _seed_model(store)
+    record_trained(store, metadata)
+    record_evaluated(store, "model-1", {
+        "normal_window_count": 60,
+        "normal_false_positive_count": 0,
+        "normal_false_positive_rate": 0.0,
+        "labels_available": False,
+        "confusion_matrix": None,
+    })
+    # PASSING_COUNTS: 0 false positives over 60 holdout windows clears the gate.
+    record_activation_gate(store, "model-1", false_positive_count=0, normal_window_count=60)
+
+    client = TestClient(create_app(store))
+    listing = client.get("/api/models").json()
+    assert len(listing) == 1
+    summary = listing[0]
+    assert summary["id"] == "model-1"
+    assert summary["state"] == "eligible"
+    assert summary["activation_eligible"] is True
+    assert summary["training_window_count"] == 3
+    assert summary["latest_drift_status"] is None  # no drift assessment run
+    # The list row carries provenance but never the artifact path.
+    assert "artifact_path" not in summary
+
+    detail = client.get("/api/models/model-1").json()
+    assert detail["artifact_checksum"] == "a" * 64
+    assert detail["training_window_count"] == 3
+    assert detail["training_window_ids"] == [1, 2, 3]
+    assert detail["state"] == "eligible"
+    assert detail["activation_eligible"] is True
+    # Full transition history, tamper-evident: trained -> evaluated -> eligible.
+    assert [t["to_state"] for t in detail["transitions"]] == ["trained", "evaluated", "eligible"]
+    assert detail["chain"]["ok"] is True
+    assert detail["latest_drift"] is None
+    assert detail["drift_assessment_count"] == 0
+    # Hardening: the detail payload never leaks host filesystem layout.
+    assert "artifact_path" not in detail
+    # The recorded gate verdict rides in the eligible transition's evidence, verbatim.
+    eligible = detail["transitions"][-1]
+    assert eligible["evidence"]["acceptance"]["activation_eligible"] is True
+
+
+def test_models_endpoint_surfaces_an_ineligible_gate_verdict_faithfully(tmp_path):
+    from ml.lifecycle import record_activation_gate, record_evaluated, record_trained
+
+    store, _ = _setup(tmp_path)
+    metadata = _seed_model(store)
+    record_trained(store, metadata)
+    record_evaluated(store, "model-1", {
+        "normal_window_count": 60,
+        "normal_false_positive_count": 1,
+        "normal_false_positive_rate": 1 / 60,
+        "labels_available": False,
+        "confusion_matrix": None,
+    })
+    # FAILING_COUNTS: 1 false positive over 60 windows -- the Wilson upper bound (7.13%)
+    # exceeds the 5% ceiling, so the gate refuses. The refusal is recorded, not hidden.
+    record_activation_gate(store, "model-1", false_positive_count=1, normal_window_count=60)
+
+    client = TestClient(create_app(store))
+    summary = client.get("/api/models").json()[0]
+    assert summary["state"] == "ineligible"
+    assert summary["activation_eligible"] is False
+    detail = client.get("/api/models/model-1").json()
+    assert detail["state"] == "ineligible"
+    assert detail["activation_eligible"] is False
+    assert detail["transitions"][-1]["to_state"] == "ineligible"
+    assert detail["transitions"][-1]["evidence"]["acceptance"]["activation_eligible"] is False
 
 
 def test_operational_efficacy_endpoint_is_honest_before_review(tmp_path):

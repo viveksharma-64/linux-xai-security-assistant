@@ -677,6 +677,26 @@ class SQLiteEventStore(EventStore):
         record["active"] = bool(record["active"])
         return record
 
+    def read_ml_models(self) -> List[Dict[str, Any]]:
+        """
+        Enumerate models newest-first; read-only, and never a scoring input.
+
+        Returns provenance columns only, not the artifact path: the transparency
+        surface identifies a model by its checksum, and does not need -- and should
+        not leak -- where its artifact lives on the host filesystem. `active` is
+        decoded to a bool to match `read_ml_model`.
+        """
+        with self._transaction() as conn:
+            rows = conn.execute(
+                "SELECT id, version, algorithm, active, schema_version, schema_hash, "
+                "created_at, json_array_length(training_window_ids_json) AS training_window_count "
+                "FROM ml_models ORDER BY created_at DESC, id DESC"
+            ).fetchall()
+        records = [dict(row) for row in rows]
+        for record in records:
+            record["active"] = bool(record["active"])
+        return records
+
     def write_ml_lifecycle_transition(
         self,
         model_id: str,

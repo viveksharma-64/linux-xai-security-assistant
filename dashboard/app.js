@@ -153,6 +153,51 @@ function renderTelemetry(status) {
   }
 }
 
+// The ML models panel: a read-only window onto recorded model fitness. A model's
+// latest lifecycle state and drift status come from the append-only logs; nothing
+// here re-runs the gate or mutates anything. This is a *list render only* -- it never
+// touches the detail pane or selectedFindingId, so a background refresh cannot disturb
+// an open investigation.
+//
+// A model is shown as fit (green) only when it is both active and gate-eligible;
+// eligible-but-not-yet-active reads as amber, because eligibility is a measurement,
+// not an activation. Anything else -- ineligible, retired, or no history -- is amber too.
+function modelIsFit(model) {
+  return model.active === true && model.activation_eligible === true;
+}
+
+function modelStateLabel(model) {
+  const state = model.state || "no history";
+  if (model.latest_drift_status === "drift_detected") return `${state} · drift detected`;
+  return state;
+}
+
+function modelRow(model) {
+  const fit = modelIsFit(model);
+  return el("div", { class: "telemetry-row" },
+    el("span", {},
+      el("span", { text: model.id }),
+      el("span", { class: "muted", text: ` · ${model.algorithm} v${model.version}` }),
+    ),
+    el("span", {},
+      el("span", { class: `telemetry-status ${fit ? "verified" : "unverified"}`, text: modelStateLabel(model) }),
+      el("span", { class: "muted", text: model.active ? " · active" : " · inactive" }),
+    ),
+  );
+}
+
+function renderModels(models) {
+  const list = $("#models-list");
+  const badge = $("#models-badge");
+  if (!models.length) {
+    badge.textContent = "None recorded";
+    replaceChildren(list, el("div", { class: "empty-state", text: "No ML models are recorded — detection runs in deterministic mode." }));
+    return;
+  }
+  badge.textContent = `${models.length} recorded`;
+  replaceChildren(list, ...models.map(modelRow));
+}
+
 // Compact effective-triage label for the findings table.
 function triageLabel(finding) {
   const parts = [];
@@ -430,14 +475,16 @@ async function loadFindings(interactive) {
 
 async function load(interactive = true) {
   try {
-    const [status, telemetry, integrity] = await Promise.all([
+    const [status, telemetry, integrity, models] = await Promise.all([
       getJson("/api/status", interactive),
       getJson("/api/telemetry/status", interactive),
       getJson("/api/integrity", interactive),
+      getJson("/api/models", interactive),
     ]);
     renderStatus(status);
     renderTelemetry(telemetry);
     renderIntegrity(integrity);
+    renderModels(models);
     await loadFindings(interactive);
     markUpdated();
   } catch (error) {

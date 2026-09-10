@@ -254,6 +254,33 @@ python3 scripts/ml_drift_check.py \
 recording, the script re-verifies the lifecycle chain and exits non-zero if it
 does not verify.
 
+## Reading the recorded state: `/api/models`
+
+The console can now show an analyst *whether the model behind a score is fit for
+this host*, not just *why a finding scored*. Two GET routes render already-recorded
+state; they re-compute no gate, write no row, and touch no threshold, artifact,
+`active` flag, or fusion weight.
+
+```text
+GET /api/models       # newest-first list: id, algorithm/version, recorded state,
+                      #   activation_eligible, latest drift status
+GET /api/models/{id}  # provenance, full transition history, gate verdict, latest
+                      #   drift summary, and the lifecycle chain verdict
+```
+
+- **The gate verdict is surfaced verbatim.** `activation_eligible` and the gate's
+  `acceptance` evidence are read out of the recorded lifecycle rows — never
+  recomputed. The gate stays the only door; this surface is a window onto the
+  witness log, not a control on it.
+- **`artifact_checksum`, never `artifact_path`.** The checksum is the identifying
+  evidence the lifecycle log already commits to; the raw path is withheld so the
+  read surface does not leak host filesystem layout.
+- **Empty is the honest default.** On a default install `/api/models` returns `[]`,
+  because detection runs deterministically until a model passes the gate. The
+  dashboard's "ML models" panel says so rather than implying a model is missing.
+- Both routes are GET-only and behind the same default-deny token middleware as
+  every other `/api/` path.
+
 ## Trust boundaries
 
 | Boundary | Untrusted input | How it is contained |

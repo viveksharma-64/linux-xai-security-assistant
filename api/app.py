@@ -11,6 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from api.auth import TokenAuthenticator, extract_token, unprotected_paths
 from detection.operational_efficacy import operational_efficacy_from_store
+from ml.drift import drift_summary
+from ml.lifecycle import current_state, lifecycle_report
 from observability import alerts as alerting
 from observability import metrics as metrics_module
 from observability.config import Settings
@@ -390,6 +392,88 @@ class IntegrityResponse(StrictModel):
     # A single overall verdict for the dashboard's banner: false if any chain is
     # broken. The per-chain detail carries the break location and reason.
     ok: bool
+
+
+# --- ML model transparency surface (read-only) --------------------------------
+# A window onto the recorded ML-fitness state -- provenance, lifecycle history, the
+# activation-gate verdict, and the latest drift summary -- not a control on it. The
+# gate stays the only door: `activation_eligible` and the gate `acceptance` block are
+# surfaced verbatim from the recorded lifecycle rows, never recomputed here. Every
+# field is Optional-tolerant like FindingResponse, so a partial history (a model that
+# was trained but never evaluated, say) still serializes rather than 500-ing the read.
+class ModelLifecycleTransitionResponse(StrictModel):
+    model_id: str
+    from_state: Optional[str] = None
+    to_state: str
+    reason: str
+    # The recorded gate verdict lives under evidence['acceptance'] for eligible/active
+    # rows; passed through as-is so the numbers behind an eligibility claim travel with it.
+    evidence: Dict[str, Any] = Field(default_factory=dict)
+    activation_eligible: bool = False
+    actor: Optional[str] = None
+    created_at: float
+    # The lifecycle log is itself hash-chained (migration 10), so this history is as
+    # tamper-evident as the findings it can influence.
+    chain_seq: Optional[int] = None
+    chain_prev_hash: Optional[str] = None
+    chain_hash: Optional[str] = None
+
+
+class DriftSummaryResponse(StrictModel):
+    # The compact `ml/drift.py:drift_summary` shape -- the few fields an operator needs
+    # without the per-feature detail. Present only when a drift assessment was recorded.
+    status: str
+    model_id: str
+    comparison_dataset_id: str
+    drifted_feature_count: int
+    drifted_features: List[str]
+    out_of_range_rate: Optional[float] = None
+    reference_window_count: int
+    comparison_window_count: int
+    alpha: float
+    method: str
+    reasons: List[str]
+
+
+class ModelSummaryResponse(StrictModel):
+    id: str
+    version: str
+    algorithm: str
+    active: bool
+    schema_version: str
+    schema_hash: str
+    created_at: float
+    training_window_count: int
+    # Latest recorded lifecycle state and the eligibility that row carried; None/False
+    # on a model with no history yet. `latest_drift_status` is the newest assessment's
+    # status, or None if none has been run.
+    state: Optional[str] = None
+    activation_eligible: bool = False
+    latest_drift_status: Optional[str] = None
+
+
+class ModelDetailResponse(StrictModel):
+    # Provenance: identifying evidence (checksum, training-window provenance), never
+    # the artifact_path -- the read surface must not leak host filesystem layout.
+    id: str
+    version: str
+    algorithm: str
+    active: bool
+    schema_version: str
+    schema_hash: str
+    created_at: float
+    artifact_checksum: str
+    training_window_count: int
+    training_window_ids: List[int]
+    hyperparameters: Dict[str, Any]
+    # Lifecycle: the latest state, the full transition history, and the chain verdict
+    # that says whether to trust it -- all read from `ml/lifecycle.py:lifecycle_report`.
+    state: Optional[str] = None
+    activation_eligible: bool = False
+    transitions: List[ModelLifecycleTransitionResponse]
+    latest_drift: Optional[DriftSummaryResponse] = None
+    drift_assessment_count: int = 0
+    chain: ChainVerdictResponse
 
 
 class OperationalEfficacyCounts(StrictModel):
@@ -913,6 +997,91 @@ def create_app(
             triage=ChainVerdictResponse(**triage),
             ml_lifecycle=ChainVerdictResponse(**ml_lifecycle),
             ok=bool(findings["ok"] and policy["ok"] and triage["ok"] and ml_lifecycle["ok"]),
+        )
+
+    @app.get("/api/models", response_model=List[ModelSummaryResponse])
+    def models() -> List[ModelSummaryResponse]:
+        """
+        Enumerate recorded ML models with their latest lifecycle state and drift status.
+
+        Read-only: reads the `ml_models` table, then attaches the latest recorded
+        lifecycle state and the newest drift status from the append-only logs. It
+        recomputes no gate and writes nothing. On a default install this is `[]` --
+        the honest and expected answer, since detection runs deterministically until
+        a model passes the activation gate.
+        """
+        summaries: List[ModelSummaryResponse] = []
+        for record in event_store.read_ml_models():
+            latest = current_state(event_store, record["id"])
+            drift = event_store.read_ml_drift_assessments(record["id"], limit=1)
+            summaries.append(
+                ModelSummaryResponse(
+                    id=record["id"],
+                    version=record["version"],
+                    algorithm=record["algorithm"],
+                    active=record["active"],
+                    schema_version=record["schema_version"],
+                    schema_hash=record["schema_hash"],
+                    created_at=record["created_at"],
+                    training_window_count=record["training_window_count"],
+                    state=latest["to_state"] if latest else None,
+                    activation_eligible=bool(latest["activation_eligible"]) if latest else False,
+                    latest_drift_status=drift[0]["status"] if drift else None,
+                )
+            )
+        return summaries
+
+    @app.get("/api/models/{model_id}", response_model=ModelDetailResponse)
+    def model_detail(model_id: str) -> ModelDetailResponse:
+        """
+        One model's provenance, lifecycle history, gate verdict, and latest drift.
+
+        Backed by `ml/lifecycle.py:lifecycle_report` (history + chain verdict + the
+        recorded gate acceptance) and `ml/drift.py:drift_summary`. The activation gate
+        is not re-run: `activation_eligible` and each transition's `acceptance` block
+        are surfaced verbatim from the recorded rows. `artifact_path` is deliberately
+        not exposed -- the checksum identifies the model without leaking host layout.
+        """
+        provenance = event_store.read_ml_model(model_id)
+        if provenance is None:
+            raise HTTPException(status_code=404, detail="ML model not found")
+        report = lifecycle_report(event_store, model_id)
+        transitions = [
+            ModelLifecycleTransitionResponse(
+                model_id=row["model_id"],
+                from_state=row["from_state"],
+                to_state=row["to_state"],
+                reason=row["reason"],
+                evidence=row["evidence"],
+                activation_eligible=row["activation_eligible"],
+                actor=row["actor"],
+                created_at=row["created_at"],
+                chain_seq=row["chain_seq"],
+                chain_prev_hash=row["chain_prev_hash"],
+                chain_hash=row["chain_hash"],
+            )
+            for row in report["transitions"]
+        ]
+        drift_rows = report["drift_assessments"]
+        latest_drift = DriftSummaryResponse(**drift_summary(drift_rows[0])) if drift_rows else None
+        return ModelDetailResponse(
+            id=provenance["id"],
+            version=provenance["version"],
+            algorithm=provenance["algorithm"],
+            active=provenance["active"],
+            schema_version=provenance["schema_version"],
+            schema_hash=provenance["schema_hash"],
+            created_at=provenance["created_at"],
+            artifact_checksum=provenance["artifact_checksum"],
+            training_window_count=len(provenance["training_window_ids"]),
+            training_window_ids=list(provenance["training_window_ids"]),
+            hyperparameters=provenance["hyperparameters"],
+            state=report["state"],
+            activation_eligible=report["activation_eligible"],
+            transitions=transitions,
+            latest_drift=latest_drift,
+            drift_assessment_count=len(drift_rows),
+            chain=ChainVerdictResponse(**report["chain"]),
         )
 
     @app.get("/api/efficacy/operational", response_model=OperationalEfficacyResponse)
