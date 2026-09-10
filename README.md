@@ -49,7 +49,7 @@ throttle. [AGENTS.md](AGENTS.md) carries the full clause-by-clause traceability.
 | Operational readiness (Phase B) | Supervised multi-collector ingestion, authenticated API, self-bounding retention, metrics/alerts, and systemd deployment; the test suite gates CI |
 | Detection credibility (Phase C) | Published precision/recall on a seeded corpus, versioned MITRE-mapped rules with per-rule tests, and a tamper-evident append-only evidence hash-chain |
 | Analyst experience (Phase D) | Append-only, hash-chained triage (acknowledge/annotate/disposition/suppress) that never mutates the evidence record; authenticated default-deny writes; integrity alarm; faithful export; and operational efficacy from dispositions, decoupled from the ML gate |
-| ML lifecycle (Phase E, track 1) | Code-free `iforest-native.v1` model artifact (no pickle), a stdlib KS/Holm drift check that refuses rather than guesses, and an append-only hash-chained model lifecycle log — with the activation gate untouched |
+| Scale & advanced ML (Phase E) | Read-only, additive throughout: a code-free model artifact with drift and a hash-chained lifecycle log, a BPF ring-buffer event transport with byte-identical loss accounting, a scale-measurement harness, exact per-feature ML anomaly attribution, and a model-transparency API and dashboard panel — the activation gate untouched throughout |
 
 ### LIVE VERIFIED telemetry
 
@@ -252,10 +252,45 @@ wipes an open investigation, keyboard navigation of the findings table, and an
 ARIA live region that announces new findings and integrity alarms without
 stealing focus.
 
-## ML lifecycle: artifacts, drift, and the log (Phase E, track 1)
+## Scale and advanced ML (Phase E)
 
-A model needs a governed life, not just a file on disk. Track 1 adds three pieces
-and activates nothing — the gate is unchanged and the ML subsystem is still
+Phase E is strictly **read-only and additive**. Nothing in it activates a model,
+changes the activation gate, edits a released migration (`LATEST_VERSION` stays
+10), or adds any active-response path. It delivers five pieces of work, summarized
+below and then expanded in the rest of this section.
+
+- **ML lifecycle — artifacts, drift, and the log.** A code-free `iforest-native.v1`
+  model artifact (no pickle), a stdlib KS/Holm drift check that refuses rather than
+  guesses, and an append-only hash-chained lifecycle log. Detail below and in
+  [docs/ML_LIFECYCLE.md](docs/ML_LIFECYCLE.md).
+- **BPF ring-buffer transport and cursor hardening.** The kernel collectors gain a
+  second, higher-throughput event transport (the BPF ring buffer), selected
+  fail-closed via `SECURITY_BPF_EVENT_BUFFER` (`auto`/`ringbuf`/`perf`) and never
+  silently downgraded. The perf path is preserved intact; loss accounting emits a
+  byte-identical `telemetry_loss` record on both transports. The journald cursor
+  file and its state directory are tightened to owner-only (`0600`/`0700`).
+- **Scale measurement.** A measurement-only harness
+  (`scripts/benchmark_scale.py`, [docs/SCALE_RESULTS.md](docs/SCALE_RESULTS.md))
+  that establishes, with evidence, that SQLite is not the constraint at measured
+  volumes (250k events, 10k findings): write throughput holds and LIMIT-bounded
+  reads stay flat. The one steep curve — deep offset-paging — is recorded with its
+  in-engine fix held in reserve, gated on evidence that deep paging is a real
+  workload. Nothing in the engine was changed.
+- **ML anomaly attribution.** An exact, model-faithful per-feature decomposition of
+  the Isolation Forest isolation-path length (`path-length-split-attribution.v1`),
+  surfaced as a bounded **FACT** in the explainer's `ml_anomaly_evidence` factor.
+  Advisory and opt-in (`MLScorer(..., attribute=True)`), off the default hot path.
+  Detail in [docs/ML_ATTRIBUTION.md](docs/ML_ATTRIBUTION.md).
+- **Model transparency surface.** `GET /api/models` and `GET /api/models/{id}`, plus
+  a dashboard "ML models" panel, render already-recorded model provenance, lifecycle
+  history, the activation-gate verdict, and the latest drift summary — so an analyst
+  can see *whether the model behind a score is fit for this host*. Covered under
+  "Seeing the recorded state" below.
+
+### A model's governed life
+
+A model needs a governed life, not just a file on disk. Three pieces give it one,
+and none activates anything — the gate is unchanged and the ML subsystem is still
 inactive. Full detail in [docs/ML_LIFECYCLE.md](docs/ML_LIFECYCLE.md).
 
 - **A model artifact that cannot carry code.** `iforest-native.v1` is two files:
@@ -299,7 +334,7 @@ python3 scripts/ml_drift_check.py --db events.db --model-id iforest-... \
     --comparison-db corpus/normal.db --comparison-dataset verified-normal-...
 ```
 
-**Seeing the recorded state (Phase E, track 5).** `GET /api/models` and `GET
+**Seeing the recorded state.** `GET /api/models` and `GET
 /api/models/{id}` render what the lifecycle log already holds — a model's
 provenance, its transition history, the activation-gate verdict, and its latest
 drift summary — so an analyst can see *whether the model behind a score is fit for
@@ -581,12 +616,13 @@ To run a focused subset:
 pytest -q tests/test_journal_stream.py tests/test_ml_integration.py
 ```
 
-Measured on Python 3.14.6 with pytest 9.1.1:
+Measured on Python 3.14.6 with pytest 9.1.1 (scikit-learn 1.9.0 installed):
 
-- Full suite: **648 passed, 5 skipped** (~25s)
-- The 5 skips are all scikit-learn-gated: `tests/test_ml_integration.py` (4) and
-  the sklearn-parity test in `tests/test_ml_artifact.py` (1). That file reports
-  **56 passed** under an interpreter that has scikit-learn installed
+- Full suite: **717 passed, 1 skipped** (~36s)
+- The single skip is bcc-gated, not sklearn-gated: `tests/test_perf_loss.py`
+  reports `bcc is not installed` on a host without the BPF toolchain. With
+  scikit-learn present, the sklearn-parity test in `tests/test_ml_artifact.py` and
+  the `tests/test_ml_integration.py` cases run rather than skip
 - Streaming journald: 92 passed, including two integration tests that exercise
   the real `journalctl` cursor semantics on systemd 261
 - Phase B added coverage for the supervised service, quarantine, retention,
@@ -615,19 +651,40 @@ Measured on Python 3.14.6 with pytest 9.1.1:
   explanation factors, and migration 9 (`tests/test_triage.py`,
   `test_operational_efficacy.py`, `test_api_app.py`, `test_explainer.py`,
   `test_schema_migrations.py`, `test_evidence_chain.py`)
-- Phase E track 1 added coverage for the native artifact (checksum-before-parse in
-  both hops, refusal of a traversing array filename, `0600` on both files,
-  reproducible bytes, and a source-level ban on code-executing deserializers and
-  on `allow_pickle=True` anywhere in `ml/` — plus a hand-built toy artifact that
-  exercises the loader and the scoring math with **no** scikit-learn), the drift
-  check (KS statistics and Holm thresholds against independently verified
-  literals, every named `insufficient_data` refusal, and that a drift result
-  cannot mutate a model or threshold), the lifecycle log (chain tamper detection,
-  the recomputed drift binding, the store-level refusal of an ungated `active`
-  row, and the gate's constants pinned as literals), the fourth chain in
-  `/api/integrity`, and migration 10 (`tests/test_ml_artifact.py`,
-  `test_ml_drift.py`, `test_ml_lifecycle.py`, `test_api_app.py`,
-  `test_schema_migrations.py`)
+- Phase E added coverage across five bodies of work:
+  - The **native ML artifact**: checksum-before-parse in both hops, refusal of a
+    traversing array filename, `0600` on both files, reproducible bytes, and a
+    source-level ban on code-executing deserializers and on `allow_pickle=True`
+    anywhere in `ml/` — plus a hand-built toy artifact that exercises the loader
+    and the scoring math with **no** scikit-learn; the **drift check**: KS
+    statistics and Holm thresholds against independently verified literals, every
+    named `insufficient_data` refusal, and that a drift result cannot mutate a
+    model or threshold; the **lifecycle log**: chain tamper detection, the
+    recomputed drift binding, the store-level refusal of an ungated `active` row,
+    and the gate's constants pinned as literals; the fourth chain in
+    `/api/integrity`; and migration 10 (`tests/test_ml_artifact.py`,
+    `test_ml_drift.py`, `test_ml_lifecycle.py`, `test_api_app.py`,
+    `test_schema_migrations.py`)
+  - The **BPF ring-buffer transport and cursor hardening**: fail-closed transport
+    selection across `auto`/`ringbuf`/`perf` with no silent downgrade,
+    byte-identical `telemetry_loss` accounting on both transports, and owner-only
+    (`0600`/`0700`) journald cursor state (`tests/test_perf_loss.py` — the one
+    bcc-gated file — and the transport/cursor cases alongside it)
+  - The **scale-measurement harness**: deterministic synthetic-load generation, the
+    metrics it records, and that it is measurement only — it writes no tracked
+    artifact and touches no engine code (`tests/test_benchmark_scale.py`)
+  - The **exact per-feature anomaly attribution**: the decomposition sums to the
+    model's own isolation-path length, per-feature contributions match a direct
+    traversal, attribution stays opt-in and off the default hot path, and the
+    `ml_anomaly_evidence` factor is a bounded, labelled FACT
+    (`tests/test_ml_attribution.py`, `test_explainer.py`)
+  - The **model-transparency surface**: `/api/models` is `[]` on a fresh store and
+    `/api/models/{id}` is a 404; a seeded model lists with its recorded
+    `state`/`activation_eligible`; the detail route returns provenance
+    (`artifact_checksum`, `training_window_count`), the transition history, and
+    `chain.ok`; the gate verdict is surfaced verbatim (both eligible and
+    ineligible); and `artifact_path` is never present in any payload
+    (`tests/test_api_app.py`)
 
 Re-measure before restating those numbers. Tests are never weakened, skipped, or
 removed to make a run look clean.
