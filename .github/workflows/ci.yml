@@ -11,10 +11,21 @@
 # every push so the findings are visible and can be driven to zero, at which point
 # flipping them to required is a one-line change.
 #
+# The `ml` job is a second required gate that exists to make one guarantee the
+# `test` job cannot: that the scikit-learn-backed tests actually execute. Those
+# tests skip themselves when scikit-learn is absent (`ml.training.SKLEARN_AVAILABLE`
+# is False), and a skip is green -- so if scikit-learn ever failed to install, the
+# `test` job would stay green while 13 tests silently vanished. scikit-learn is a
+# declared runtime dependency, so `pip install -e '.[dev]'` already pulls it into
+# the `test` job too; the `ml` job asserts it imported and then refuses to pass if
+# any test in the scikit-learn-gated files skips. It touches only the CI config --
+# no model behaviour, activation gate, threshold, or safety invariant changes here.
+#
 # eBPF/BCC is never installed here: the Python binding must match the running
 # kernel, which a hosted runner does not provide. Every module that touches bcc
 # defers the import (telemetry/bcc/bpf_runtime.py) so the suite imports cleanly
-# without it.
+# without it. (That kernel-binding constraint is why bcc, unlike scikit-learn, is
+# not a declared dependency and its handful of tests stay skipped even here.)
 name: CI
 
 on:
@@ -61,6 +72,78 @@ jobs:
         with:
           name: coverage-py${{ matrix.python-version }}
           path: coverage.xml
+          if-no-files-found: ignore
+
+  ml:
+    name: ml (scikit-learn required)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # A single interpreter is enough: this job gates on "the scikit-learn
+          # path executed", not on cross-version behaviour, which the `test`
+          # matrix already covers. 3.12 matches the advisory lint/type jobs.
+          python-version: "3.12"
+          cache: pip
+      - name: Install (with scikit-learn)
+        # scikit-learn is a declared runtime dependency, so the base install
+        # pulls it in; no extra install line is needed. If the wheel ever stops
+        # resolving, this step fails here rather than silently downgrading the
+        # suite to skips.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+      - name: Assert scikit-learn is importable
+        # The gate the `test` job cannot give: prove the dependency is really
+        # present before asserting the tests ran. `SKLEARN_AVAILABLE` is the exact
+        # flag the tests branch on, so checking it here tests the same condition
+        # they do -- not merely that some sklearn is on the path.
+        run: |
+          python -c "import sklearn; print('scikit-learn', sklearn.__version__)"
+          python -c "from ml.training import SKLEARN_AVAILABLE; assert SKLEARN_AVAILABLE, 'ml.training could not import scikit-learn'; print('SKLEARN_AVAILABLE =', SKLEARN_AVAILABLE)"
+      - name: Run the scikit-learn-gated tests, forbidding skips
+        # Run the three scikit-learn-gated files by name -- fast and focused, and
+        # the full suite (with these no longer skipped) still runs in `test`. `-rs`
+        # prints any surviving skip reasons in the log. pytest has no native "fail
+        # on skip", so a skip is still exit 0 here; the JUnit report this writes is
+        # inspected by the next step, which is what actually enforces zero skips.
+        run: |
+          pytest tests/test_ml_artifact.py tests/test_ml_attribution.py tests/test_ml_integration.py \
+            -rs --junit-xml=ml-junit.xml
+      - name: Fail if any scikit-learn-gated test skipped
+        # A skip here means scikit-learn was not exercised despite being declared
+        # -- exactly the silent-green regression this job exists to catch. Parse
+        # the JUnit report and require zero skips (and zero errors/failures).
+        run: |
+          python - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse("ml-junit.xml").getroot()
+          suites = root.findall(".//testsuite")
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          total = sum(int(s.get("tests", 0)) for s in suites)
+          print(f"collected={total} skipped={skipped} failures={failures} errors={errors}")
+          if skipped:
+              names = [
+                  tc.get("classname", "") + "::" + tc.get("name", "")
+                  for s in suites for tc in s.findall("testcase")
+                  if tc.find("skipped") is not None
+              ]
+              print("SKIPPED (scikit-learn not exercised):", *names, sep="\n  ")
+              sys.exit(1)
+          if failures or errors:
+              sys.exit(1)
+          print("OK: every scikit-learn-gated test executed")
+          PY
+      - name: Upload ML JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ml-junit
+          path: ml-junit.xml
           if-no-files-found: ignore
 
   lint:
