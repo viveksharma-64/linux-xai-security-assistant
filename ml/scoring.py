@@ -41,19 +41,36 @@ class MLScorer:
         self.training_windows = store.read_ml_training_windows_by_ids(self.metadata["training_window_ids"])
         if len(self.training_windows) != len(self.metadata["training_window_ids"]):
             raise MLScoringError("ML training-window provenance is incomplete")
+        # Per-feature training min/max/mean depend only on the fixed training
+        # windows, never on the scored event, so they are identical on every
+        # score() call. Memoise them on first use: the first score() still runs
+        # the build -- preserving the original call-time semantics, including the
+        # ValueError an empty training set would raise -- and every later call
+        # reuses the result instead of re-folding all windows per feature.
+        self._training_stats: dict[str, tuple[float, float, float]] | None = None
+
+    def _training_feature_stats(self) -> dict[str, tuple[float, float, float]]:
+        stats = self._training_stats
+        if stats is None:
+            stats = {}
+            for name in FEATURE_NAMES:
+                values = [float(window["features"][name]) for window in self.training_windows]
+                stats[name] = (min(values), max(values), sum(values) / len(values))
+            self._training_stats = stats
+        return stats
 
     def _feature_diagnostics(self, features: dict[str, float], scaled: np.ndarray) -> list[dict[str, Any]]:
+        stats = self._training_feature_stats()
         diagnostics = []
         for index, name in enumerate(FEATURE_NAMES):
-            values = [float(window["features"][name]) for window in self.training_windows]
             value = float(features[name])
-            lower, upper = min(values), max(values)
+            lower, upper, mean = stats[name]
             diagnostics.append({
                 "feature": name,
                 "value": value,
                 "training_min": lower,
                 "training_max": upper,
-                "training_mean": sum(values) / len(values),
+                "training_mean": mean,
                 "absolute_zscore": round(float(abs(scaled[index])), 6),
                 "in_training_range": lower <= value <= upper,
             })
