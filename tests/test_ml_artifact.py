@@ -719,8 +719,16 @@ def test_native_scoring_is_bitwise_identical_to_sklearn(tmp_path):
         )
         # The published formula, re-derived in plain Python, agrees too -- so the
         # parity is with sklearn's documented definition and not with a shared
-        # implementation quirk.
-        assert _reference_decision(np.asarray(rows).tolist(), export) == expected.tolist()
+        # implementation quirk. The re-derivation runs in float64 with a different
+        # reduction order than numpy, so it agrees only up to floating-point
+        # rounding (~1e-16 on some numpy builds, e.g. CPython 3.11's); a tight
+        # absolute tolerance keeps this a real cross-check of the documented
+        # formula without asserting a bit-identical reduction order sklearn never
+        # promises. The exact bitwise claim is the native-vs-sklearn assertion
+        # above.
+        assert _reference_decision(np.asarray(rows).tolist(), export) == pytest.approx(
+            expected.tolist(), rel=0, abs=1e-12
+        )
 
     # Self-check: routing in full float64 must disagree somewhere on the boundary
     # rows, or they are not boundary rows and the parity above is vacuous.
