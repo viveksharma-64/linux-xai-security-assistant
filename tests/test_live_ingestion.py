@@ -571,3 +571,55 @@ def test_kernel_loss_report_is_intercepted_before_the_queue(tmp_path):
 
     assert health.dropped_event_count > 0, "test did not saturate the queue; it proves nothing"
     assert health.kernel_lost_event_count == 77
+
+
+def test_rejected_events_never_reach_the_analysis_queue(tmp_path):
+    """
+    A finding may only cite an event the database holds. `write_events` refuses a
+    record before the transaction -- it is never persisted -- so it must not reach
+    the analysis queue; an analysis pass that cited it would emit a finding
+    pointing at an event no query can resolve. The store here refuses one event by
+    pid to prove the rejected record is filtered out of the batch while its
+    committed neighbours go through.
+    """
+
+    class _RejectsOneStore:
+        def __init__(self, inner, reject_pid):
+            self._inner = inner
+            self._reject_pid = reject_pid
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def write_events(self, events):
+            events = list(events)
+            keep = [event for event in events if event.pid != self._reject_pid]
+            refused = [event for event in events if event.pid == self._reject_pid]
+            result = self._inner.write_events(keep)
+            for event in refused:
+                # Carry the exact event objects handed in, which is what the real
+                # store does and what _flush filters `pending` against by identity.
+                result.rejected.append((event, "simulated writer refusal"))
+            return result
+
+    inner = SQLiteEventStore(str(tmp_path / "reject.db"))
+    store = _RejectsOneStore(inner, reject_pid=999)
+
+    analyzed: list = []
+    source = [
+        _event(pid=1, comm="keep-a"),
+        _event(pid=999, comm="reject-me"),
+        _event(pid=2, comm="keep-b"),
+    ]
+
+    health = LiveIngestionService(source, store, analysis_pipeline=analyzed.extend).run()
+
+    assert health.status == "stopped"
+    analyzed_pids = {event.pid for event in analyzed}
+    # The refused event is neither persisted nor analysed; its committed
+    # neighbours are both.
+    assert 999 not in analyzed_pids
+    assert analyzed_pids == {1, 2}
+    assert inner.count_events() == 2
+    # The invariant, stated as an equality: everything analysed is in the database.
+    assert len(analyzed) == inner.count_events()
