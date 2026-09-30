@@ -110,6 +110,7 @@ packages = [
     "telemetry",
     "telemetry.auditd",
     "telemetry.bcc",
+    "telemetry.health",
     "telemetry.journald",
 ]
 
