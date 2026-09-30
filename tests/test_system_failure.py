@@ -503,3 +503,82 @@ def test_pipeline_ignores_non_telemetry_batch(store):
         for i in range(3)
     ])
     assert [r for r in store.read_detection_findings() if r["mode"] == "system_failure"] == []
+
+
+# ---------------------------------------------------------------------------
+# Concurrency
+# ---------------------------------------------------------------------------
+
+def test_concurrent_scoring_never_interleaves_on_one_instance(store):
+    # One DatabaseAnalysisPipeline -- and so one scorer -- is shared by every
+    # consumer thread (pipeline/service.py). Scoring a window is a
+    # read-modify-write over the hysteresis counters and the crash-loop ring, so
+    # two threads inside it at once could advance a counter twice for one window
+    # or lose an advance, and "N consecutive windows" would stop meaning
+    # anything. Assert the mutual exclusion directly rather than hoping a race
+    # reproduces: without the lock the sleep below guarantees an overlap.
+    import threading
+    import time
+
+    scorer = _scorer(store, failure_consecutive_windows=1)
+    unguarded = scorer._score_window
+    depth: list = []
+    overlaps: list = []
+
+    def traced(events, window_start, window_end, persist=True):
+        depth.append(1)  # list ops are atomic, so the depth count is sound
+        if len(depth) > 1:
+            overlaps.append(len(depth))
+        try:
+            time.sleep(0.005)  # widen the critical section past thread-switch granularity
+            return unguarded(events, window_start, window_end, persist=persist)
+        finally:
+            depth.pop()
+
+    scorer._score_window = traced
+
+    def run(index):
+        start, _ = _win(index)
+        scorer.score_batch([_health(start + 10, disk_percent=99.9)])
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert overlaps == [], f"score_batch ran concurrently on one instance (depth {overlaps})"
+
+
+def test_concurrent_batches_persist_every_window_exactly_once(store):
+    # The outcome the lock protects: eight threads each scoring a distinct
+    # breaching window leave exactly eight findings -- none lost to a clobbered
+    # counter, none duplicated by two threads advancing the same window.
+    import threading
+
+    scorer = _scorer(store, failure_consecutive_windows=1)
+
+    def run(index):
+        start, _ = _win(index)
+        scorer.score_batch([_health(start + 10, disk_percent=99.9)])
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    rows = [r for r in store.read_detection_findings() if r["mode"] == "system_failure"]
+    assert len(rows) == 8
+    assert sorted(r["window_start"] for r in rows) == [i * WINDOW_SECONDS for i in range(8)]
+
+
+def test_score_and_score_batch_share_one_reentrant_lock(store):
+    # score_batch holds the lock across its windows and calls the unguarded
+    # window scorer; score() is the guarded public entry. A non-reentrant lock
+    # here would deadlock the moment anything nested them.
+    scorer = _scorer(store, failure_consecutive_windows=1)
+    start, end = _win(0)
+    with scorer._lock:  # re-entering from the same thread must not block
+        assert scorer.score([_health(start + 10, disk_percent=99.9)], start, end)
+        assert scorer.score_batch([_health(start + 20, disk_percent=99.9)])

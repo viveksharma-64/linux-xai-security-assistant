@@ -48,6 +48,7 @@ LOW    – mem_percent ≥ failure_memory_medium_pct (default 80 %) sustained
 
 import hashlib
 import json
+import threading
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -227,6 +228,14 @@ class SystemFailureScorer:
         self._host_states: Dict[str, _HostState] = {}
         # Per-unit crash-loop tracking
         self._service_state = _ServiceState()
+        # One scorer instance is shared by every consumer thread of a
+        # DatabaseAnalysisPipeline (pipeline/service.py), and scoring a window is
+        # a read-modify-write over the hysteresis counters and the crash-loop
+        # ring: two threads interleaving inside it would advance a counter twice
+        # for one window, or lose an advance, and the "N consecutive windows"
+        # guarantee the detector is built on would silently stop holding.
+        # Reentrant because score_batch scores each window through score().
+        self._lock = threading.RLock()
 
     def _s(self) -> Settings:
         """Lazily load settings so tests can inject them via the constructor."""
@@ -353,6 +362,10 @@ class SystemFailureScorer:
         each bucket scored once. Because a live batch can straddle a window
         boundary, windows are scored in ascending order so the hysteresis
         counters advance monotonically.
+
+        The whole batch is scored under the instance lock, not each window
+        separately: ascending window order only advances the counters correctly
+        if no other thread interleaves a later window part-way through.
         """
         by_window: Dict[float, List[Event]] = defaultdict(list)
         for event in events:
@@ -362,10 +375,11 @@ class SystemFailureScorer:
             by_window[ws].append(event)
 
         findings: List[Dict[str, Any]] = []
-        for ws in sorted(by_window):
-            findings.extend(
-                self.score(by_window[ws], ws, ws + WINDOW_SECONDS, persist=persist)
-            )
+        with self._lock:
+            for ws in sorted(by_window):
+                findings.extend(
+                    self._score_window(by_window[ws], ws, ws + WINDOW_SECONDS, persist=persist)
+                )
         return findings
 
     # ------------------------------------------------------------------
@@ -390,7 +404,22 @@ class SystemFailureScorer:
         each finding is written to the store via write_detection_finding()
         and gets an ``id`` field. When persist=False the findings are
         returned in-memory only.
+
+        Serialized against concurrent scoring on the same instance; see
+        ``__init__``. Callers already holding the lock (``score_batch``) go
+        straight to ``_score_window``.
         """
+        with self._lock:
+            return self._score_window(events, window_start, window_end, persist=persist)
+
+    def _score_window(
+        self,
+        events: Sequence[Event],
+        window_start: float,
+        window_end: float,
+        persist: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Score one window. The caller must hold ``self._lock``."""
         s = self._s()
 
         # Partition by type within this window
