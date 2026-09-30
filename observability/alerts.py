@@ -75,7 +75,11 @@ class Alert:
         }
 
 
-def evaluate(snapshot: MetricsSnapshot, config: Optional[Settings] = None) -> List[Alert]:
+def evaluate(
+    snapshot: MetricsSnapshot,
+    config: Optional[Settings] = None,
+    chain_status: Optional[Dict[str, bool]] = None,
+) -> List[Alert]:
     """
     All conditions currently firing, worst first.
 
@@ -83,6 +87,16 @@ def evaluate(snapshot: MetricsSnapshot, config: Optional[Settings] = None) -> Li
     rules be tested against constructed states -- including states that are hard
     to produce on a real host, like a full disk -- instead of only against
     whatever the local database happens to contain.
+
+    `chain_status` maps each append-only table to whether its hash chain still
+    verifies. It is a parameter rather than a field of the snapshot on purpose:
+    verifying a chain re-folds the whole table from row 0, which is exactly the
+    cost `collect_snapshot` is built to avoid so that `/metrics` and `/api/status`
+    stay O(1) per scrape (F2). The long-running service can afford that walk on its
+    slow alert interval and passes the result here; the per-request `/api/alerts`
+    path omits it and so never pays the cost. The consequence is deliberate:
+    `evidence_chain_broken` pages through the service loop and is available on
+    demand at `/api/integrity`, but does not appear on `/api/alerts`.
     """
     resolved = config or load_process_settings()
     alerts: List[Alert] = []
@@ -109,6 +123,28 @@ def evaluate(snapshot: MetricsSnapshot, config: Optional[Settings] = None) -> Li
                 threshold=0.0,
             )
         )
+
+    # A chain that no longer verifies means a row in the append-only evidence log
+    # was altered, reordered, deleted, or inserted out of band. That is tamper
+    # evidence about the evidence itself, so it is critical and sits with the other
+    # "cannot be trusted" conditions. Supplied only by the service loop (see the
+    # docstring): the scrape paths never run the walk that produces it.
+    if chain_status:
+        broken = sorted(table for table, ok in chain_status.items() if not ok)
+        if broken:
+            alerts.append(
+                Alert(
+                    name="evidence_chain_broken",
+                    severity=SEVERITY_CRITICAL,
+                    summary=(
+                        "append-only evidence chain failed verification for "
+                        + ", ".join(broken)
+                        + "; a row was altered, reordered, deleted, or inserted out of band"
+                    ),
+                    value=float(len(broken)),
+                    threshold=0.0,
+                )
+            )
 
     # --- event loss --------------------------------------------------------
     if snapshot.dropped_event_count:

@@ -192,7 +192,8 @@ class IngestionService:
             return
         self._last_alert_check = now
         snapshot = metrics.collect_snapshot(self.store, self.settings)
-        firing = alerting.evaluate(snapshot, self.settings)
+        chain_status = self._verify_chains()
+        firing = alerting.evaluate(snapshot, self.settings, chain_status=chain_status)
         # Only transitions are logged. Re-logging every firing alert on every
         # interval would bury the moment a condition started -- which is the one
         # timestamp an operator needs -- under thousands of identical lines.
@@ -202,6 +203,40 @@ class IngestionService:
         for name in sorted(previous - current):
             LOGGER.info("alert_cleared alert=%s", name)
         self._alert_state = firing
+
+    def _verify_chains(self) -> Dict[str, bool]:
+        """
+        Recompute every append-only hash chain and report which still verify.
+
+        Runs here, on the slow alert interval, and never on a scrape: verification
+        re-folds each chained table from row 0, which is precisely the full-table
+        cost `/metrics` and `/api/status` are built to avoid (F2). Doing it in the
+        maintenance loop means a bare install still pages when the evidence log is
+        tampered with, without putting that walk on every scrape.
+
+        A table whose verification itself raises is logged and omitted rather than
+        reported broken: a transient read error (a locked database, a slow disk) is
+        not tamper evidence, `evidence_chain_broken` must not cry wolf on it, and
+        the next interval re-checks. Omitting is safe because the alert rule fires
+        only on tables explicitly marked unverified.
+        """
+        verifiers = {
+            "findings": self.store.verify_findings_chain,
+            "policy": self.store.verify_policy_chain,
+            "triage": self.store.verify_triage_chain,
+            "ml_lifecycle": self.store.verify_ml_lifecycle_chain,
+        }
+        status: Dict[str, bool] = {}
+        for table, verify in verifiers.items():
+            try:
+                status[table] = bool(verify()["ok"])
+            except Exception as error:
+                LOGGER.error(
+                    "evidence_chain_verify_failed table=%s error=%s",
+                    table,
+                    f"{type(error).__name__}: {error}",
+                )
+        return status
 
 
 def _build_parser() -> argparse.ArgumentParser:

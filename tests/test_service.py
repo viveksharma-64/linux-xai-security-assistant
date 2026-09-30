@@ -179,6 +179,68 @@ def test_only_alert_transitions_are_logged(store, monkeypatch, caplog):
     assert len(cleared) == 1
 
 
+def test_verify_chains_reports_all_tables_verified_on_a_clean_store(store):
+    idle = SupervisedSource(name="idle", factory=list)
+    service = IngestionService(store, [idle], fast_config())
+    # A fresh store's append-only chains are empty, and an empty chain verifies.
+    assert service._verify_chains() == {
+        "findings": True,
+        "policy": True,
+        "triage": True,
+        "ml_lifecycle": True,
+    }
+
+
+def test_a_broken_chain_pages_through_the_service_loop(store, monkeypatch):
+    from pipeline import service as service_module
+    from observability.metrics import MetricsSnapshot
+
+    idle = SupervisedSource(name="idle", factory=list)
+    service = IngestionService(store, [idle], fast_config(), alert_interval_seconds=0.0)
+
+    # A benign snapshot so the only condition that can fire is the chain rule,
+    # which the service loop -- unlike the scrape paths -- evaluates.
+    monkeypatch.setattr(
+        service_module.metrics,
+        "collect_snapshot",
+        lambda *a, **k: MetricsSnapshot(
+            collected_at=1000.0, latest_event_timestamp=999.0, collector={"updated_at": 999.0}
+        ),
+    )
+    monkeypatch.setattr(
+        store, "verify_findings_chain", lambda: {"ok": False, "break_seq": 3, "reason": "row 3 altered"}
+    )
+
+    service._maybe_alert()
+
+    fired = {alert.name: alert for alert in service._alert_state}
+    assert "evidence_chain_broken" in fired
+    assert fired["evidence_chain_broken"].severity == "critical"
+
+
+def test_a_chain_verifier_that_errors_is_omitted_not_reported_broken(store, monkeypatch, caplog):
+    idle = SupervisedSource(name="idle", factory=list)
+    service = IngestionService(store, [idle], fast_config())
+
+    def boom():
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(store, "verify_policy_chain", boom)
+
+    with caplog.at_level(logging.ERROR):
+        status = service._verify_chains()
+
+    # A transient read error is not tamper evidence: the table is absent from the
+    # verdict -- so evidence_chain_broken cannot fire on it -- and the failure is
+    # logged rather than swallowed.
+    assert "policy" not in status
+    assert status["findings"] is True
+    assert any(
+        "evidence_chain_verify_failed" in record.getMessage() and "table=policy" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_retention_failure_does_not_stop_the_service(store, monkeypatch):
     # A database that cannot be pruned still collects; the size-cap alert covers a
     # sustained failure. Retention raising must not take ingestion down with it.

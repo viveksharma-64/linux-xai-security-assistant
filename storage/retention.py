@@ -26,6 +26,16 @@ to tell "never collected" from "aged out at 03:00 on Tuesday", because those lea
 to different next steps. Every action writes a row to `maintenance_log` recording
 what was deleted, why, and the coverage floor that remains.
 
+Why the evidence chains are exempt
+----------------------------------
+Retention deletes events and the per-window analytics derived from them. It does
+not delete from the append-only hash-chained tables (`detection_findings`,
+`policy_decisions`, and the triage and ML-lifecycle logs). Those chains verify by
+recomputing from a contiguous `chain_seq` starting at 0, so pruning their oldest
+rows would be indistinguishable from tampering and would leave `/api/integrity`
+reporting a break forever. Findings are rare compared to events, and the byte cap
+still bounds total growth, so the chains are bounded indirectly rather than cut.
+
 Why vacuum is scheduled separately
 ----------------------------------
 Deleting rows frees pages inside the file but does not shrink the file, so the
@@ -148,7 +158,14 @@ class RetentionManager:
     # ---------------------------------------------------------------- policies
 
     def _prune_by_age(self) -> Optional[MaintenanceAction]:
-        """Delete everything older than the retention window, events first."""
+        """
+        Delete aged-out events and derived time-series rows, events first.
+
+        Not literally everything older than the window: the append-only
+        hash-chained tables are exempt, because deleting their oldest rows would
+        break the contiguity `verify_chain` relies on. See
+        `SQLiteEventStore.delete_analytics_older_than`.
+        """
         max_age_days = self.settings.retention_max_age_days
         if max_age_days <= 0:
             # 0 means "keep indefinitely". Spelled as a disabled policy rather

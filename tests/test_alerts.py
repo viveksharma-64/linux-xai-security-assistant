@@ -39,6 +39,44 @@ def test_a_healthy_snapshot_fires_nothing():
     assert evaluate(snap, config(stale_after_seconds=300.0, alert_min_free_disk_bytes=100)) == []
 
 
+def test_a_broken_evidence_chain_pages_and_names_the_tables():
+    # A chain that no longer verifies is tamper evidence about the evidence itself,
+    # so it pages, and it names every unverified table so an operator knows what to
+    # pull. The measured value is the count of broken tables.
+    snap = MetricsSnapshot(
+        collected_at=1000.0, latest_event_timestamp=999.0, collector={"updated_at": 999.0}
+    )
+    alert = fired(
+        evaluate(
+            snap,
+            config(),
+            chain_status={"findings": False, "policy": True, "triage": False, "ml_lifecycle": True},
+        )
+    )["evidence_chain_broken"]
+    assert alert.severity == SEVERITY_CRITICAL
+    assert alert.value == 2.0
+    assert "findings" in alert.summary and "triage" in alert.summary
+    assert "policy" not in alert.summary
+
+
+def test_a_verified_chain_status_fires_nothing():
+    snap = MetricsSnapshot(
+        collected_at=1000.0, latest_event_timestamp=999.0, collector={"updated_at": 999.0}
+    )
+    names = fired(evaluate(snap, config(), chain_status={"findings": True, "policy": True}))
+    assert "evidence_chain_broken" not in names
+
+
+def test_omitting_chain_status_never_fires_the_chain_rule():
+    # `/api/alerts` calls evaluate without chain_status so it never pays the
+    # whole-table verification walk; the rule must stay silent in that case rather
+    # than defaulting to "broken" and paging on every scrape.
+    snap = MetricsSnapshot(
+        collected_at=1000.0, latest_event_timestamp=999.0, collector={"updated_at": 999.0}
+    )
+    assert "evidence_chain_broken" not in fired(evaluate(snap, config()))
+
+
 def test_dropped_events_are_critical_because_the_record_has_gaps():
     snap = MetricsSnapshot(
         collected_at=1000.0,
