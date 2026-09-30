@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import time
+
 from fastapi.testclient import TestClient
 
 from api.app import create_app
@@ -71,6 +73,34 @@ def test_health_and_status_are_read_only(tmp_path):
     assert status.json()["read_only"] is True
 
 
+def test_status_counts_findings_by_aggregate_and_counts_events_once(tmp_path, monkeypatch):
+    # The dashboard polls /api/status. It used to read every finding to produce
+    # two numbers -- so the cost of the summary grew with the evidence record --
+    # and it counted the events table twice per request for one field.
+    store, _ = _setup(tmp_path)
+    calls = {"count_events": 0}
+    real_count_events = store.count_events
+
+    def counted():
+        calls["count_events"] += 1
+        return real_count_events()
+
+    def loud():
+        raise AssertionError("/api/status read the whole findings table")
+
+    monkeypatch.setattr(store, "count_events", counted)
+    monkeypatch.setattr(store, "read_detection_findings", loud)
+
+    body = TestClient(create_app(store)).get("/api/status").json()
+
+    assert calls["count_events"] == 1
+    assert body["total_events"] == body["event_count"] == 1
+    # The breakdown still sums to the total -- severity is NOT NULL, so the
+    # aggregate accounts for every finding.
+    assert body["total_detections"] == 1
+    assert sum(body["severity_counts"].values()) == body["total_detections"]
+
+
 def test_event_detection_explanation_and_policy_retrieval(tmp_path):
     store, explanation = _setup(tmp_path)
     client = TestClient(create_app(store))
@@ -96,16 +126,56 @@ def test_event_detection_explanation_and_policy_retrieval(tmp_path):
     assert len(decision["chain_hash"]) == 64  # policy chain is surfaced too
 
 
-def test_telemetry_status_reports_all_live_verified_sources(tmp_path):
+def test_telemetry_status_is_derived_from_stored_events_not_a_static_list(tmp_path):
+    """
+    A supported source that nothing collects must not read as healthy.
+
+    The surface used to be a hardcoded literal that reported every source as
+    "verified", which told an operator that file, auth, and service telemetry
+    were fine on a deployment where no collector for them was even running.
+    """
+    store, _ = _setup(tmp_path)  # writes one process_exec event at t=1000.0
+    store.write(Event.from_raw_json({
+        "event_type": "file_open",
+        "timestamp": time.time(),
+        "comm": "cat",
+        "uid": 0,
+        "pid": 11,
+        "payload": {"path": "/etc/passwd"},
+    }))
+
+    sources = TestClient(create_app(store)).get("/api/telemetry/status").json()["sources"]
+
+    # Just arrived.
+    assert sources["file_access"]["status"] == "live"
+    # Recorded once, long ago: quiet, not absent -- and distinguishable from both.
+    assert sources["process_exec"]["status"] == "stale"
+    assert sources["process_exec"]["last_event_timestamp"] == 1000.0
+    # Supported by the build, but nothing ever fed it.
+    for key in ("tcp_network", "audit_auth", "system_service", "pipes_streams", "system_health"):
+        assert sources[key]["status"] == "not_collected", key
+        assert sources[key]["last_event_timestamp"] is None
+    # The capability description survives, so "not_collected" reads as unwired
+    # rather than unsupported.
+    assert "journald" in sources["audit_auth"]["detail"]
+
+
+def test_telemetry_status_honours_the_configured_staleness_window(tmp_path):
     store, _ = _setup(tmp_path)
-    response = TestClient(create_app(store)).get("/api/telemetry/status")
-    sources = response.json()["sources"]
-    assert sources["process_exec"]["status"] == "verified"
-    assert sources["tcp_network"]["status"] == "verified"
-    assert sources["file_access"]["status"] == "verified"
-    assert sources["audit_auth"]["status"] == "verified"
-    assert sources["system_service"]["status"] == "verified"
-    assert sources["pipes_streams"]["status"] == "verified"
+    store.write(Event.from_raw_json({
+        "event_type": "file_open",
+        "timestamp": time.time() - 120.0,
+        "comm": "cat",
+        "uid": 0,
+        "pid": 11,
+        "payload": {"path": "/etc/passwd"},
+    }))
+
+    fresh = create_app(store, Settings(api_require_auth=False, stale_after_seconds=300.0))
+    tight = create_app(store, Settings(api_require_auth=False, stale_after_seconds=60.0))
+
+    assert TestClient(fresh).get("/api/telemetry/status").json()["sources"]["file_access"]["status"] == "live"
+    assert TestClient(tight).get("/api/telemetry/status").json()["sources"]["file_access"]["status"] == "stale"
 
 
 def test_missing_and_malformed_ids_are_safe_errors(tmp_path):

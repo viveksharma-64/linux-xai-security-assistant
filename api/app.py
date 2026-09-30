@@ -1,5 +1,4 @@
 import time
-from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
@@ -17,33 +16,59 @@ from observability import alerts as alerting
 from observability import metrics as metrics_module
 from observability.config import Settings
 from observability.config import settings as load_process_settings
-from storage.sqlite_store import SQLiteEventStore
+from storage.sqlite_store import MAX_TRIAGE_ANNOTATION_LIMIT, SQLiteEventStore
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_POLICY_PATH = ROOT / "policy" / "default_policy.yaml"
+
+# The telemetry surfaces this build can collect, and the canonical event types
+# each one produces.
+#
+# `detail` describes a *capability* -- what the collector was built and
+# live-verified to emit. It is deliberately not a status: whether a source is
+# reporting right now is a property of the database, not of the build, and is
+# derived per request in `telemetry_status()` from the newest event of each type.
+# Conflating the two is how an operator ends up reading "verified" for a source
+# that no deployed unit actually runs.
 TELEMETRY_SOURCES = {
+    "process_exec": {
+        "event_types": ("process_exec",),
+        "detail": "Live-verified BCC/eBPF process execution and post-exec context telemetry.",
+    },
+    "system_health": {
+        "event_types": ("system_health",),
+        "detail": "Live-verified psutil system-health telemetry.",
+    },
     "tcp_network": {
-        "status": "verified",
+        "event_types": ("tcp_connect",),
         "detail": "Live-verified BCC sock:inet_sock_set_state IPv4 TCP connect telemetry.",
     },
     "file_access": {
-        "status": "verified",
+        "event_types": ("file_open", "file_write"),
         "detail": "Live-verified file-access telemetry; canonical file_open/file_write events are supported.",
     },
     "audit_auth": {
-        "status": "verified",
+        "event_types": ("auth_session",),
         "detail": "Live-verified structured journald PAM authentication/session telemetry.",
     },
     "system_service": {
-        "status": "verified",
+        "event_types": ("service_state",),
         "detail": "Live-verified structured journald/systemd service lifecycle telemetry.",
     },
     "pipes_streams": {
-        "status": "verified",
+        "event_types": ("ipc_event",),
         "detail": "Live-verified BCC pipe/pipe2 IPC telemetry with validated file descriptors.",
     },
 }
+
+# The three observed states a source can be in. `not_collected` is the honest
+# answer for a supported collector that nothing has ever fed -- it is neither
+# healthy nor broken, and saying so is what tells an operator the unit is not
+# wired rather than that the host is quiet.
+TELEMETRY_LIVE = "live"
+TELEMETRY_STALE = "stale"
+TELEMETRY_NOT_COLLECTED = "not_collected"
 
 
 class StrictModel(BaseModel):
@@ -58,6 +83,7 @@ class HealthResponse(StrictModel):
 class TelemetrySource(StrictModel):
     status: str
     detail: str
+    last_event_timestamp: Optional[float] = None
 
 
 class TelemetryStatusResponse(StrictModel):
@@ -661,16 +687,51 @@ def create_app(
 
     @app.get("/api/telemetry/status", response_model=TelemetryStatusResponse)
     def telemetry_status() -> TelemetryStatusResponse:
-        sources = {
-            "process_exec": TelemetrySource(status="verified", detail="Live-verified BCC/eBPF process execution and post-exec context telemetry."),
-            "system_health": TelemetrySource(status="verified", detail="Real psutil system-health telemetry is verified."),
-            **{key: TelemetrySource(**value) for key, value in TELEMETRY_SOURCES.items()},
-        }
+        """
+        What each supported telemetry source is *observed* to be doing.
+
+        Derived from the newest stored event of each source's canonical event
+        types, not from a build-time list: a source is `live` if something
+        arrived within `stale_after_seconds`, `stale` if it once reported and has
+        gone quiet, and `not_collected` if no event of its type was ever stored.
+
+        The distinction matters operationally. A deployment that never wired a
+        collector and a deployment whose collector died look identical in a
+        static list, and the static list reads as an all-clear for both.
+        `detail` still carries the capability description, so an operator can see
+        that a `not_collected` source is supported but unwired rather than
+        missing from the build.
+        """
+        now = time.time()
+        latest_by_type = event_store.latest_event_timestamp_by_type()
+        sources = {}
+        for key, source in TELEMETRY_SOURCES.items():
+            seen = [
+                latest_by_type[event_type]
+                for event_type in source["event_types"]
+                if event_type in latest_by_type
+            ]
+            newest = max(seen) if seen else None
+            if newest is None:
+                status_value = TELEMETRY_NOT_COLLECTED
+            elif now - newest > stale_after_seconds:
+                status_value = TELEMETRY_STALE
+            else:
+                status_value = TELEMETRY_LIVE
+            sources[key] = TelemetrySource(
+                status=status_value,
+                detail=source["detail"],
+                last_event_timestamp=newest,
+            )
         return TelemetryStatusResponse(sources=sources)
 
     @app.get("/api/status", response_model=StatusResponse)
     def status() -> StatusResponse:
-        findings = event_store.read_detection_findings()
+        # Counts come from a SQL aggregate rather than from reading every
+        # finding: the summary needs two numbers, and materialising the whole
+        # table (evidence JSON and all) to produce them made this endpoint --
+        # which the dashboard polls -- cost more the longer the system ran.
+        severity_counts = event_store.count_findings_by_severity()
         baseline = event_store.read_latest_ready_baseline()
         event_count = event_store.count_events()
         last_event_timestamp = event_store.latest_event_timestamp()
@@ -682,9 +743,9 @@ def create_app(
         return StatusResponse(
             status="ok",
             read_only=True,
-            total_events=event_store.count_events(),
-            total_detections=len(findings),
-            severity_counts=dict(Counter(item["severity"] for item in findings)),
+            total_events=event_count,
+            total_detections=sum(severity_counts.values()),
+            severity_counts=severity_counts,
             baseline_status="ready" if baseline else "insufficient_normal_data",
             telemetry=telemetry_status().sources,
             collector_status=collector.get("status", "unknown"),
@@ -919,12 +980,22 @@ def create_app(
         taken from an intact record. Annotations are grouped in one pass to avoid
         a per-finding query.
 
+        The annotation history is read under the store's hard limit, which is
+        oldest-first, so a record with more annotations than that loses its
+        *newest* ones. An export that cannot be complete says so in
+        `annotations_truncated` rather than looking complete: each finding's
+        `triage.annotation_count` is computed over the whole table and stays
+        authoritative, so a consumer can tell which findings lost history.
+
         Declared before `/api/triage/{finding_id}` so the static path wins the
         route match; otherwise "export" would be parsed as a finding id.
         """
         findings = event_store.read_detection_findings()
         states = event_store.read_latest_triage_state()
-        all_annotations = event_store.read_triage_annotations(limit=5000)
+        all_annotations = event_store.read_triage_annotations(
+            limit=MAX_TRIAGE_ANNOTATION_LIMIT
+        )
+        annotations_truncated = len(all_annotations) >= MAX_TRIAGE_ANNOTATION_LIMIT
         by_finding: Dict[int, List[Dict[str, Any]]] = {}
         for annotation in all_annotations:
             by_finding.setdefault(int(annotation["finding_id"]), []).append(annotation)
@@ -960,7 +1031,17 @@ def create_app(
                 "included and marked (triage.effective_suppressed); suppression is "
                 "a presentation annotation only and never removes a finding from "
                 "the record or this export. 'actor' is a self-reported claim."
+                + (
+                    " ANNOTATION HISTORY IS TRUNCATED: the oldest "
+                    f"{MAX_TRIAGE_ANNOTATION_LIMIT} annotations are included and "
+                    "newer ones are omitted. Compare triage.annotation_count, "
+                    "which is authoritative, against the annotations listed."
+                    if annotations_truncated
+                    else ""
+                )
             ),
+            "annotations_truncated": annotations_truncated,
+            "annotation_limit": MAX_TRIAGE_ANNOTATION_LIMIT,
             "findings": exported,
         }
 
