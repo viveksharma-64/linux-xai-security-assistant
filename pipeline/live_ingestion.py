@@ -631,7 +631,10 @@ class LiveIngestionService:
         while keeping the same durability guarantee for everything in it.
 
         Events reach `batch` (the analysis queue) only after they are committed, so
-        a finding can never cite an event that is not in the database.
+        a finding can never cite an event that is not in the database. Records the
+        writer rejected are excluded from `batch` -- they were never persisted --
+        while inserted and duplicate events (both present in the database) go
+        through.
 
         Returns the new pending list so the caller cannot accidentally keep using
         a list whose contents were already written.
@@ -655,6 +658,14 @@ class LiveIngestionService:
             self._health.malformed_count += result.rejected_count
             self._health.last_event_timestamp = pending[-1].timestamp
         if result.rejected:
+            # Rejected records were refused before the transaction and are not in
+            # the database. They must not reach `batch`: an analysis pass that cited
+            # one would emit a finding pointing at an event no query can resolve,
+            # breaking the guarantee above. Filter by identity -- the rejected
+            # tuples carry the very objects handed in, and two distinct events can
+            # compare equal.
+            rejected_ids = {id(event) for event, _ in result.rejected}
+            persisted = [event for event in pending if id(event) not in rejected_ids]
             for _, reason in result.rejected[:1]:
                 LOGGER.warning(
                     "telemetry events rejected before write: rejected=%d of %d reason=%s",
@@ -662,7 +673,9 @@ class LiveIngestionService:
                     now_events,
                     reason,
                 )
-        batch.extend(pending)
+        else:
+            persisted = pending
+        batch.extend(persisted)
         return []
 
     def _maybe_analyse(self, batch: list[Event]) -> list[Event]:
