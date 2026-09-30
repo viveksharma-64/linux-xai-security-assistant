@@ -21,6 +21,10 @@ Wants=network-online.target
 Type=simple
 User=linux-xai
 Group=linux-xai
+# Read access to the system journal, for telemetry/journald/service_monitor.py.
+# Without it journalctl silently shows only this user's own records and unit
+# lifecycle telemetry never arrives.
+SupplementaryGroups=systemd-journal
 WorkingDirectory=/opt/linux-xai-security
 
 # The eBPF probes are attached by the collector subprocesses this service spawns.
@@ -46,11 +50,23 @@ Environment=PYTHONUNBUFFERED=1
 # One --source per collector: NAME=COMMAND, where COMMAND emits JSONL on stdout.
 # A crashed collector is restarted here; a permanently broken one is marked
 # degraded and the service exits non-zero so Restart= re-runs the whole set.
+#
+# Each spec is quoted so systemd passes it as ONE argv word. Unquoted, systemd
+# splits on whitespace and the interpreter path lands in a separate argument that
+# argparse rejects ("unrecognized arguments"), so the service exits 2 at startup.
+#
+# system_health and service_state feed the availability detector in
+# detection/system_failure.py; without them its disk, memory, CPU, and unit-failure
+# rules can never fire. Neither needs a capability: the health sampler reads /proc
+# via psutil, and the service monitor reads journald (the linux-xai user must be in
+# the systemd-journal group to see the system journal -- see deploy/README.md).
 ExecStart=/opt/linux-xai-security/.venv/bin/linux-xai-service \
-  --source process_exec=/opt/linux-xai-security/.venv/bin/python telemetry/bcc/process_exec_probe.py \
-  --source network_connect=/opt/linux-xai-security/.venv/bin/python telemetry/bcc/network_connect_probe.py \
-  --source network_state=/opt/linux-xai-security/.venv/bin/python telemetry/bcc/network_state_probe.py \
-  --source ipc_pipe=/opt/linux-xai-security/.venv/bin/python telemetry/bcc/ipc_pipe_probe.py
+  "--source=process_exec=/opt/linux-xai-security/.venv/bin/python telemetry/bcc/process_exec_probe.py" \
+  "--source=network_connect=/opt/linux-xai-security/.venv/bin/python telemetry/bcc/network_connect_probe.py" \
+  "--source=network_state=/opt/linux-xai-security/.venv/bin/python telemetry/bcc/network_state_probe.py" \
+  "--source=ipc_pipe=/opt/linux-xai-security/.venv/bin/python telemetry/bcc/ipc_pipe_probe.py" \
+  "--source=system_health=/opt/linux-xai-security/.venv/bin/python telemetry/health/system_health_probe.py" \
+  "--source=service_state=/opt/linux-xai-security/.venv/bin/python telemetry/journald/service_monitor.py"
 
 Restart=always
 RestartSec=5

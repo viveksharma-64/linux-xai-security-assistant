@@ -89,6 +89,37 @@ BPF JIT, `@privileged`/`@debug` syscalls for `bpf()`/`perf_event_open()`). Do no
 "tighten" these without a kernel to test against. The **API unit** has none of these
 exceptions — it runs fully sandboxed with zero capabilities.
 
+## Supervised collectors
+
+Each `--source NAME=COMMAND` in the ingest unit's `ExecStart` is one supervised
+collector. **Quote each spec**: systemd splits the command line on whitespace, so
+an unquoted spec puts the script path in its own argument and the service exits 2
+before it starts. `tests/test_deploy_units.py` parses the shipped unit to keep
+that from regressing.
+
+| Source | Needs | Emits |
+|--------|-------|-------|
+| `process_exec`, `network_connect`, `network_state`, `ipc_pipe` | eBPF capabilities | the security telemetry |
+| `system_health` | nothing — reads `/proc` via psutil | CPU, memory, disk samples |
+| `service_state` | journal read access | systemd unit lifecycle |
+
+The last two feed the availability detector in `detection/system_failure.py`;
+without them its disk, memory, CPU, and unit-failure rules have no input and
+cannot fire.
+
+`service_state` reads the journal through `journalctl`, which shows a normal user
+only their own records. The unit therefore sets
+`SupplementaryGroups=systemd-journal` — without it the collector runs, reports
+healthy, and emits nothing. Confirm with:
+
+```bash
+sudo -u linux-xai journalctl -n 1 --output=json
+```
+
+`system_health` needs no capability at all, so it keeps reporting on a kernel
+where BCC cannot attach — which makes it the source to check first when
+`/api/telemetry/status` shows the eBPF sources degraded.
+
 ## Retention runs in-process
 
 There is deliberately **no `.timer` unit.** Age pruning, the byte cap, and the
