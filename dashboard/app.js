@@ -134,22 +134,32 @@ const SOURCE_LABELS = {
   pipes_streams: "Pipes / streams / IPC",
 };
 
+// Observed source states, as derived by /api/telemetry/status from the newest
+// stored event of each type. Only "live" is green: a source that has gone quiet
+// and a source nothing ever collected are both states an operator has to act on,
+// so neither may read as an all-clear.
+const SOURCE_STATE_LABELS = { live: "live", stale: "stale", not_collected: "not collected" };
+
 function renderTelemetry(status) {
   const rows = Object.entries(status.sources).map(([key, source]) => el("div", { class: "telemetry-row" },
     el("span", { text: SOURCE_LABELS[key] || key }),
-    el("span", { class: `telemetry-status ${source.status === "verified" ? "verified" : "unverified"}`, text: source.status }),
+    el("span", {
+      class: `telemetry-status ${source.status === "live" ? "verified" : "unverified"}`,
+      text: SOURCE_STATE_LABELS[source.status] || source.status,
+    }),
   ));
   replaceChildren($("#telemetry-list"), ...rows);
   $("#health-badge").textContent = "Observed status";
 
-  // Honest footer: reflect the sources actually reported as verified right now,
-  // rather than a hardcoded "Live verified: ..." list that could drift from reality.
-  const verified = Object.entries(status.sources).filter(([, s]) => s.status === "verified").map(([key]) => SOURCE_LABELS[key] || key);
+  // Honest footer: name the sources actually reporting right now, and say so
+  // plainly when none is, rather than a hardcoded "Live verified: ..." list that
+  // could drift from reality.
+  const live = Object.entries(status.sources).filter(([, s]) => s.status === "live").map(([key]) => SOURCE_LABELS[key] || key);
   const footer = $("#source-footer");
-  if (verified.length) {
-    footer.textContent = `Observed verified sources: ${verified.join(", ")}.`;
+  if (live.length) {
+    footer.textContent = `Sources reporting now: ${live.join(", ")}.`;
   } else {
-    footer.textContent = "No telemetry source is currently reporting as verified.";
+    footer.textContent = "No telemetry source is currently reporting.";
   }
 }
 

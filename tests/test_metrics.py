@@ -30,11 +30,8 @@ class FakeStore:
             "count_events": 10,
             "latest_event_timestamp": 1000.0,
             "oldest_event_timestamp": 100.0,
-            "read_detection_findings": [
-                {"severity": "high"},
-                {"severity": "high"},
-                {"severity": "low"},
-            ],
+            # Counts, not findings: a scrape must never read the whole table.
+            "count_findings_by_severity": {"high": 2, "low": 1},
             "database_bytes": 4096,
             "file_permissions": {"/var/lib/x/events.db": 0o600},
             "read_collector_health": {
@@ -66,6 +63,20 @@ def test_snapshot_reads_every_figure_from_the_store():
     assert snap.finding_count == 3
     assert snap.severity_counts == {"high": 2, "low": 1}
     assert snap.collector["processed_count"] == 500
+
+
+def test_a_scrape_never_materialises_the_findings_table():
+    # /metrics is scraped on an interval forever. Reading every finding to count
+    # them made each scrape cost grow with the evidence record -- and the whole
+    # point of the aggregate is that no per-finding row crosses into Python.
+    class Loud(FakeStore):
+        def read_detection_findings(self):
+            raise AssertionError("the scrape path read the whole findings table")
+
+    snap = collect_snapshot(Loud(), config=Settings())
+    assert snap.database_error is None
+    assert snap.finding_count == 3
+    assert snap.severity_counts == {"high": 2, "low": 1}
 
 
 def test_a_database_error_is_captured_not_raised():

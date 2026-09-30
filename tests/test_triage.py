@@ -14,9 +14,10 @@ the export's completeness, and the auth gate.
 
 from fastapi.testclient import TestClient
 
+from api import app as app_module
 from api.app import create_app
 from observability.config import Settings
-from storage.sqlite_store import SQLiteEventStore
+from storage.sqlite_store import MAX_TRIAGE_ANNOTATION_LIMIT, SQLiteEventStore
 
 # A token long enough to satisfy MIN_TOKEN_LENGTH, for the default-deny checks.
 TOKEN = "0123456789abcdef-a-long-enough-token"
@@ -187,6 +188,33 @@ def test_suppressed_finding_is_included_and_marked_in_export(tmp_path):
     # intact record.
     assert export["chain_integrity"]["findings"]["ok"] is True
     assert export["chain_integrity"]["triage"]["ok"] is True
+    # Nothing was dropped, and the export says so rather than leaving it implied.
+    assert export["annotations_truncated"] is False
+    assert export["annotation_limit"] == MAX_TRIAGE_ANNOTATION_LIMIT
+
+
+def test_an_export_that_cannot_be_complete_says_so(tmp_path, monkeypatch):
+    # read_triage_annotations is oldest-first under a hard limit, so a record
+    # with more annotations than that loses its *newest* ones -- the opposite of
+    # what "faithful, complete export" promises, and invisible to a consumer.
+    # The limit is patched rather than writing 5000 annotations: the property
+    # under test is "returned exactly the limit => declare truncation".
+    store, fid = _store_with_finding(tmp_path)
+    monkeypatch.setattr(app_module, "MAX_TRIAGE_ANNOTATION_LIMIT", 2)
+    client = TestClient(create_app(store))
+    for index in range(3):
+        client.post(f"/api/triage/{fid}/annotate", json={"note": f"note {index}"})
+
+    export = client.get("/api/triage/export").json()
+
+    assert export["annotations_truncated"] is True
+    assert export["annotation_limit"] == 2
+    assert "TRUNCATED" in export["note"]
+    triage = export["findings"][0]["triage"]
+    # The newest annotation is the one missing, and annotation_count -- computed
+    # over the whole table, not from this list -- still tells the consumer so.
+    assert [a["note"] for a in triage["annotations"]] == ["note 0", "note 1"]
+    assert triage["annotation_count"] == 3
 
 
 def test_triage_write_to_a_missing_finding_is_404(tmp_path):

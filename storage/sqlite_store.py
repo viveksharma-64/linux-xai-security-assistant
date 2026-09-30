@@ -41,6 +41,12 @@ _TRIAGE_ACTIONS = frozenset(
 )
 _TRIAGE_DISPOSITIONS = frozenset({"true-positive", "false-positive", "benign"})
 
+# Hard ceiling on one `read_triage_annotations` call, so no caller can ask for an
+# unbounded materialisation of the annotation table. Exported because a caller
+# that claims to return a complete history has to be able to say when it hit
+# this -- see the truncation flag on /api/triage/export.
+MAX_TRIAGE_ANNOTATION_LIMIT = 5000
+
 # The append-only ML lifecycle vocabulary, kept in step with the CHECK constraint
 # on ml_model_lifecycle (migration 10) and with ml/lifecycle.py. `active` is in
 # the list because the log must be able to *record* an activation; it is not a
@@ -1155,6 +1161,28 @@ class SQLiteEventStore(EventStore):
                 findings.append(finding)
             return findings
 
+    def count_findings_by_severity(self) -> Dict[str, int]:
+        """
+        How many findings exist at each severity, as a SQL aggregate.
+
+        The summary surfaces (`/api/status`, `/metrics`) want two numbers --
+        a total and a per-severity breakdown -- and were reading the whole
+        `detection_findings` table to compute them: every row materialised, its
+        evidence JSON decoded, all of it discarded after a `len()` and a
+        `Counter`. That cost grows with the evidence record forever, on a path
+        a monitoring system scrapes on an interval.
+
+        SQLite answers this by scanning one small `NOT NULL TEXT` column and
+        returning one row per distinct severity; nothing per-finding crosses
+        into Python. `severity` is `NOT NULL`, so summing the values is the
+        exact finding count -- callers need no second query for the total.
+        """
+        with self._transaction() as conn:
+            rows = conn.execute(
+                "SELECT severity, COUNT(*) AS c FROM detection_findings GROUP BY severity"
+            ).fetchall()
+        return {str(row["severity"]): int(row["c"]) for row in rows}
+
     def read_detection_finding(self, finding_id: int) -> Optional[Dict[str, Any]]:
         with self._transaction() as conn:
             row = conn.execute(
@@ -1392,8 +1420,13 @@ class SQLiteEventStore(EventStore):
         Ordered by `id` ASC, which is chain order, so corrections read as the
         narrative they are. Returns raw annotation rows including their `chain_*`
         fields; effective state is computed separately (`read_latest_triage_state`).
+
+        `limit` is clamped to `MAX_TRIAGE_ANNOTATION_LIMIT`. Because the order is
+        oldest-first, a clamped call drops the *newest* annotations, so a caller
+        receiving exactly the limit must treat the history as possibly truncated
+        rather than complete.
         """
-        limit = max(1, min(int(limit), 5000))
+        limit = max(1, min(int(limit), MAX_TRIAGE_ANNOTATION_LIMIT))
         with self._transaction() as conn:
             if finding_id is None:
                 rows = conn.execute(
@@ -1747,6 +1780,30 @@ class SQLiteEventStore(EventStore):
         with self._transaction() as conn:
             row = conn.execute("SELECT MAX(timestamp) AS latest FROM events").fetchone()
             return float(row["latest"]) if row["latest"] is not None else None
+
+    def latest_event_timestamp_by_type(self) -> Dict[str, float]:
+        """
+        Newest event timestamp per `event_type`, for event types present at all.
+
+        This is what lets the telemetry surface report what is *actually
+        arriving* rather than what the build is capable of collecting. An event
+        type absent from the result was never recorded, which is a different
+        operational state from "recorded, but not recently" and has to be
+        distinguishable from it.
+
+        `idx_events_type_timestamp` (migration 5) covers `(event_type,
+        timestamp)`, so SQLite answers this from the index -- one skip-scan per
+        distinct type rather than a table scan.
+        """
+        with self._transaction() as conn:
+            rows = conn.execute(
+                "SELECT event_type, MAX(timestamp) AS latest FROM events GROUP BY event_type"
+            ).fetchall()
+        return {
+            str(row["event_type"]): float(row["latest"])
+            for row in rows
+            if row["event_type"] is not None and row["latest"] is not None
+        }
 
     def oldest_event_timestamp(self) -> Optional[float]:
         """Coverage floor of the database, and the number retention moves."""

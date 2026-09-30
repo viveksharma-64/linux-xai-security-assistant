@@ -9,10 +9,10 @@ counters would therefore mean the API can only report on itself -- it would say
 figure here is read from the tables the ingestion side already writes to, so what
 the operator scrapes is the same record an analyst reads afterwards.
 
-The cost is scrape latency: `/metrics` does a handful of indexed queries per
-request. That is acceptable at Prometheus intervals (15-60s) and is the reason
-`snapshot()` collects everything in one pass rather than each gauge fetching its
-own row.
+The cost is scrape latency: `/metrics` does a handful of counting/aggregate
+queries per request, none of which materialise a table. That is acceptable at
+Prometheus intervals (15-60s) and is the reason `snapshot()` collects everything
+in one pass rather than each gauge fetching its own row.
 
 Why plain text and no client library
 ------------------------------------
@@ -176,13 +176,12 @@ def collect_snapshot(store: Any, config: Optional[Settings] = None) -> MetricsSn
         snapshot.event_count = store.count_events()
         snapshot.latest_event_timestamp = store.latest_event_timestamp()
         snapshot.oldest_event_timestamp = store.oldest_event_timestamp()
-        findings = store.read_detection_findings()
-        snapshot.finding_count = len(findings)
-        counts: Dict[str, int] = {}
-        for finding in findings:
-            severity = str(finding.get("severity", "unknown"))
-            counts[severity] = counts.get(severity, 0) + 1
-        snapshot.severity_counts = counts
+        # A SQL aggregate, not a full read of detection_findings: a scrape needs
+        # the counts, not the findings, and materialising every row (evidence
+        # JSON included) to discard it made scrape cost grow with the evidence
+        # record forever. `severity` is NOT NULL, so the sum is the exact total.
+        snapshot.severity_counts = dict(store.count_findings_by_severity())
+        snapshot.finding_count = sum(snapshot.severity_counts.values())
         snapshot.database_bytes = store.database_bytes()
         snapshot.file_permissions = store.file_permissions()
         snapshot.collector = store.read_collector_health() or {}

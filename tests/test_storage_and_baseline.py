@@ -187,6 +187,54 @@ def test_sqlite_store_skips_malformed_events(tmp_path):
     assert list(store.read_all()) == []
 
 
+def _finding(severity, entity_key, provenance):
+    return {
+        "source_risk_id": None,
+        "window_start": 1000.0,
+        "window_end": 1300.0,
+        "entity_type": "command",
+        "entity_key": entity_key,
+        "risk_score": 0.7,
+        "severity": severity,
+        "behavior_score": 0.7,
+        "rule_score": 0.0,
+        "context_score": 0.0,
+        "evidence": [{"signal": "behavior_anomaly", "score": 0.7}],
+        "explanation": f"test finding {entity_key}",
+        "mode": "detection",
+        "provenance_hash": provenance,
+        "detector_version": "detector.v1",
+    }
+
+
+def test_severity_counts_come_from_an_aggregate_not_a_table_read(tmp_path):
+    # /api/status and /metrics need a total and a breakdown, nothing else. The
+    # aggregate exists so neither has to materialise every finding (and decode
+    # its evidence JSON) to count them.
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
+    assert store.count_findings_by_severity() == {}
+
+    for index, severity in enumerate(["HIGH", "HIGH", "MEDIUM", "LOW"]):
+        store.write_detection_finding(_finding(severity, f"cmd{index}", f"ph{index}"))
+
+    counts = store.count_findings_by_severity()
+    assert counts == {"HIGH": 2, "MEDIUM": 1, "LOW": 1}
+    # severity is NOT NULL, so the sum is the exact finding count: callers get
+    # the total from this one query rather than a second COUNT(*).
+    assert sum(counts.values()) == len(store.read_detection_findings())
+
+
+def test_severity_counts_include_suppressed_findings(tmp_path):
+    # Suppression is a presentation decision, never a drop, so the operational
+    # totals have to keep counting what the record holds.
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
+    store.write_detection_finding(_finding("HIGH", "visible", "p0"))
+    store.write_detection_finding(
+        {**_finding("HIGH", "quiet", "p1"), "suppressed": True, "suppression_reason": "known"}
+    )
+    assert store.count_findings_by_severity() == {"HIGH": 2}
+
+
 def test_baseline_rejects_insufficient_normal_data():
     baseline = BehavioralBaseline(minimum_samples=10)
     samples = [
