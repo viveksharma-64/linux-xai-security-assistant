@@ -45,6 +45,42 @@ def store(tmp_path):
         handle.close()
 
 
+def _write_finding(store, window_start: float, explanation: str) -> int:
+    """Write one chained finding plus the chained policy decision that follows it."""
+    finding_id = store.write_detection_finding(
+        {
+            "window_start": window_start,
+            "window_end": window_start + 60,
+            "entity_type": "process",
+            "entity_key": f"bash:{int(window_start)}",
+            "severity": "medium",
+            "risk_score": 0.5,
+            "behavior_score": 0.5,
+            "rule_score": 0.5,
+            "context_score": 0.5,
+            "evidence": {},
+            "explanation": explanation,
+            "mode": "observe",
+        }
+    )
+    store.write_policy_decision(
+        {
+            "finding_id": finding_id,
+            "policy_id": "observe-only",
+            "decision": "propose",
+            "reason": explanation,
+            "risk_score": 0.5,
+            "severity": "medium",
+            "required_approval": True,
+            "proposed_action": "notify",
+            "limitations": {},
+            "timestamp": window_start + 60,
+            "dry_run": True,
+        }
+    )
+    return finding_id
+
+
 def _settings(**overrides) -> Settings:
     # Every policy off by default so each test enables exactly the one it asserts
     # on; otherwise a vacuum triggered by an unrelated default would be
@@ -104,29 +140,97 @@ class TestAgeRetention:
 
     def test_prunes_dependent_analytics_rows(self, store):
         now = 1_000_000.0
-        finding_id = store.write_detection_finding(
-            {
-                "window_start": now - 40 * DAY,
-                "window_end": now - 40 * DAY + 60,
-                "entity_type": "process",
-                "entity_key": "bash:1000",
-                "severity": "medium",
-                "risk_score": 0.5,
-                "behavior_score": 0.5,
-                "rule_score": 0.5,
-                "context_score": 0.5,
-                "evidence": {},
-                "explanation": "aged finding",
-                "mode": "observe",
-            }
-        )
-        store.write_explanation({"finding_id": finding_id, "explanation_type": "why", "content": "old"})
+        for age_days, score in ((40, 0.2), (1, 0.3)):
+            window_start = now - age_days * DAY
+            store.write_risk_record(
+                {
+                    "window_start": window_start,
+                    "window_end": window_start + 60,
+                    "entity_type": "process",
+                    "entity_key": f"bash:{age_days}",
+                    "anomaly_score": score,
+                    "risk_level": "low",
+                    "contributing_features": {},
+                    "explanation": f"{age_days}d",
+                    "mode": "observe",
+                }
+            )
+            store.write_feature_record(
+                {
+                    "event_type": "process_exec",
+                    "window_start": window_start,
+                    "window_end": window_start + 60,
+                    "total_events": 1,
+                    "unique_commands": 1,
+                    "unique_uids": 1,
+                }
+            )
+            store.write_anomaly_record(
+                {
+                    "event_type": "process_exec",
+                    "timestamp": window_start,
+                    "anomaly_score": score,
+                    "score_bucket": "low",
+                    "explanation": f"{age_days}d",
+                }
+            )
         manager = RetentionManager(store, _settings(retention_max_age_days=30.0), clock=lambda: now)
 
         action = manager.run_once()[0]
 
-        assert action["rows_deleted"] >= 2
-        assert store.read_detection_findings() == []
+        # Three stale derived rows go; the three inside the window stay.
+        assert action["rows_deleted"] == 3
+        assert [record["explanation"] for record in store.read_risk_records()] == ["1d"]
+        assert [record["explanation"] for record in store.read_anomaly_records()] == ["1d"]
+
+    def test_keeps_aged_findings_so_the_evidence_chains_still_verify(self, store):
+        """
+        Retention must not prune the append-only chains.
+
+        `verify_chain` reads a gap in `chain_seq` as a deleted row, so age-pruning
+        the oldest finding would leave every later `/api/integrity` call reporting
+        tampering that never happened -- a permanent false alarm indistinguishable
+        from the real thing. The stale finding is kept instead, and the byte cap on
+        events remains the bound on growth.
+        """
+        now = 1_000_000.0
+        stale_id = _write_finding(store, now - 40 * DAY, "aged finding")
+        _write_finding(store, now - 1 * DAY, "recent finding")
+        store.write_explanation(
+            {"finding_id": stale_id, "explanation_type": "why", "content": "old"}
+        )
+        store.write(_event(now - 40 * DAY))
+        manager = RetentionManager(store, _settings(retention_max_age_days=30.0), clock=lambda: now)
+
+        manager.run_once()
+
+        assert store.verify_findings_chain()["ok"] is True
+        assert store.verify_policy_chain()["ok"] is True
+        assert [item["explanation"] for item in store.read_detection_findings()] == [
+            "aged finding",
+            "recent finding",
+        ]
+        # The explanation is keyed by finding id, so it must survive with it: a
+        # finding the dashboard can show but not explain is worse than either.
+        assert [item["finding_id"] for item in store.read_explanations()] == [stale_id]
+        assert len(store.read_policy_decisions()) == 2
+
+    def test_pruning_only_events_still_leaves_the_chains_verifiable(self, store):
+        """The chain verdict is unchanged by a prune that deletes events only."""
+        now = 1_000_000.0
+        _write_finding(store, now - 40 * DAY, "aged finding")
+        store.write(_event(now - 40 * DAY))
+        manager = RetentionManager(store, _settings(retention_max_age_days=30.0), clock=lambda: now)
+
+        action = manager.run_once()[0]
+
+        assert action["events_deleted"] == 1
+        assert store.verify_findings_chain() == {
+            "ok": True,
+            "checked": 1,
+            "break_seq": None,
+            "reason": None,
+        }
 
 
 class TestSizeCap:

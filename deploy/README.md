@@ -98,6 +98,20 @@ service, and it means retention keeps running exactly as long as ingestion does.
 Setting `retention_max_age_days: 0` keeps events indefinitely (bounded only by the
 byte cap, if set).
 
+Retention prunes events and the per-window analytics derived from them. It does
+**not** delete from the append-only hash-chained tables (findings, policy
+decisions, triage, ML lifecycle): those verify by recomputing a contiguous chain
+from its first row, so pruning the oldest rows would make `/api/integrity` report
+tampering for the rest of the database's life.
+
+Those tables are therefore **unbounded**, and the byte cap does not change
+that: the cap deletes only events, and once it runs out of them it logs
+`retention_size_cap_ineffective` and stops, so a database dominated by chained
+evidence sits permanently over budget. Findings are rare next to events, so the
+growth is slow in practice — but it is growth with no ceiling. If you need a
+hard limit, archive the database and start a new chain rather than deleting
+rows from it.
+
 ## Verifying a deployment
 
 ```bash

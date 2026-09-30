@@ -1842,39 +1842,44 @@ class SQLiteEventStore(EventStore):
 
     def delete_analytics_older_than(self, cutoff: float) -> int:
         """
-        Drop derived analytics whose window ended at or before `cutoff`.
+        Drop the derived *time-series* analytics whose window ended at or before
+        `cutoff`.
 
-        Derived rows are pruned on the same clock as the events they were derived
-        from. Keeping a finding whose evidence has aged out would leave the
-        dashboard showing a detection an analyst cannot investigate, which is
-        worse than showing nothing: the explanation cites event ids that no longer
-        resolve.
+        Per-window derived rows are pruned on the same clock as the events they
+        were derived from; they are the rows that grow with uptime, and nothing
+        references them once their window has aged out.
 
-        Explanations, assistant responses, and policy decisions are removed by
-        finding id rather than by their own timestamps, so the four tables stay
-        mutually consistent.
+        The hash-chained tables are deliberately exempt. `detection_findings` and
+        `policy_decisions` are append-only logs whose `chain_seq` must stay
+        contiguous from 0: `evidence_chain.verify_chain` treats a gap as evidence
+        of a deleted row (see storage/evidence_chain.py:233), which is the whole
+        point of chaining them. Pruning the oldest findings would therefore move
+        the surviving head off seq 0 and make `/api/integrity` report tampering
+        forever, indistinguishable from the real thing. An age bound on the
+        evidence record is not worth destroying the record's verifiability, so
+        retention does not bound these tables at all -- and neither does the
+        byte cap, which deletes only from `events`. Once those run out,
+        `RetentionManager._enforce_size_cap` logs
+        `retention_size_cap_ineffective` and gives up, so a database whose size
+        is dominated by chained evidence sits permanently over budget. What
+        keeps that tolerable is the production rate -- findings are rare next to
+        events -- not a mechanism. An operator who needs a hard ceiling has to
+        archive the database and start a new chain, not delete rows from this
+        one.
+
+        `finding_explanations` and `assistant_responses` are keyed by finding id
+        and survive with their finding: deleting them would leave a finding the
+        dashboard can show but not explain.
+
+        A retained finding whose source events have aged out is still
+        self-describing -- `evidence_json` and `explanation` are stored inline on
+        the chained row -- so what is lost is the ability to pivot from the
+        finding back into raw event rows, not the finding's own account of
+        itself.
         """
         cutoff = float(cutoff)
         with self._transaction() as conn:
-            findings = [
-                int(row["id"])
-                for row in conn.execute(
-                    "SELECT id FROM detection_findings WHERE window_end <= ?", (cutoff,)
-                ).fetchall()
-            ]
             rows_deleted = 0
-            for start in range(0, len(findings), 500):
-                chunk = findings[start:start + 500]
-                placeholders = ", ".join("?" for _ in chunk)
-                for table in ("finding_explanations", "assistant_responses", "policy_decisions"):
-                    cursor = conn.execute(
-                        f"DELETE FROM {table} WHERE finding_id IN ({placeholders})", chunk
-                    )
-                    rows_deleted += cursor.rowcount or 0
-                cursor = conn.execute(
-                    f"DELETE FROM detection_findings WHERE id IN ({placeholders})", chunk
-                )
-                rows_deleted += cursor.rowcount or 0
             for table, column in (
                 ("behavior_risks", "window_end"),
                 ("event_features", "window_end"),
