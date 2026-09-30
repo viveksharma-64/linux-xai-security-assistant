@@ -152,3 +152,24 @@ def test_replace_returns_a_new_settings_without_mutating_the_original():
     assert derived.api_port == 1234
     assert base.api_port == 8000
     assert derived.db_path == base.db_path
+
+
+def test_queue_size_above_the_ceiling_is_rejected():
+    # queue_size bounds the in-memory ingestion queue; an enormous value would
+    # defeat the backpressure memory bound and invite an OOM kill mid-write, so it
+    # fails closed at startup with a message that names the field.
+    from observability.config import MAX_QUEUE_SIZE
+
+    with pytest.raises(ConfigError) as error:
+        load_settings(environ={"SECURITY_QUEUE_SIZE": str(MAX_QUEUE_SIZE + 1)})
+    assert "queue_size" in str(error.value)
+    assert "bounded" in str(error.value)
+
+
+def test_queue_size_at_the_ceiling_is_accepted():
+    # The bound is inclusive: the documented ceiling is a valid setting, so an
+    # operator who deliberately sizes to the maximum is not turned away.
+    from observability.config import MAX_QUEUE_SIZE
+
+    resolved = load_settings(environ={"SECURITY_QUEUE_SIZE": str(MAX_QUEUE_SIZE)})
+    assert resolved.queue_size == MAX_QUEUE_SIZE

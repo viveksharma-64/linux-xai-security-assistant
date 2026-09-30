@@ -257,6 +257,16 @@ def _as_mode(raw: Any, key: str) -> int:
         raise ConfigError(f"{key}: expected an octal file mode, got {raw!r}") from error
 
 
+# The largest `queue_size` accepted. The ingestion queue is bounded on purpose:
+# that bound is the memory ceiling backpressure enforces when the producer
+# outruns the writer. A value like a byte count pasted into a slot-count field
+# would let the queue hold millions of events in RAM and turn a bounded, back-
+# pressured pipeline into one that the kernel OOM-kills mid-write -- the exact
+# unbounded-memory failure the bounded queue exists to prevent. The ceiling is
+# generous (~1M queued events is already gigabytes) but finite.
+MAX_QUEUE_SIZE = 1_048_576
+
+
 def _validate(settings: Settings) -> Settings:
     """
     Reject values that are individually parseable but jointly meaningless.
@@ -288,6 +298,13 @@ def _validate(settings: Settings) -> Settings:
     for key, value in positive:
         if value <= 0:
             raise ConfigError(f"{key}: must be positive, got {value!r}")
+
+    # queue_size has an upper bound as well as a lower one: see MAX_QUEUE_SIZE.
+    if settings.queue_size > MAX_QUEUE_SIZE:
+        raise ConfigError(
+            f"queue_size: must be <= {MAX_QUEUE_SIZE} to keep the ingestion queue's memory "
+            f"bounded, got {settings.queue_size!r}"
+        )
 
     non_negative = (
         ("backpressure_timeout_seconds", settings.backpressure_timeout_seconds),
