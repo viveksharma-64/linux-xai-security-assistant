@@ -23,7 +23,7 @@ boundaries above.
 | # | Requirement clause | Where it lives | Status |
 |---|---|---|---|
 | R1 | Learns normal system behavior | `baseline/behavior_analyzer.py` and the baseline engine; per-`EventType` windowed baselines. ML (`ml/`) is implemented but intentionally inactive. | **Satisfied** (deterministic baseline). |
-| R2 | Detects security threats in real time | `detection/detector.py` deterministic fusion over streaming telemetry; explained findings persisted via `storage/sqlite_store.py`. Real-time now covers the kernel collectors (exec, network, IPC) and both streaming journald collectors (auth, service). | **Satisfied**, with one narrowed gap — see Gap B. |
+| R2 | Detects security threats in real time | `detection/detector.py` deterministic fusion over streaming telemetry; explained findings persisted via `storage/sqlite_store.py`. Real-time *collection* now covers the kernel collectors (exec, network, IPC) and both streaming journald collectors (auth, service); the *security findings* themselves are driven by `process_exec` alone (`detector.py` filters to it before any rule runs), while network, IPC, and auth are stored and served as investigable evidence but drive no finding today, and `service`/`system_health` feed R3, not this clause — see "What each event type actually drives" in the README. | **Satisfied**, with one narrowed gap — see Gap B. |
 | R3 | Detects system failures in real time | `detection/system_failure.py` scores `system_health`/`service_state` over fixed 300s windows with hysteresis and persists failure findings via `storage/sqlite_store.py` (`mode="system_failure"`, no schema change). Detection surfaces failures for an operator; taking an active response is R5, not this clause. | **Satisfied** (detection only). |
 | R4 | Explains why anomalies are detected | `explainability/explainer.py` builds evidence and rationale for each finding; `assistant/service.py` renders an advisory, human-readable explanation. | **Satisfied.** |
 | R5 | Recommends or performs corrective actions | *Recommend:* `assistant/service.py` (advisory) and `policy/engine.py` (deterministic, fail-closed, approval-gated **dry-run** decisions). *Perform:* not built — `response/` is empty and no executor exists. | **Partial (Gap C):** recommend yes; perform deliberately absent. |
@@ -165,6 +165,8 @@ Track 5 makes the existing ML-fitness apparatus visible to the analyst: `GET /ap
 ## Telemetry status
 
 All planned telemetry families are **LIVE VERIFIED**. No telemetry category remains unverified.
+
+"LIVE VERIFIED" is a *collection* claim — the source attaches and emits real, normalized events — not a statement that the family drives a finding. Which event types actually feed detection is a separate question: security findings are driven by `process_exec` alone and `system_failure.py` by `system_health`/`service_state`, while the remaining families are stored and served as evidence but drive no finding today (see "What each event type actually drives" in the README).
 
 | Family | Status | Source and controlled evidence |
 |---|---|---|

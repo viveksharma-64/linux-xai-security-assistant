@@ -102,6 +102,37 @@ def test_detection_fuses_behavior_rules_and_context(tmp_path):
     ))
 
 
+def test_finding_score_fields_are_rounded_to_four_decimals(tmp_path):
+    """
+    The detector rounds every fused score to 4 dp before it enters the finding.
+    This is load-bearing, not cosmetic: _provenance_hash folds these fields into
+    the finding's identity, so an unrounded float would let a sub-ulp difference
+    between runs or platforms yield a different hash for the same finding and
+    defeat deduplication. Guard the rounding directly.
+    """
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
+    engine = DetectionEngine(store)
+    events = [
+        _event(1000 + index, comm="nc" if index < 2 else "bash", uid=0 if index == 0 else 1000, pid=index)
+        for index in range(12)
+    ]
+    finding = engine.detect(risks=[_risk()], events=events, persist=False)["findings"][0]
+
+    for field in ("risk_score", "behavior_score", "rule_score", "context_score"):
+        value = finding[field]
+        assert value == round(value, 4), f"{field}={value!r} is not rounded to 4dp"
+    for item in finding["evidence"]:
+        assert item["score"] == round(item["score"], 4), item
+
+    # The setup genuinely exercises the rounding: the unrounded fused risk score
+    # carries more than four decimals (0.91912), so this pair would fail if the
+    # round() on risk_score were dropped.
+    raw_rule = 1.0 - ((1.0 - 0.80) * (1.0 - 0.65) * (1.0 - 0.60) * (1.0 - 0.40))
+    raw_risk = 0.50 * 0.85 + 0.35 * raw_rule + 0.15 * 1.0
+    assert raw_risk != round(raw_risk, 4)
+    assert finding["risk_score"] == round(raw_risk, 4)
+
+
 def test_findings_are_persisted_with_structured_evidence(tmp_path):
     store = SQLiteEventStore(str(tmp_path / "events.db"))
     engine = DetectionEngine(store)

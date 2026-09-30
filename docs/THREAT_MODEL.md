@@ -64,6 +64,6 @@ accepted rather than mitigated, it says so.
 ## Residual risks (accepted)
 
 - **Root/kernel compromise of the monitored host** — out of scope, as above.
-- **No transport encryption in-process.** The API binds loopback; TLS is expected to be terminated by a reverse proxy. Binding off-loopback is gated behind an explicit `ALLOW_NON_LOOPBACK_API=1`.
+- **No transport encryption in-process.** The API binds loopback; TLS is expected to be terminated by a reverse proxy. The packaged entry point (`api/__main__.py`, which the systemd unit runs) refuses a non-loopback bind unless `ALLOW_NON_LOOPBACK_API=1` is set, and refuses a non-loopback bind without authentication regardless. Both are startup checks in that entry point rather than properties of the ASGI app, so an operator who runs `uvicorn api.app:app --host 0.0.0.0` by hand bypasses them — the guard is against accident, not against a determined operator.
 - **On-host storage only.** Evidence lives on the host it describes; an attacker with sufficient local privilege and time could delete history within the retention window. Off-host/append-only shipping is future work.
 - **Advisory linting/typing in CI.** `ruff`/`mypy` run but do not gate merges yet (they could not be baselined on the offline build host); the test suite is the gate. Tracked to become required.

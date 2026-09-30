@@ -168,6 +168,14 @@ class DetectionEngine:
             risk_score = min(1.0, 0.50 * behavior_score + 0.35 * rule_score + 0.15 * context_score)
             fusion_formula = "min(1, 0.50 * behavior_score + 0.35 * rule_score + 0.15 * context_score)"
 
+        # Every fused score the detector reports is rounded to 4 decimal places.
+        # This is an invariant, not cosmetics: _provenance_hash (below) folds these
+        # score fields into the finding's identity, so an unrounded float would let
+        # a sub-ulp difference between runs or platforms produce a different hash
+        # for the same finding and defeat deduplication. Rounding also keeps the
+        # stored number identical to the .4f figures in `explanation`. The per-rule
+        # scores nested under "rules" are passed through unrounded on purpose: each
+        # is that rule's own reported value, not the detector's to restate.
         evidence = [
             {
                 "signal": "behavior_anomaly",
