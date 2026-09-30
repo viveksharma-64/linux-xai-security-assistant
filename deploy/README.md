@@ -111,8 +111,12 @@ curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/metrics
 ```
 
 The API binds loopback by default; terminate TLS at a reverse proxy in front of it.
-Binding a non-loopback address requires setting `ALLOW_NON_LOOPBACK_API=1`
-explicitly, so it cannot happen by accident.
+The packaged entry point (`linux-xai-api`, i.e. `api/__main__.py`, which is what
+both the unit and the commands above run) refuses to start on a non-loopback
+address unless `ALLOW_NON_LOOPBACK_API=1` is set, and refuses outright to serve a
+non-loopback address without authentication. Those are entry-point checks, not
+properties of the ASGI app: invoking `uvicorn api.app:app --host 0.0.0.0`
+directly bypasses both. Run the service through its console script.
 
 See `docs/THREAT_MODEL.md` for the security rationale behind these choices and
 `docs/PHASE_B_RESULTS.md` for measured throughput/latency and the soak result.

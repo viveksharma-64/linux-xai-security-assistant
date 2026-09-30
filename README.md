@@ -22,8 +22,8 @@ Each clause maps to code, and the honest gaps are marked rather than hidden:
 | Requirement clause | Where it lives | Status |
 |---|---|---|
 | Learn normal system behavior | `baseline/` behavioral baseline (ML present but inactive) | Implemented |
-| Detect security threats in real time | `detection/` fusion over streaming collectors (6 of 7 sources stream) | Implemented |
-| Detect system failures in real time | `detection/system_failure.py` windowed scoring of `system_health`/`service_state` | **Implemented** (detection only) |
+| Detect security threats in real time | `detection/` fusion over streaming collectors (6 of the 7 collectors stream; security findings are driven by `process_exec` — see below) | Implemented |
+| Detect system failures in real time | `detection/system_failure.py` windowed scoring of the supervised `system_health`/`service_state` collectors | **Implemented** (detection only) |
 | Explain why anomalies are detected | `explainability/` evidence + advisory `assistant/` | Implemented |
 | Recommend or perform corrective actions | `assistant/` advises and `policy/` emits fail-closed dry-run decisions | **Recommend only** — performing actions is deliberately not built |
 
@@ -84,6 +84,26 @@ The canonical `Event` contract in `pipeline/event_stream.py` is the central
 boundary. Collectors do not write directly to SQLite, and downstream modules
 do not depend on a collector-specific event model.
 
+### What each event type actually drives
+
+Collection, storage, and detection are three different things here, and the
+distinction is deliberate rather than an oversight:
+
+| Event type | Stored, retained, served | Drives a finding |
+|---|---|---|
+| `process_exec` | yes | **yes** — the behavioural baseline, every rule in `detection/rules_catalog.yaml`, and context scoring all read process executions and nothing else |
+| `system_health`, `service_state` | yes | **yes** — `detection/system_failure.py` only |
+| `tcp_connect`, `ipc_event`, `file_open`, `file_write`, `auth_session` | yes | **no** — no risk, rule, or finding consumes them today |
+
+The second group is collected because evidence an analyst cannot retrieve is
+not evidence: it is persisted, retained, surfaced by `/api/events` and the
+dashboard, and available for investigation around a finding. Its only
+programmatic consumer is `ml/feature_schema.py`, which is part of the
+**inactive** ML path. `detection/detector.py` filters to `process_exec`
+explicitly before any rule sees an event, so a non-exec event cannot
+accidentally satisfy a rule written for executions. Broadening deterministic
+detection to those types is future work, not a claim being made now.
+
 ## Safety principles
 
 - Collectors are observation-only.
@@ -92,8 +112,10 @@ do not depend on a collector-specific event model.
   dry-run decisions.
 - The API is read-only, authenticated on by default, and fails closed: with
   authentication required but no token configured it returns `503` rather than
-  serve the evidence feed unauthenticated. It binds loopback unless
-  `ALLOW_NON_LOOPBACK_API=1` is set explicitly.
+  serve the evidence feed unauthenticated. Its packaged entry point binds
+  loopback unless `ALLOW_NON_LOOPBACK_API=1` is set explicitly (a startup guard
+  in `api/__main__.py`, not a property of the ASGI app — running `uvicorn` by
+  hand bypasses it).
 - No automatic termination, freezing, blocking, firewall changes, or account
   changes are implemented.
 - ML failure falls back to deterministic detection; it cannot break the
