@@ -267,6 +267,7 @@ class DetectionEngine:
                 end = float(finding["window_end"])
                 if prev_end is None or start > prev_end:  # a window gap starts a new run
                     run_anchor = start
+                assert run_anchor is not None
                 finding["correlation_id"] = self._correlation_id(entity_type, entity_key, run_anchor)
                 prev_end = end if prev_end is None else max(prev_end, end)
 

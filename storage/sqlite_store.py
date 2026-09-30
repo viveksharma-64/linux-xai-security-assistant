@@ -499,7 +499,7 @@ class SQLiteEventStore(EventStore):
         try:
             timestamp = float(event.timestamp)
         except (TypeError, ValueError):
-            raise ValueError("event timestamp must be numeric")
+            raise ValueError("event timestamp must be numeric") from None
 
         if event.event_type is None or event.event_type.value is None:
             raise ValueError("event_type is required")
@@ -628,6 +628,7 @@ class SQLiteEventStore(EventStore):
                 "INSERT INTO ml_training_windows (dataset_id, window_start, window_end, event_ids_json, features_json, schema_version, schema_hash, collector_context_json, verified_normal, verification_json, immutable_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (window["dataset_id"], float(window["window_start"]), float(window["window_end"]), json.dumps(window["event_ids"], sort_keys=True), json.dumps(window["features"], sort_keys=True), window["schema_version"], window["schema_hash"], json.dumps(window["collector_context"], sort_keys=True), 1, json.dumps(window["verification"], sort_keys=True), immutable_hash, float(window["created_at"])),
             )
+            assert cursor.lastrowid is not None
             return int(cursor.lastrowid)
 
     def read_ml_training_windows(self, dataset_id: str) -> List[Dict[str, Any]]:
@@ -783,6 +784,7 @@ class SQLiteEventStore(EventStore):
             (str(model_id), from_state, to_state, reason,
              json.dumps(evidence, sort_keys=True), int(bool(activation_eligible)), actor, created_at),
         )
+        assert cursor.lastrowid is not None
         row_id = int(cursor.lastrowid)
         self._extend_chain(conn, "ml_model_lifecycle", ML_LIFECYCLE_CHAIN_COLUMNS, row_id)
         return row_id
@@ -842,6 +844,7 @@ class SQLiteEventStore(EventStore):
                      json.dumps(assessment["reasons"], sort_keys=True),
                      actor, float(assessment["created_at"])),
                 )
+                assert cursor.lastrowid is not None
                 assessment_id = int(cursor.lastrowid)
                 stored = dict(
                     conn.execute(
@@ -1141,6 +1144,7 @@ class SQLiteEventStore(EventStore):
                         finding.get("created_at"),
                     ),
                 )
+                assert cursor.lastrowid is not None
                 finding_id = int(cursor.lastrowid)
                 self._extend_chain(
                     conn, "detection_findings", FINDING_CHAIN_COLUMNS, finding_id
@@ -1283,6 +1287,7 @@ class SQLiteEventStore(EventStore):
                         decision.get("advisory_rejection"),
                     ),
                 )
+                assert cursor.lastrowid is not None
                 decision_id = int(cursor.lastrowid)
                 self._extend_chain(
                     conn, "policy_decisions", POLICY_CHAIN_COLUMNS, decision_id
@@ -1383,6 +1388,7 @@ class SQLiteEventStore(EventStore):
                     """,
                     (int(finding_id), action, disposition, note, actor, created_at),
                 )
+                assert cursor.lastrowid is not None
                 annotation_id = int(cursor.lastrowid)
                 self._extend_chain(
                     conn, "triage_annotations", TRIAGE_CHAIN_COLUMNS, annotation_id
@@ -1691,8 +1697,7 @@ class SQLiteEventStore(EventStore):
                 rows = conn.execute(sql, page_values).fetchall()
             if not rows:
                 return
-            for row in rows:
-                yield row
+            yield from rows
             cursor_timestamp = rows[-1]["timestamp"]
             cursor_id = rows[-1]["id"]
             if len(rows) < page_size:
@@ -1836,6 +1841,7 @@ class SQLiteEventStore(EventStore):
                     float(record.get("created_at", time.time())),
                 ),
             )
+            assert cursor.lastrowid is not None
             return int(cursor.lastrowid)
 
     def read_maintenance_records(self, limit: int = 100) -> List[Dict[str, Any]]:

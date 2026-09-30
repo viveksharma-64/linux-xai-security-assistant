@@ -30,7 +30,7 @@ class BehavioralBaseline:
         return [event for event in events if event and event.event_type == EventType.PROCESS_EXEC]
 
     def _window_counts(self, events: Sequence[Event], bucket_seconds: int = 60) -> Counter:
-        bucketed = Counter()
+        bucketed: Counter[int] = Counter()
         for event in events:
             if event.timestamp is None:
                 continue
@@ -174,14 +174,12 @@ class BehavioralBaseline:
             baseline_summary = self.feature_summary(normalized_events)
         current_summary = self.feature_summary(normalized_events)
 
-        scored = []
+        scored: List[Dict[str, Any]] = []
         exec_events = self._extract_exec_events(normalized_events)
         if not exec_events:
             return scored
 
         total_execs = float(baseline_summary.get("total_execs", 1) or 1)
-        avg_window_count = float(baseline_summary.get("avg_window_count", 1) or 1)
-        peak_window_count = float(baseline_summary.get("peak_window_count", 1) or 1)
 
         for event in exec_events:
             feature_vector = self._event_feature_vector(event, baseline_summary, current_summary)

@@ -70,7 +70,9 @@ def extract_features(events: Sequence[Event]) -> dict[str, float]:
     """Return the complete ordered named feature mapping for one event window."""
     ordered = sorted(events, key=lambda event: (float(event.timestamp), event.event_type.value, event.pid or -1))
     timestamps = [float(event.timestamp) for event in ordered if math.isfinite(float(event.timestamp))]
-    intervals = [right - left for left, right in zip(timestamps, timestamps[1:])]
+    # zip stops at the shorter operand by design: timestamps[1:] is one element
+    # shorter than timestamps, pairing each adjacent (left, right), so strict stays False.
+    intervals = [right - left for left, right in zip(timestamps, timestamps[1:], strict=False)]
     span = max(timestamps) - min(timestamps) if len(timestamps) >= 2 else 0.0
     mean_interval = sum(intervals) / len(intervals) if intervals else 0.0
     variance = sum((value - mean_interval) ** 2 for value in intervals) / len(intervals) if intervals else 0.0

@@ -209,7 +209,7 @@ def _benign_clean_window(name: str, base_ts: int, rng: random.Random, pid: _Pid)
     count = rng.randint(8, 24)
     seconds = _spread_seconds(count)
     events = []
-    for offset, second in zip(range(count), seconds):
+    for second in seconds:
         comm = rng.choice(_BENIGN_COMMANDS)
         events.append(
             _exec(base_ts + second, comm, uid=1000, gid=1000, ppid=1000, pid=pid.next())

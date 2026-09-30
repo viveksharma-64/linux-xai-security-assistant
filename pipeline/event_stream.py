@@ -152,7 +152,7 @@ class Event:
     ancestry: Optional[list] = None
 
     # Event-specific payload
-    payload: Dict[str, Any] = None  # Event-specific data
+    payload: Dict[str, Any] = field(default_factory=dict)  # Event-specific data
 
     # Metadata
     source: str = "telemetry_bcc"  # Origin (BCC, auditd, etc.)
@@ -186,7 +186,7 @@ class Event:
         return json.dumps(data)
 
     @classmethod
-    def from_raw_json(cls, raw_json: dict) -> "Event":
+    def from_raw_json(cls, raw_json: dict) -> "Event | None":
         """
         Factory method: parse raw collector JSON into a canonical Event.
 
@@ -455,11 +455,11 @@ class CanonicalNormalizer(EventNormalizer):
                 try:
                     uid = int(uid)
                 except (TypeError, ValueError):
-                    raise ValueError("uid must be numeric")
+                    raise ValueError("uid must be numeric") from None
             record["uid"] = uid
 
-            for field in ("pid", "ppid", "gid"):
-                record[field] = _coerce_int(record.get(field))
+            for key in ("pid", "ppid", "gid"):
+                record[key] = _coerce_int(record.get(key))
             parent_comm = record.get("parent_comm")
             record["parent_comm"] = parent_comm if isinstance(parent_comm, str) else None
             ancestry = record.get("ancestry", [])
@@ -495,13 +495,13 @@ class CanonicalNormalizer(EventNormalizer):
         timestamp, and inventing one from the wall clock would just launder an
         adjustable clock into a field that promises not to be.
         """
-        for field, value in (
+        for key, value in (
             ("host_id", identity.host_id()),
             ("boot_id", identity.boot_id()),
             ("agent_id", identity.agent_id()),
         ):
-            if record.get(field) is None:
-                record[field] = value
+            if record.get(key) is None:
+                record[key] = value
         if record.get("timestamp_monotonic") is None:
             record["timestamp_monotonic"] = time.monotonic()
 
