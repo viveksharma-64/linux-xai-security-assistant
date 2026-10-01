@@ -25,11 +25,11 @@ only measures.
 """
 
 import math
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from ml.scoring import MLScorer
 from pipeline.event_stream import Event
-
 
 MAX_NORMAL_FPR = 0.05
 MIN_NORMAL_HOLDOUT_WINDOWS = 60

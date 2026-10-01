@@ -92,8 +92,9 @@ import tempfile
 import threading
 import time
 from collections import deque
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional, Sequence, Tuple
+from typing import Any
 
 # journald cursors look like "s=<hex>;i=<hex>;b=<hex>;m=<hex>;t=<hex>;x=<hex>".
 # Validated rather than trusted: the value comes off disk, is passed to a
@@ -158,7 +159,7 @@ class CursorStore:
     def __init__(self, path: os.PathLike | str):
         self.path = Path(path)
 
-    def load(self) -> Optional[str]:
+    def load(self) -> str | None:
         """Return the stored cursor, or None if absent, unreadable, or corrupt."""
         try:
             raw = self.path.read_text(encoding="utf-8").strip()
@@ -222,7 +223,7 @@ class StaleCursorError(JournalReadError):
 
 def build_command(
     journalctl_command: Sequence[str],
-    cursor: Optional[str],
+    cursor: str | None,
     since: str,
     follow: bool,
 ) -> list[str]:
@@ -261,9 +262,9 @@ class JournalStream:
         stderr_lines: int = 20,
     ):
         self.journalctl_command = tuple(journalctl_command)
-        self.process: Optional[subprocess.Popen] = None
+        self.process: subprocess.Popen | None = None
         self._stderr_lines: deque[str] = deque(maxlen=stderr_lines)
-        self._stderr_thread: Optional[threading.Thread] = None
+        self._stderr_thread: threading.Thread | None = None
         self._stop = threading.Event()
 
     @property
@@ -279,7 +280,7 @@ class JournalStream:
         self,
         cursor: str,
         timeout: float = CURSOR_PROBE_TIMEOUT_SECONDS,
-    ) -> Tuple[str, str]:
+    ) -> tuple[str, str]:
         """
         Decide whether a stored cursor can be resumed from. Returns (verdict, detail).
 
@@ -319,10 +320,10 @@ class JournalStream:
 
     def read(
         self,
-        cursor: Optional[str] = None,
+        cursor: str | None = None,
         since: str = DEFAULT_SINCE,
         follow: bool = True,
-    ) -> Iterator[Tuple[dict, Optional[str]]]:
+    ) -> Iterator[tuple[dict, str | None]]:
         command = build_command(self.journalctl_command, cursor, since, follow)
         self._stderr_lines.clear()
         try:
@@ -358,7 +359,7 @@ class JournalStream:
         finally:
             self._reap()
 
-    def _finish(self, cursor: Optional[str]) -> None:
+    def _finish(self, cursor: str | None) -> None:
         """Classify the child's exit once stdout is exhausted."""
         process = self.process
         if process is None:
@@ -430,9 +431,9 @@ class JournalCollector:
     def __init__(
         self,
         name: str,
-        normalize: Callable[[dict], Optional[dict]],
+        normalize: Callable[[dict], dict | None],
         cursor_store: CursorStore,
-        stream: Optional[JournalStream] = None,
+        stream: JournalStream | None = None,
         output=None,
         checkpoint_interval_seconds: float = DEFAULT_CHECKPOINT_INTERVAL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
@@ -450,9 +451,9 @@ class JournalCollector:
         self.record_count = 0
         self.checkpoint_count = 0
         self.discarded_cursor_count = 0
-        self._pending_cursor: Optional[str] = None
-        self._saved_cursor: Optional[str] = None
-        self._last_checkpoint: Optional[float] = None
+        self._pending_cursor: str | None = None
+        self._saved_cursor: str | None = None
+        self._last_checkpoint: float | None = None
 
     @property
     def output(self):
@@ -523,7 +524,7 @@ class JournalCollector:
         )
         return 1
 
-    def _resolve_or_discard(self, cursor: str, since: str) -> Optional[str]:
+    def _resolve_or_discard(self, cursor: str, since: str) -> str | None:
         """
         Return the cursor if the journal can resume from it, otherwise None.
 
@@ -548,7 +549,7 @@ class JournalCollector:
         )
         return None
 
-    def _consume(self, cursor: Optional[str], since: str, follow: bool) -> None:
+    def _consume(self, cursor: str | None, since: str, follow: bool) -> None:
         for record, entry_cursor in self.stream.read(cursor=cursor, since=since, follow=follow):
             self.record_count += 1
             event = None
@@ -679,7 +680,7 @@ def add_stream_arguments(parser, default_since: str = DEFAULT_SINCE) -> None:
 
 def run_collector(
     name: str,
-    normalize: Callable[[dict], Optional[dict]],
+    normalize: Callable[[dict], dict | None],
     args,
 ) -> int:
     """Build a collector from parsed arguments and run it to completion."""

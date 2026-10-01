@@ -41,8 +41,8 @@ import logging
 import os
 import secrets
 import stat
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Set
 
 from observability.config import Settings
 
@@ -62,7 +62,7 @@ def _digest(token: str) -> bytes:
     return hashlib.sha256(token.encode("utf-8")).digest()
 
 
-def _read_token_file(path: Path) -> List[str]:
+def _read_token_file(path: Path) -> list[str]:
     """
     Read one token per line, ignoring blanks and `#` comments.
 
@@ -105,11 +105,11 @@ class TokenAuthenticator:
 
     def __init__(self, settings: Settings):
         self.required = settings.api_require_auth
-        self._digests: Set[bytes] = set()
-        self._sources: List[str] = []
+        self._digests: set[bytes] = set()
+        self._sources: list[str] = []
 
         inline = settings.api_tokens or ""
-        candidates: List[str] = [part.strip() for part in inline.split(",") if part.strip()]
+        candidates: list[str] = [part.strip() for part in inline.split(",") if part.strip()]
         if candidates:
             self._sources.append("api_tokens")
         if settings.api_token_file:
@@ -149,7 +149,7 @@ class TokenAuthenticator:
     def sources(self) -> Sequence[str]:
         return tuple(self._sources)
 
-    def verify(self, presented: Optional[str]) -> bool:
+    def verify(self, presented: str | None) -> bool:
         """
         Whether a presented credential is accepted.
 
@@ -169,7 +169,7 @@ class TokenAuthenticator:
         return matched
 
 
-def extract_token(authorization: Optional[str], api_key: Optional[str]) -> Optional[str]:
+def extract_token(authorization: str | None, api_key: str | None) -> str | None:
     """
     Pull the credential out of `Authorization: Bearer ...` or `X-API-Key`.
 

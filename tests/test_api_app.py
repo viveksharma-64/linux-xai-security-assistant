@@ -1,19 +1,17 @@
-from pathlib import Path
-
 import time
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from api.app import create_app
-from ml.feature_schema import SCHEMA_VERSION, schema_hash
-from detection.detector import DetectionEngine
 from assistant.service import AssistantService
+from detection.detector import DetectionEngine
 from explainability.explainer import FindingExplainer
+from ml.feature_schema import SCHEMA_VERSION, schema_hash
 from observability.config import Settings
 from pipeline.event_stream import Event
 from policy.engine import PolicyEngine
 from storage.sqlite_store import SQLiteEventStore
-
 
 ROOT = Path(__file__).parents[1]
 DEFAULT_POLICY = ROOT / "policy" / "default_policy.yaml"

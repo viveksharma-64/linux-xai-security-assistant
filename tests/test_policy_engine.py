@@ -5,7 +5,6 @@ import pytest
 from policy.engine import PolicyConfigurationError, PolicyDecision, PolicyEngine
 from storage.sqlite_store import SQLiteEventStore
 
-
 ROOT = Path(__file__).parents[1]
 DEFAULT_POLICY = ROOT / "policy" / "default_policy.yaml"
 

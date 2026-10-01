@@ -43,9 +43,10 @@ import os
 import tempfile
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any
 
 LOGGER = logging.getLogger(__name__)
 
@@ -99,7 +100,7 @@ class BatchQuarantine:
         except OSError:
             return 0
 
-    def _existing(self) -> List[Path]:
+    def _existing(self) -> list[Path]:
         if not self.directory.is_dir():
             return []
         return sorted(
@@ -108,7 +109,7 @@ class BatchQuarantine:
             if path.is_file() and path.name.startswith(FILENAME_PREFIX) and path.name.endswith(FILENAME_SUFFIX)
         )
 
-    def store(self, events: Sequence[Any], reason: str, source: Optional[str] = None) -> bool:
+    def store(self, events: Sequence[Any], reason: str, source: str | None = None) -> bool:
         """
         Write one batch aside. Returns False when the cap refused it.
 
@@ -149,7 +150,7 @@ class BatchQuarantine:
                 return False
         return True
 
-    def _write_atomically(self, document: Dict[str, Any]) -> Path:
+    def _write_atomically(self, document: dict[str, Any]) -> Path:
         """
         Write via a temporary file and rename.
 
@@ -176,16 +177,16 @@ class BatchQuarantine:
             temp_path.unlink(missing_ok=True)
             raise
 
-    def load(self, path: Path) -> Dict[str, Any]:
+    def load(self, path: Path) -> dict[str, Any]:
         with path.open("r", encoding="utf-8") as stream:
             return json.load(stream)
 
-    def batches(self) -> List[Path]:
+    def batches(self) -> list[Path]:
         """Quarantined batch files, oldest first."""
         return self._existing()
 
     @staticmethod
-    def _encode(event: Any) -> Dict[str, Any]:
+    def _encode(event: Any) -> dict[str, Any]:
         """
         Render one event as a plain JSON-ready dict.
 

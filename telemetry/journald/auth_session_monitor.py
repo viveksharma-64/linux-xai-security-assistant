@@ -5,7 +5,8 @@ import argparse
 import json
 import re
 import subprocess
-from typing import Any, Iterable, Iterator, Optional
+from collections.abc import Iterable, Iterator
+from typing import Any
 
 # Importable both as a package module and as a sibling file: this collector is
 # run as `python3 telemetry/journald/auth_session_monitor.py`, where the
@@ -26,14 +27,14 @@ _PAM_SESSION = re.compile(
 _PAM_FAILURE = re.compile(r"pam_[^(]+\((?P<service>[^:()]+):auth\): authentication failure", re.IGNORECASE)
 
 
-def _integer(value: Any) -> Optional[int]:
+def _integer(value: Any) -> int | None:
     try:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
 
 
-def normalize_journal_record(record: dict[str, Any]) -> Optional[dict[str, Any]]:
+def normalize_journal_record(record: dict[str, Any]) -> dict[str, Any] | None:
     """Map a recognized PAM record to canonical raw JSON without inventing fields."""
     message = record.get("MESSAGE")
     if not isinstance(message, str):

@@ -45,7 +45,8 @@ a new model and putting it through the same gate.
 """
 
 import time
-from typing import Any, Dict, List, Mapping, Optional
+from collections.abc import Mapping
+from typing import Any
 
 from ml.evaluation import normal_fpr_acceptance
 from storage.sqlite_store import SQLiteEventStore
@@ -64,8 +65,8 @@ def record_trained(
     store: SQLiteEventStore,
     metadata: Mapping[str, Any],
     *,
-    actor: Optional[str] = None,
-) -> Dict[str, Any]:
+    actor: str | None = None,
+) -> dict[str, Any]:
     """
     Open a model's history with what it was trained on and what artifact it produced.
 
@@ -95,8 +96,8 @@ def record_evaluated(
     model_id: str,
     report: Mapping[str, Any],
     *,
-    actor: Optional[str] = None,
-) -> Dict[str, Any]:
+    actor: str | None = None,
+) -> dict[str, Any]:
     """
     Record that a model was evaluated, without recording a verdict.
 
@@ -127,8 +128,8 @@ def record_activation_gate(
     *,
     false_positive_count: int,
     normal_window_count: int,
-    actor: Optional[str] = None,
-) -> Dict[str, Any]:
+    actor: str | None = None,
+) -> dict[str, Any]:
     """
     Put the counts through the activation gate and record the verdict it returns.
 
@@ -168,8 +169,8 @@ def record_activation(
     *,
     false_positive_count: int,
     normal_window_count: int,
-    actor: Optional[str] = None,
-) -> Dict[str, Any]:
+    actor: str | None = None,
+) -> dict[str, Any]:
     """
     Record that a model became active, refusing unless the gate says it may.
 
@@ -208,8 +209,8 @@ def record_drift_assessment(
     store: SQLiteEventStore,
     assessment: Mapping[str, Any],
     *,
-    actor: Optional[str] = None,
-) -> Dict[str, Any]:
+    actor: str | None = None,
+) -> dict[str, Any]:
     """
     Append a drift assessment, plus a `retraining_required` row when it found drift.
 
@@ -259,9 +260,9 @@ def record_drifted(
     model_id: str,
     *,
     reason: str,
-    evidence: Optional[Mapping[str, Any]] = None,
-    actor: Optional[str] = None,
-) -> Dict[str, Any]:
+    evidence: Mapping[str, Any] | None = None,
+    actor: str | None = None,
+) -> dict[str, Any]:
     """
     Record an operator's judgment that a model is no longer fit for its host.
 
@@ -278,9 +279,9 @@ def record_retired(
     model_id: str,
     *,
     reason: str,
-    evidence: Optional[Mapping[str, Any]] = None,
-    actor: Optional[str] = None,
-) -> Dict[str, Any]:
+    evidence: Mapping[str, Any] | None = None,
+    actor: str | None = None,
+) -> dict[str, Any]:
     """
     Close a model's history.
 
@@ -294,7 +295,7 @@ def record_retired(
     )
 
 
-def current_state(store: SQLiteEventStore, model_id: str) -> Optional[Dict[str, Any]]:
+def current_state(store: SQLiteEventStore, model_id: str) -> dict[str, Any] | None:
     """
     The latest lifecycle row for one model, or None if it has no history.
 
@@ -307,7 +308,7 @@ def current_state(store: SQLiteEventStore, model_id: str) -> Optional[Dict[str, 
     return history[-1] if history else None
 
 
-def lifecycle_report(store: SQLiteEventStore, model_id: str) -> Dict[str, Any]:
+def lifecycle_report(store: SQLiteEventStore, model_id: str) -> dict[str, Any]:
     """
     One model's history plus the chain verification that says whether to trust it.
 
@@ -329,7 +330,7 @@ def lifecycle_report(store: SQLiteEventStore, model_id: str) -> Dict[str, Any]:
     }
 
 
-def eligible_model_ids(store: SQLiteEventStore, limit: int = 500) -> List[str]:
+def eligible_model_ids(store: SQLiteEventStore, limit: int = 500) -> list[str]:
     """
     Model ids whose latest gate row granted eligibility, in the order granted.
 
@@ -337,7 +338,7 @@ def eligible_model_ids(store: SQLiteEventStore, limit: int = 500) -> List[str]:
     ever pass the gate" without hand-reading the chain -- on a default install
     the honest answer is an empty list, and that is the expected answer.
     """
-    granted: List[str] = []
+    granted: list[str] = []
     for row in store.read_ml_lifecycle(limit=limit):
         if row["to_state"] == "eligible" and row["activation_eligible"] and row["model_id"] not in granted:
             granted.append(row["model_id"])

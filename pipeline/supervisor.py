@@ -50,10 +50,12 @@ import logging
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from typing import Any
 
-from observability.config import Settings, settings as load_process_settings
+from observability.config import Settings
+from observability.config import settings as load_process_settings
 from pipeline.event_stream import Event
 from pipeline.live_ingestion import CollectorHealth, LiveIngestionService, RawInput
 from pipeline.quarantine import BatchQuarantine
@@ -96,23 +98,23 @@ class SourceState:
 
     name: str
     status: str = STATUS_STARTING
-    detail: Optional[str] = None
-    error: Optional[str] = None
-    started_at: Optional[float] = None
-    stopped_at: Optional[float] = None
-    last_event_timestamp: Optional[float] = None
+    detail: str | None = None
+    error: str | None = None
+    started_at: float | None = None
+    stopped_at: float | None = None
+    last_event_timestamp: float | None = None
     processed_count: int = 0
     restart_count: int = 0
     consecutive_failures: int = 0
-    last_failure_at: Optional[float] = None
-    next_restart_at: Optional[float] = None
+    last_failure_at: float | None = None
+    next_restart_at: float | None = None
     backoff_seconds: float = 0.0
     crash_looping: bool = False
     quarantined_batch_count: int = 0
     quarantined_event_count: int = 0
-    updated_at: Optional[float] = None
+    updated_at: float | None = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         state = {key: value for key, value in self.__dict__.items() if key != "name"}
         state["crash_looping"] = bool(self.crash_looping)
         return state
@@ -191,9 +193,9 @@ class SourceSupervisor:
         source: SupervisedSource,
         store: SQLiteEventStore,
         config: Settings,
-        service_factory: Optional[Callable[[SupervisedSource], LiveIngestionService]] = None,
-        quarantine: Optional[BatchQuarantine] = None,
-        analysis_pipeline: Optional[Callable[[List[Event]], None]] = None,
+        service_factory: Callable[[SupervisedSource], LiveIngestionService] | None = None,
+        quarantine: BatchQuarantine | None = None,
+        analysis_pipeline: Callable[[list[Event]], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
     ):
@@ -210,10 +212,10 @@ class SourceSupervisor:
         self.policy = RestartPolicy(config, clock=clock)
         self.state = SourceState(name=source.name)
         self._service_factory = service_factory or self._default_service_factory
-        self._service: Optional[LiveIngestionService] = None
+        self._service: LiveIngestionService | None = None
         self._service_lock = threading.Lock()
         self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._state_lock = threading.Lock()
 
     # ------------------------------------------------------------------ control
@@ -241,7 +243,7 @@ class SourceSupervisor:
         if service is not None:
             service.stop()
 
-    def join(self, timeout: Optional[float] = None) -> None:
+    def join(self, timeout: float | None = None) -> None:
         if self._thread is not None:
             self._thread.join(timeout)
 
@@ -315,7 +317,7 @@ class SourceSupervisor:
                 break
         return self.snapshot()
 
-    def _run_once(self) -> tuple[Optional[CollectorHealth], Optional[str]]:
+    def _run_once(self) -> tuple[CollectorHealth | None, str | None]:
         """
         One collector lifetime. Returns (health, failure description or None).
 
@@ -364,7 +366,7 @@ class SourceSupervisor:
 
     # -------------------------------------------------------------------- state
 
-    def _absorb_health(self, health: Optional[CollectorHealth]) -> None:
+    def _absorb_health(self, health: CollectorHealth | None) -> None:
         if health is None:
             return
         with self._state_lock:
@@ -430,10 +432,10 @@ class CollectorSupervisor:
     def __init__(
         self,
         store: SQLiteEventStore,
-        sources: List[SupervisedSource],
-        config: Optional[Settings] = None,
-        service_factory: Optional[Callable[[SupervisedSource], LiveIngestionService]] = None,
-        analysis_pipeline: Optional[Callable[[List[Event]], None]] = None,
+        sources: list[SupervisedSource],
+        config: Settings | None = None,
+        service_factory: Callable[[SupervisedSource], LiveIngestionService] | None = None,
+        analysis_pipeline: Callable[[list[Event]], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
     ):
@@ -474,16 +476,16 @@ class CollectorSupervisor:
         for supervisor in self.supervisors:
             supervisor.stop()
 
-    def join(self, timeout: Optional[float] = None) -> None:
+    def join(self, timeout: float | None = None) -> None:
         for supervisor in self.supervisors:
             supervisor.join(timeout)
 
-    def run(self) -> Dict[str, SourceState]:
+    def run(self) -> dict[str, SourceState]:
         self.start()
         self.join()
         return self.states()
 
-    def states(self) -> Dict[str, SourceState]:
+    def states(self) -> dict[str, SourceState]:
         return {supervisor.source.name: supervisor.snapshot() for supervisor in self.supervisors}
 
     def healthy(self) -> bool:

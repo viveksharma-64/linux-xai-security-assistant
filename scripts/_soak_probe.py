@@ -46,7 +46,7 @@ def main(argv=None) -> int:
         os.fsync(handle.fileno())
 
     try:
-        with open(seq_path, "r", encoding="utf-8") as handle:
+        with open(seq_path, encoding="utf-8") as handle:
             seq = int(handle.read().strip() or "0")
     except (OSError, ValueError):
         seq = 0

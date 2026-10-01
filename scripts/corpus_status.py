@@ -37,7 +37,7 @@ import json
 import os
 import sqlite3
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 # Runnable as a bare script from anywhere.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -71,7 +71,7 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     return row is not None
 
 
-def collect_status(dataset_db: str) -> Dict[str, Any]:
+def collect_status(dataset_db: str) -> dict[str, Any]:
     """
     Read per-dataset verified-normal window counts, read-only.
 
@@ -88,8 +88,8 @@ def collect_status(dataset_db: str) -> Dict[str, Any]:
         conn.row_factory = sqlite3.Row
         if not (_table_exists(conn, "ml_datasets") and _table_exists(conn, "ml_training_windows")):
             # A raw capture or an empty store: no verified-normal corpus yet.
-            datasets: List[sqlite3.Row] = []
-            window_counts: Dict[str, int] = {}
+            datasets: list[sqlite3.Row] = []
+            window_counts: dict[str, int] = {}
         else:
             datasets = conn.execute(
                 "SELECT id, name, environment_json, verification_json, created_at "
@@ -105,7 +105,7 @@ def collect_status(dataset_db: str) -> Dict[str, Any]:
     finally:
         conn.close()
 
-    dataset_reports: List[Dict[str, Any]] = []
+    dataset_reports: list[dict[str, Any]] = []
     holdout_windows = 0
     training_windows = 0
     other_windows = 0
@@ -151,7 +151,7 @@ def collect_status(dataset_db: str) -> Dict[str, Any]:
     }
 
 
-def _print_human(status: Dict[str, Any]) -> None:
+def _print_human(status: dict[str, Any]) -> None:
     print(f"verified-normal corpus status: {status['dataset_db']}")
     print("")
     if status["datasets"]:
@@ -201,7 +201,7 @@ def _print_human(status: Dict[str, Any]) -> None:
     )
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Report verified-normal corpus progress toward the fixed ML activation gate (read-only).",
     )

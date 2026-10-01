@@ -21,7 +21,6 @@ Run (requires root):
 Ctrl+C to stop.
 """
 
-import ctypes as ct
 import json
 import socket
 import struct

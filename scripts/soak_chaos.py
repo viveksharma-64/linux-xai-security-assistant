@@ -44,7 +44,7 @@ PROBE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_soak_probe.py
 
 def _read_pid(pid_path: str) -> int | None:
     try:
-        with open(pid_path, "r", encoding="utf-8") as handle:
+        with open(pid_path, encoding="utf-8") as handle:
             return int(handle.read().strip())
     except (OSError, ValueError):
         return None
@@ -60,7 +60,7 @@ def _alive(pid: int) -> bool:
 
 def _distinct_emitted(emitted_path: str) -> int:
     try:
-        with open(emitted_path, "r", encoding="utf-8") as handle:
+        with open(emitted_path, encoding="utf-8") as handle:
             return len({line.strip() for line in handle if line.strip()})
     except OSError:
         return 0

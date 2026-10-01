@@ -51,10 +51,12 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
 
-from observability.config import Settings, settings as load_process_settings
+from observability.config import Settings
+from observability.config import settings as load_process_settings
 from storage.sqlite_store import SQLiteEventStore
 
 LOGGER = logging.getLogger(__name__)
@@ -76,15 +78,15 @@ class MaintenanceAction:
     reason: str
     events_deleted: int = 0
     rows_deleted: int = 0
-    cutoff_timestamp: Optional[float] = None
-    oldest_retained_timestamp: Optional[float] = None
-    db_bytes_before: Optional[int] = None
-    db_bytes_after: Optional[int] = None
+    cutoff_timestamp: float | None = None
+    oldest_retained_timestamp: float | None = None
+    db_bytes_before: int | None = None
+    db_bytes_after: int | None = None
     duration_seconds: float = 0.0
-    detail: Optional[str] = None
+    detail: str | None = None
     created_at: float = 0.0
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "action": self.action,
             "reason": self.reason,
@@ -114,7 +116,7 @@ class RetentionManager:
     def __init__(
         self,
         store: SQLiteEventStore,
-        config: Optional[Settings] = None,
+        config: Settings | None = None,
         clock: Callable[[], float] = time.time,
     ):
         self.store = store
@@ -126,7 +128,7 @@ class RetentionManager:
 
     # ------------------------------------------------------------- scheduling
 
-    def maybe_run(self, force: bool = False) -> List[Dict[str, Any]]:
+    def maybe_run(self, force: bool = False) -> list[dict[str, Any]]:
         """
         Run the policy if the interval has elapsed, otherwise do nothing.
 
@@ -142,8 +144,8 @@ class RetentionManager:
             self._last_run = now
         return self.run_once()
 
-    def run_once(self) -> List[Dict[str, Any]]:
-        actions: List[MaintenanceAction] = []
+    def run_once(self) -> list[dict[str, Any]]:
+        actions: list[MaintenanceAction] = []
         age_action = self._prune_by_age()
         if age_action is not None:
             actions.append(age_action)
@@ -157,7 +159,7 @@ class RetentionManager:
 
     # ---------------------------------------------------------------- policies
 
-    def _prune_by_age(self) -> Optional[MaintenanceAction]:
+    def _prune_by_age(self) -> MaintenanceAction | None:
         """
         Delete aged-out events and derived time-series rows, events first.
 
@@ -201,7 +203,7 @@ class RetentionManager:
         )
         return action
 
-    def _enforce_size_cap(self) -> Optional[MaintenanceAction]:
+    def _enforce_size_cap(self) -> MaintenanceAction | None:
         """
         Delete the oldest events until the database fits its byte budget.
 
@@ -280,7 +282,7 @@ class RetentionManager:
         )
         return action
 
-    def _maybe_vacuum(self, forced: bool) -> Optional[MaintenanceAction]:
+    def _maybe_vacuum(self, forced: bool) -> MaintenanceAction | None:
         interval = self.settings.retention_vacuum_interval_seconds
         now = time.monotonic()
         if not forced:
@@ -316,7 +318,7 @@ class RetentionManager:
         )
         return action
 
-    def _record(self, action: MaintenanceAction) -> Dict[str, Any]:
+    def _record(self, action: MaintenanceAction) -> dict[str, Any]:
         action.created_at = self.clock()
         payload = action.to_dict()
         try:

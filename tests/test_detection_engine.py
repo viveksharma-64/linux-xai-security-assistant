@@ -1,6 +1,6 @@
+from baseline.behavior_analyzer import BehaviorAnalyzer
 from detection.detector import DetectionEngine
 from detection.rules import load_rules
-from baseline.behavior_analyzer import BehaviorAnalyzer
 from pipeline.event_stream import Event
 from storage.sqlite_store import SQLiteEventStore
 

@@ -34,8 +34,8 @@ so an edit would silently never run.
 
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Tuple
 
 from storage.evidence_chain import FINDING_CHAIN_COLUMNS, POLICY_CHAIN_COLUMNS, next_link
 
@@ -766,7 +766,7 @@ def _apply_ml_lifecycle(conn: sqlite3.Connection) -> None:
     )
 
 
-MIGRATIONS: Tuple[Migration, ...] = (
+MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
         description="baseline schema as of the introduction of versioned migrations",

@@ -1,19 +1,18 @@
-import socket
 from types import SimpleNamespace
 
 import pytest
 
+import telemetry.bcc.network_state_probe as network_state_probe
 from pipeline.event_stream import Event, EventType
 from storage.sqlite_store import SQLiteEventStore
 from telemetry.bcc.network_state_probe import (
     AF_INET,
+    BPF_PROGRAM,
     IPPROTO_TCP,
     TCP_ESTABLISHED,
     TCP_SYN_SENT,
-    BPF_PROGRAM,
     normalize_state_event,
 )
-import telemetry.bcc.network_state_probe as network_state_probe
 
 
 def test_tracepoint_constants_match_kernel_contract():

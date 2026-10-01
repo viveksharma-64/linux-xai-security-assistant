@@ -19,7 +19,6 @@ from pipeline.event_stream import Event, EventType
 from storage.retention import RetentionManager
 from storage.sqlite_store import SQLiteEventStore
 
-
 DAY = 86400.0
 
 

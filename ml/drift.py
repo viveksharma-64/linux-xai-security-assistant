@@ -47,8 +47,9 @@ anything would be a lie of omission, so it is refused by name.
 """
 
 import time
+from collections.abc import Mapping, Sequence
 from math import comb, exp, sqrt
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any
 
 from ml.feature_schema import FEATURE_NAMES, SCHEMA_VERSION, schema_hash
 from storage.sqlite_store import SQLiteEventStore
@@ -174,7 +175,7 @@ def _asymptotic_two_sided_p(n: int, m: int, statistic: int) -> float:
     return min(1.0, max(0.0, 2.0 * total))
 
 
-def two_sample_ks(reference: Sequence[float], comparison: Sequence[float]) -> Dict[str, Any]:
+def two_sample_ks(reference: Sequence[float], comparison: Sequence[float]) -> dict[str, Any]:
     """
     Two-sided two-sample KS test, returning the statistic, p-value, and method used.
 
@@ -199,7 +200,7 @@ def two_sample_ks(reference: Sequence[float], comparison: Sequence[float]) -> Di
     }
 
 
-def holm_bonferroni(p_values: Sequence[float], alpha: float) -> List[Dict[str, Any]]:
+def holm_bonferroni(p_values: Sequence[float], alpha: float) -> list[dict[str, Any]]:
     """
     Holm-Bonferroni step-down correction over a family of p-values.
 
@@ -214,7 +215,7 @@ def holm_bonferroni(p_values: Sequence[float], alpha: float) -> List[Dict[str, A
     """
     count = len(p_values)
     order = sorted(range(count), key=lambda index: p_values[index])
-    records: List[Dict[str, Any]] = [{} for _ in range(count)]
+    records: list[dict[str, Any]] = [{} for _ in range(count)]
     still_rejecting = True
     for rank, index in enumerate(order):
         threshold = alpha / float(count - rank)
@@ -247,7 +248,7 @@ def _minimum_attainable_p(n: int, m: int) -> float:
     return 2 / comb(n + m, n)
 
 
-def _feature_columns(windows: Sequence[Mapping[str, Any]]) -> Dict[str, List[float]]:
+def _feature_columns(windows: Sequence[Mapping[str, Any]]) -> dict[str, list[float]]:
     return {
         name: [float(window["features"][name]) for window in windows]
         for name in FEATURE_NAMES
@@ -276,8 +277,8 @@ def _refusal(
     alpha: float,
     reference_count: int,
     comparison_count: int,
-    reasons: List[str],
-) -> Dict[str, Any]:
+    reasons: list[str],
+) -> dict[str, Any]:
     """An assessment that declines to conclude, with the reasons stated."""
     return {
         "model_id": model_id,
@@ -323,7 +324,7 @@ def assess_drift(
     *,
     comparison_store: Any = None,
     alpha: float = DEFAULT_ALPHA,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Compare a model's training feature distributions against a newer normal dataset.
 
@@ -347,7 +348,7 @@ def assess_drift(
     if metadata is None:
         return _refusal(model_id, comparison_dataset_id, alpha, 0, 0, ["ML model metadata was not found"])
 
-    reasons: List[str] = []
+    reasons: list[str] = []
     if metadata["schema_version"] != SCHEMA_VERSION or metadata["schema_hash"] != schema_hash():
         reasons.append("model feature schema is incompatible with this runtime")
 
@@ -386,7 +387,7 @@ def assess_drift(
     tests = [two_sample_ks(reference_columns[name], comparison_columns[name]) for name in FEATURE_NAMES]
     corrections = holm_bonferroni([test["p_value"] for test in tests], alpha)
 
-    features: List[Dict[str, Any]] = []
+    features: list[dict[str, Any]] = []
     out_of_range_total = 0
     for name, test, correction in zip(FEATURE_NAMES, tests, corrections, strict=True):
         reference_values = reference_columns[name]
@@ -477,7 +478,7 @@ def assess_drift(
     }
 
 
-def drift_summary(assessment: Mapping[str, Any]) -> Dict[str, Any]:
+def drift_summary(assessment: Mapping[str, Any]) -> dict[str, Any]:
     """The few fields an operator or API caller needs, without the per-feature detail."""
     return {
         "status": assessment["status"],

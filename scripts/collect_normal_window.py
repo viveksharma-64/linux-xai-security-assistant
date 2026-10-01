@@ -56,7 +56,7 @@ import platform
 import sqlite3
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 # Runnable as a bare script from anywhere.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -114,9 +114,9 @@ def _row_to_event(row: sqlite3.Row) -> Event:
 
 def read_source_window(
     source_path: str,
-    window_start: Optional[float],
-    window_end: Optional[float],
-) -> Tuple[List[int], List[Event]]:
+    window_start: float | None,
+    window_end: float | None,
+) -> tuple[list[int], list[Event]]:
     """
     Read (event_ids, events) from a source capture, read-only, in id order.
 
@@ -128,8 +128,8 @@ def read_source_window(
     if not os.path.exists(source_path):
         raise FileNotFoundError(f"source capture not found: {source_path}")
 
-    clauses: List[str] = []
-    params: List[Any] = []
+    clauses: list[str] = []
+    params: list[Any] = []
     if window_start is not None:
         clauses.append("timestamp >= ?")
         params.append(float(window_start))
@@ -154,7 +154,7 @@ def read_source_window(
     return event_ids, events
 
 
-def _feature_summary(events: List[Event]) -> Dict[str, Any]:
+def _feature_summary(events: list[Event]) -> dict[str, Any]:
     """A small, human-checkable digest of the window the operator is attesting."""
     features = extract_features(events)
     timestamps = [float(event.timestamp) for event in events]
@@ -171,7 +171,7 @@ def _feature_summary(events: List[Event]) -> Dict[str, Any]:
     }
 
 
-def _build_verification(args: argparse.Namespace, source_path: str) -> Dict[str, Any]:
+def _build_verification(args: argparse.Namespace, source_path: str) -> dict[str, Any]:
     """The operator attestation recorded immutably with the dataset and window."""
     return {
         "verified_normal": True,  # only reached after the --i-verified-normal gate
@@ -183,7 +183,7 @@ def _build_verification(args: argparse.Namespace, source_path: str) -> Dict[str,
     }
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Promote one reviewed normal window into a candidate verified-normal dataset.",
     )
@@ -308,7 +308,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     return 0
 
 
-def _emit(summary: Dict[str, Any], as_json: bool, header: str) -> None:
+def _emit(summary: dict[str, Any], as_json: bool, header: str) -> None:
     if as_json:
         print(json.dumps(summary, indent=2, sort_keys=True))
         return

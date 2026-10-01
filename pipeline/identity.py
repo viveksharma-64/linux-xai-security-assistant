@@ -46,7 +46,6 @@ import logging
 import os
 import uuid
 from functools import lru_cache
-from typing import Optional
 
 LOGGER = logging.getLogger(__name__)
 
@@ -67,10 +66,10 @@ _HOST_ID_LENGTH = 32
 AGENT_ID_ENV = "SECURITY_AGENT_ID"
 
 
-def _read_first_line(path: str) -> Optional[str]:
+def _read_first_line(path: str) -> str | None:
     """Return the stripped first line of a file, or None if it cannot be read."""
     try:
-        with open(path, "r", encoding="utf-8") as handle:
+        with open(path, encoding="utf-8") as handle:
             value = handle.readline().strip()
     except OSError as error:
         LOGGER.debug("identity_source_unavailable path=%s error=%s", path, error)
@@ -84,7 +83,7 @@ def _derive(raw: str) -> str:
 
 
 @lru_cache(maxsize=1)
-def host_id() -> Optional[str]:
+def host_id() -> str | None:
     """
     Stable, non-reversible identifier for this machine.
 
@@ -106,7 +105,7 @@ def host_id() -> Optional[str]:
 
 
 @lru_cache(maxsize=1)
-def boot_id() -> Optional[str]:
+def boot_id() -> str | None:
     """
     Identifier of the current kernel boot, verbatim.
 

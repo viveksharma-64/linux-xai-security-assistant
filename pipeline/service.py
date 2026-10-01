@@ -40,7 +40,8 @@ import logging
 import signal
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from collections.abc import Callable, Sequence
+from typing import Any
 
 from observability import alerts as alerting
 from observability import configure_logging, metrics
@@ -92,8 +93,8 @@ class IngestionService:
         store: SQLiteEventStore,
         sources: Sequence[SupervisedSource],
         config: Settings,
-        service_factory: Optional[Callable[[SupervisedSource], Any]] = None,
-        analysis_pipeline: Optional[Callable[[List[Event]], None]] = None,
+        service_factory: Callable[[SupervisedSource], Any] | None = None,
+        analysis_pipeline: Callable[[list[Event]], None] | None = None,
         alert_interval_seconds: float = DEFAULT_ALERT_INTERVAL_SECONDS,
     ):
         self.store = store
@@ -108,9 +109,9 @@ class IngestionService:
         self.retention = RetentionManager(store, config)
         self.alert_interval_seconds = alert_interval_seconds
         self._stop = threading.Event()
-        self._maintenance: Optional[threading.Thread] = None
+        self._maintenance: threading.Thread | None = None
         self._last_alert_check = 0.0
-        self._alert_state: List[alerting.Alert] = []
+        self._alert_state: list[alerting.Alert] = []
 
     # ------------------------------------------------------------------ control
 
@@ -132,12 +133,12 @@ class IngestionService:
         self._stop.set()
         self.supervisor.stop()
 
-    def join(self, timeout: Optional[float] = None) -> None:
+    def join(self, timeout: float | None = None) -> None:
         self.supervisor.join(timeout)
         if self._maintenance is not None:
             self._maintenance.join(timeout)
 
-    def run(self) -> Dict[str, Any]:
+    def run(self) -> dict[str, Any]:
         """
         Run until every source has stopped or been degraded, or until asked to stop.
 
@@ -162,7 +163,7 @@ class IngestionService:
             self.join(timeout=10.0)
         return self.report()
 
-    def report(self) -> Dict[str, Any]:
+    def report(self) -> dict[str, Any]:
         states = {name: state.to_dict() for name, state in self.supervisor.states().items()}
         return {
             "sources": states,
@@ -204,7 +205,7 @@ class IngestionService:
             LOGGER.info("alert_cleared alert=%s", name)
         self._alert_state = firing
 
-    def _verify_chains(self) -> Dict[str, bool]:
+    def _verify_chains(self) -> dict[str, bool]:
         """
         Recompute every append-only hash chain and report which still verify.
 
@@ -226,7 +227,7 @@ class IngestionService:
             "triage": self.store.verify_triage_chain,
             "ml_lifecycle": self.store.verify_ml_lifecycle_chain,
         }
-        status: Dict[str, bool] = {}
+        status: dict[str, bool] = {}
         for table, verify in verifiers.items():
             try:
                 status[table] = bool(verify()["ok"])
@@ -260,7 +261,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     configure_logging()
     try:

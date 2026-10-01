@@ -36,7 +36,8 @@ threshold. Benign dispositions are folded in with false positives for the rate,
 since operationally both are "this fired but should not have alarmed".
 """
 
-from typing import Any, Dict, Mapping, Optional
+from collections.abc import Mapping
+from typing import Any
 
 # The disposition vocabulary, mirrored from the triage layer
 # (`storage/sqlite_store.py:_TRIAGE_DISPOSITIONS`). `true-positive` is the only
@@ -49,7 +50,7 @@ _REVIEWED_DISPOSITIONS = ("true-positive", "false-positive", "benign")
 def compute_operational_efficacy(
     total_findings: int,
     triage_state: Mapping[int, Mapping[str, Any]],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Precision and review counts from the latest per-finding triage state.
 
@@ -82,8 +83,8 @@ def compute_operational_efficacy(
     # passing a stale total should not yield a negative unreviewed count.
     unreviewed = max(0, int(total_findings) - reviewed)
 
-    precision: Optional[float] = true_positives / reviewed if reviewed else None
-    reviewed_false_positive_rate: Optional[float] = (
+    precision: float | None = true_positives / reviewed if reviewed else None
+    reviewed_false_positive_rate: float | None = (
         false_positive_like / reviewed if reviewed else None
     )
 
@@ -115,7 +116,7 @@ def compute_operational_efficacy(
     }
 
 
-def operational_efficacy_from_store(store: Any) -> Dict[str, Any]:
+def operational_efficacy_from_store(store: Any) -> dict[str, Any]:
     """
     Convenience wrapper: read the counts this measurement needs from a store.
 

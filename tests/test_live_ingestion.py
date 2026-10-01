@@ -3,8 +3,9 @@ import sys
 import threading
 import time
 
-from api.app import create_app
 from fastapi.testclient import TestClient
+
+from api.app import create_app
 from pipeline.event_stream import CanonicalNormalizer
 from pipeline.live_ingestion import (
     LOSS_EVENT_TYPE,

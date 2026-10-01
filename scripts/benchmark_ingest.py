@@ -21,7 +21,7 @@ import os
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List
+from typing import Any
 
 # Runnable as a bare script from anywhere: put the repository root on the path so
 # the package imports resolve without a PYTHONPATH incantation.
@@ -31,7 +31,7 @@ from pipeline.event_stream import CanonicalNormalizer  # noqa: E402
 from storage.sqlite_store import SQLiteEventStore  # noqa: E402
 
 
-def _raw_event(seq: int) -> Dict[str, Any]:
+def _raw_event(seq: int) -> dict[str, Any]:
     # A process_exec event shaped like the exec probe's output. `seq` keeps the
     # content hash unique so dedupe does not silently absorb the batch and flatter
     # the write rate.
@@ -50,18 +50,18 @@ def _raw_event(seq: int) -> Dict[str, Any]:
     }
 
 
-def _percentile(sorted_values: List[float], fraction: float) -> float:
+def _percentile(sorted_values: list[float], fraction: float) -> float:
     if not sorted_values:
         return float("nan")
     index = min(len(sorted_values) - 1, int(round(fraction * (len(sorted_values) - 1))))
     return sorted_values[index]
 
 
-def run(events: int, batch_size: int, db_path: str) -> Dict[str, Any]:
+def run(events: int, batch_size: int, db_path: str) -> dict[str, Any]:
     store = SQLiteEventStore(db_path)
     normalizer = CanonicalNormalizer()
     inserted = duplicates = rejected = 0
-    batch_latencies_ms: List[float] = []
+    batch_latencies_ms: list[float] = []
     normalize_seconds = 0.0
 
     wall_start = time.perf_counter()

@@ -1,14 +1,14 @@
 import logging
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any
 
 import yaml
 
 from storage.sqlite_store import SQLiteEventStore
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ class PolicyConfigurationError(ValueError):
 class PolicyRule:
     policy_id: str
     priority: int
-    match: Dict[str, Any]
+    match: dict[str, Any]
     decision: PolicyDecision
     required_approval: bool
     proposed_action: str
@@ -138,7 +138,7 @@ class PolicyEngine:
             ))
         return cls(store, parsed, dry_run=dry_run)
 
-    def _validate_finding(self, finding: Dict[str, Any]) -> None:
+    def _validate_finding(self, finding: dict[str, Any]) -> None:
         required = {"id", "risk_score", "severity", "entity_type", "entity_key", "evidence"}
         missing = sorted(required.difference(finding))
         if missing:
@@ -149,7 +149,7 @@ class PolicyEngine:
         if not isinstance(finding["evidence"], list) or not finding["evidence"]:
             raise PolicyConfigurationError("finding evidence must be a non-empty list")
 
-    def _matched_rule_ids(self, finding: Dict[str, Any]) -> set[str]:
+    def _matched_rule_ids(self, finding: dict[str, Any]) -> set[str]:
         for item in finding["evidence"]:
             if item.get("signal") == "rule_fusion":
                 return {
@@ -159,7 +159,7 @@ class PolicyEngine:
                 }
         return set()
 
-    def _limitations(self, finding: Dict[str, Any], assistant: Optional[Dict[str, Any]]) -> List[str]:
+    def _limitations(self, finding: dict[str, Any], assistant: dict[str, Any] | None) -> list[str]:
         limitations = []
         if assistant and isinstance(assistant.get("limitations"), str):
             limitations.append(assistant["limitations"])
@@ -167,7 +167,7 @@ class PolicyEngine:
             limitations.append("TCP/network, file, and audit/auth telemetry availability is not established by this finding.")
         return limitations
 
-    def _matches(self, policy: PolicyRule, finding: Dict[str, Any], limitations: List[str]) -> bool:
+    def _matches(self, policy: PolicyRule, finding: dict[str, Any], limitations: list[str]) -> bool:
         criteria = policy.match
         severity = str(finding["severity"]).upper()
         if "severity" in criteria and severity not in {str(item).upper() for item in criteria["severity"]}:
@@ -186,7 +186,7 @@ class PolicyEngine:
             return False
         return True
 
-    def _advisory_check(self, policy: PolicyRule, assistant: Optional[Dict[str, Any]]) -> Optional[str]:
+    def _advisory_check(self, policy: PolicyRule, assistant: dict[str, Any] | None) -> str | None:
         if not assistant:
             return None
         recommendation = assistant.get("recommended_action", "")
@@ -202,11 +202,11 @@ class PolicyEngine:
 
     def evaluate(
         self,
-        finding: Dict[str, Any],
-        assistant_response: Optional[Dict[str, Any]] = None,
-        dry_run: Optional[bool] = None,
+        finding: dict[str, Any],
+        assistant_response: dict[str, Any] | None = None,
+        dry_run: bool | None = None,
         persist: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         timestamp = time.time()
         try:
             self._validate_finding(finding)
@@ -276,7 +276,7 @@ class PolicyEngine:
             self.store.write_policy_decision(result)
         return result
 
-    def evaluate_all(self, findings: Iterable[Dict[str, Any]], assistant_responses: Optional[Dict[Any, Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    def evaluate_all(self, findings: Iterable[dict[str, Any]], assistant_responses: dict[Any, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         responses = assistant_responses or {}
         return [
             self.evaluate(finding, responses.get(finding.get("id")))

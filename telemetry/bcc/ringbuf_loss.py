@@ -37,7 +37,7 @@ object and only indexes it, so it stays importable and unit-testable off-host.
 from __future__ import annotations
 
 import ctypes
-from typing import Any, Optional
+from typing import Any
 
 # The drop counter is a BPF_ARRAY of length 1; its only element lives at key 0.
 _COUNTER_KEY = ctypes.c_int(0)
@@ -71,7 +71,7 @@ class RingBufferLossReporter:
         if delta:
             self._reporter(delta)
 
-    def _read(self, bpf: Any) -> Optional[int]:
+    def _read(self, bpf: Any) -> int | None:
         try:
             leaf = bpf[self.map_name][_COUNTER_KEY]
         except Exception:

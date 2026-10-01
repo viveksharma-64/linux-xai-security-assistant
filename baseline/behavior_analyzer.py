@@ -1,6 +1,7 @@
 from collections import Counter, defaultdict
+from collections.abc import Iterable, Sequence
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any
 
 from baseline.behavioral_baseline import BehavioralBaseline
 from pipeline.event_stream import CanonicalNormalizer, Event, EventType
@@ -41,14 +42,14 @@ class BehaviorAnalyzer:
             minimum_samples=minimum_normal_execs,
             time_window_seconds=window_seconds,
         )
-        self._normal_events: List[Event] = []
-        self._baseline_summary: Optional[Dict[str, Any]] = None
+        self._normal_events: list[Event] = []
+        self._baseline_summary: dict[str, Any] | None = None
 
-    def _normalize_events(self, events: Iterable[Any]) -> List[Event]:
+    def _normalize_events(self, events: Iterable[Any]) -> list[Event]:
         normalizer = CanonicalNormalizer()
         normalized = []
         for event in events:
-            parsed: Optional[Event]
+            parsed: Event | None
             if isinstance(event, Event):
                 parsed = event
             elif isinstance(event, dict):
@@ -67,15 +68,15 @@ class BehaviorAnalyzer:
             ),
         )
 
-    def _execution_events(self, events: Sequence[Event]) -> List[Event]:
+    def _execution_events(self, events: Sequence[Event]) -> list[Event]:
         return [event for event in events if event.event_type == EventType.PROCESS_EXEC]
 
     def _window_start(self, timestamp: float) -> float:
         return float(int(timestamp // self.window_seconds) * self.window_seconds)
 
-    def aggregate_windows(self, events: Iterable[Any]) -> List[Dict[str, Any]]:
+    def aggregate_windows(self, events: Iterable[Any]) -> list[dict[str, Any]]:
         normalized = self._normalize_events(events)
-        grouped: Dict[float, List[Event]] = defaultdict(list)
+        grouped: dict[float, list[Event]] = defaultdict(list)
         for event in self._execution_events(normalized):
             grouped[self._window_start(float(event.timestamp))].append(event)
 
@@ -106,7 +107,7 @@ class BehaviorAnalyzer:
             )
         return windows
 
-    def _persist_learning_state(self, result: Dict[str, Any]) -> None:
+    def _persist_learning_state(self, result: dict[str, Any]) -> None:
         feature_summary = result.get("feature_summary", {})
         self.store.write_baseline_record(
             {
@@ -119,7 +120,7 @@ class BehaviorAnalyzer:
             }
         )
 
-    def learn_normal(self, events: Iterable[Any], verified_normal: bool = False) -> Dict[str, Any]:
+    def learn_normal(self, events: Iterable[Any], verified_normal: bool = False) -> dict[str, Any]:
         """Add explicitly verified normal events and attempt baseline promotion."""
         if not verified_normal:
             return {
@@ -154,7 +155,7 @@ class BehaviorAnalyzer:
             "minimum_required": result["minimum_required"],
         }
 
-    def _load_baseline_summary(self) -> Optional[Dict[str, Any]]:
+    def _load_baseline_summary(self) -> dict[str, Any] | None:
         if self._baseline_summary is not None:
             return self._baseline_summary
         stored = self.store.read_latest_ready_baseline()
@@ -170,7 +171,7 @@ class BehaviorAnalyzer:
             return "medium"
         return "normal"
 
-    def monitor(self, events: Iterable[Any], persist: bool = True) -> Dict[str, Any]:
+    def monitor(self, events: Iterable[Any], persist: bool = True) -> dict[str, Any]:
         """Compare current events against a READY baseline without learning from them."""
         baseline_summary = self._load_baseline_summary()
         if baseline_summary is None:
@@ -184,7 +185,7 @@ class BehaviorAnalyzer:
         risks = []
         for window in self.aggregate_windows(normalized):
             scored = self.baseline.score_events(window["events"], baseline_summary)
-            by_entity: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
+            by_entity: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
             for score in scored:
                 by_entity[("command", score["comm"] or "unknown")].append(score)
                 by_entity[("uid", str(score["uid"]) if score["uid"] is not None else "unknown")].append(score)

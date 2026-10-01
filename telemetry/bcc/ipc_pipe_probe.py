@@ -4,7 +4,7 @@
 import json
 import sys
 import time
-from typing import Any, Optional
+from typing import Any
 
 # Importable both as a package module and as a sibling file: the documented way
 # to run this collector is `python3 telemetry/bcc/ipc_pipe_probe.py`, where the
@@ -126,7 +126,7 @@ int trace_pipe_return(struct pt_regs *ctx) {
 """
 
 
-def _decode_comm(value: Any) -> Optional[str]:
+def _decode_comm(value: Any) -> str | None:
     if isinstance(value, bytes):
         value = value.split(b"\0", 1)[0].decode("utf-8", "replace")
     if not isinstance(value, str):
@@ -135,7 +135,7 @@ def _decode_comm(value: Any) -> Optional[str]:
     return value or None
 
 
-def normalize_pipe_event(event: Any, timestamp: Optional[float] = None) -> Optional[dict]:
+def normalize_pipe_event(event: Any, timestamp: float | None = None) -> dict | None:
     """Convert one pipe syscall result into the canonical IPC raw contract."""
     try:
         pid = int(event.pid)

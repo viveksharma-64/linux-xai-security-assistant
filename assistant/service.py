@@ -2,11 +2,11 @@ import json
 import logging
 import time
 import uuid
-from typing import Any, Dict, Iterable, List, Optional
+from collections.abc import Iterable
+from typing import Any
 
 from assistant.provider import LLMProvider, ProviderError, ProviderResponse
 from storage.sqlite_store import SQLiteEventStore
-
 
 LOGGER = logging.getLogger(__name__)
 OUTPUT_FIELDS = (
@@ -49,17 +49,17 @@ class AssistantService:
     evidence, limitations, and detection meaning remain controlled locally.
     """
 
-    def __init__(self, provider: Optional[LLMProvider] = None, logger: Optional[logging.Logger] = None, store: Optional[SQLiteEventStore] = None):
+    def __init__(self, provider: LLMProvider | None = None, logger: logging.Logger | None = None, store: SQLiteEventStore | None = None):
         self.provider = provider
         self.logger = logger or LOGGER
         self.store = store
 
-    def _persist_if_configured(self, response: Dict[str, Any]) -> Dict[str, Any]:
+    def _persist_if_configured(self, response: dict[str, Any]) -> dict[str, Any]:
         if self.store is not None:
             self.store.write_assistant_response(response)
         return response
 
-    def _validate_explanation(self, explanation: Dict[str, Any]) -> None:
+    def _validate_explanation(self, explanation: dict[str, Any]) -> None:
         required = {
             "finding_id",
             "severity",
@@ -84,7 +84,7 @@ class AssistantService:
         if not isinstance(explanation["contributing_factors"], list):
             raise AssistantInputError("contributing_factors must be a list")
 
-    def _prompt(self, explanation: Dict[str, Any]) -> str:
+    def _prompt(self, explanation: dict[str, Any]) -> str:
         evidence_json = json.dumps(explanation, sort_keys=True, separators=(",", ":"))
         return f"""You are an evidence-grounded Linux security analyst narrator.
 
@@ -109,7 +109,7 @@ UNTRUSTED STRUCTURED EVIDENCE BEGINS:
 UNTRUSTED STRUCTURED EVIDENCE ENDS.
 """
 
-    def _fallback(self, explanation: Dict[str, Any], provider: str, reason: str) -> Dict[str, Any]:
+    def _fallback(self, explanation: dict[str, Any], provider: str, reason: str) -> dict[str, Any]:
         factors = [
             item.get("statement", "")
             for item in explanation["contributing_factors"]
@@ -144,8 +144,8 @@ UNTRUSTED STRUCTURED EVIDENCE ENDS.
     def _validate_provider_output(
         self,
         output: Any,
-        explanation: Dict[str, Any],
-    ) -> Dict[str, Any]:
+        explanation: dict[str, Any],
+    ) -> dict[str, Any]:
         if isinstance(output, str):
             try:
                 output = json.loads(output)
@@ -171,7 +171,7 @@ UNTRUSTED STRUCTURED EVIDENCE ENDS.
         response["fallback_used"] = False
         return response
 
-    def generate(self, explanation: Dict[str, Any]) -> Dict[str, Any]:
+    def generate(self, explanation: dict[str, Any]) -> dict[str, Any]:
         """Narrate one validated detection explanation, falling back safely on failure."""
         self._validate_explanation(explanation)
         finding_id = explanation["finding_id"]
@@ -196,5 +196,5 @@ UNTRUSTED STRUCTURED EVIDENCE ENDS.
             self.logger.warning("assistant_failure provider=%s request_id=%s finding_id=%s latency_ms=%s fallback=true reason=%s", provider_name, request_id, finding_id, elapsed_ms, type(error).__name__)
             return self._persist_if_configured(self._fallback(explanation, provider_name, type(error).__name__))
 
-    def generate_all(self, explanations: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def generate_all(self, explanations: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         return [self.generate(explanation) for explanation in explanations]

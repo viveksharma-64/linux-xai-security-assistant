@@ -192,8 +192,8 @@ def test_verify_chains_reports_all_tables_verified_on_a_clean_store(store):
 
 
 def test_a_broken_chain_pages_through_the_service_loop(store, monkeypatch):
-    from pipeline import service as service_module
     from observability.metrics import MetricsSnapshot
+    from pipeline import service as service_module
 
     idle = SupervisedSource(name="idle", factory=list)
     service = IngestionService(store, [idle], fast_config(), alert_interval_seconds=0.0)

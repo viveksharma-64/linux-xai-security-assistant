@@ -28,15 +28,16 @@ control, so an unreadable level degrades rather than blocks.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field, fields
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from typing import Any
 
 # Searched in order; the first readable file wins. `/etc` is the packaged
 # location, and the environment override exists so a test or a second instance
 # on the same host can point somewhere else without touching system state.
 CONFIG_FILE_ENV = "SECURITY_CONFIG_FILE"
-DEFAULT_CONFIG_PATHS: Tuple[str, ...] = (
+DEFAULT_CONFIG_PATHS: tuple[str, ...] = (
     "/etc/linux-xai-security/config.yaml",
     "/etc/linux-xai-security/config.yml",
 )
@@ -82,7 +83,7 @@ def _as_str(raw: Any, key: str) -> str:
     return str(raw)
 
 
-def _as_optional_str(raw: Any, key: str) -> Optional[str]:
+def _as_optional_str(raw: Any, key: str) -> str | None:
     if raw is None:
         return None
     text = str(raw).strip()
@@ -114,8 +115,8 @@ class Settings:
     # Comma-separated inline tokens, and/or a file with one token per line. The
     # file is preferred for packaged installs: an environment variable is visible
     # in `/proc/<pid>/environ` and in `systemctl show`, a 0600 file is not.
-    api_tokens: Optional[str] = None
-    api_token_file: Optional[str] = None
+    api_tokens: str | None = None
+    api_token_file: str | None = None
 
     # --- telemetry freshness ----------------------------------------------
     stale_after_seconds: float = 300.0
@@ -134,7 +135,7 @@ class Settings:
     restart_healthy_runtime_seconds: float = 60.0
     crash_loop_threshold: int = 5
     crash_loop_window_seconds: float = 300.0
-    quarantine_dir: Optional[str] = None
+    quarantine_dir: str | None = None
     quarantine_max_batches: int = 128
 
     # --- retention ---------------------------------------------------------
@@ -175,7 +176,7 @@ class Settings:
     failure_crash_loop_threshold: int = 3
     failure_crash_loop_window_seconds: float = 600.0
 
-    def replace(self, **overrides: Any) -> "Settings":
+    def replace(self, **overrides: Any) -> Settings:
         merged = {f.name: getattr(self, f.name) for f in fields(self)}
         merged.update(overrides)
         return Settings(**merged)
@@ -185,7 +186,7 @@ class Settings:
 #
 # The config-file key is the field name; it is spelled out anyway so a rename in
 # Python cannot silently invalidate every deployed `/etc` file.
-_FIELD_SPECS: Dict[str, Tuple[str, str, Callable[[Any, str], Any]]] = {
+_FIELD_SPECS: dict[str, tuple[str, str, Callable[[Any, str], Any]]] = {
     "db_path": ("db_path", "SECURITY_DB_PATH", _as_str),
     "db_file_mode": ("db_file_mode", "SECURITY_DB_FILE_MODE", lambda raw, key: _as_mode(raw, key)),
     "db_enforce_mode": ("db_enforce_mode", "SECURITY_DB_ENFORCE_MODE", _as_bool),
@@ -365,7 +366,7 @@ def _validate(settings: Settings) -> Settings:
     return settings
 
 
-def config_file_path(environ: Optional[Mapping[str, str]] = None) -> Optional[Path]:
+def config_file_path(environ: Mapping[str, str] | None = None) -> Path | None:
     """
     The config file that would be read, or None when there is none.
 
@@ -388,7 +389,7 @@ def config_file_path(environ: Optional[Mapping[str, str]] = None) -> Optional[Pa
     return None
 
 
-def _read_config_file(path: Path) -> Dict[str, Any]:
+def _read_config_file(path: Path) -> dict[str, Any]:
     import yaml
 
     try:
@@ -409,8 +410,8 @@ def _read_config_file(path: Path) -> Dict[str, Any]:
 
 
 def load_settings(
-    environ: Optional[Mapping[str, str]] = None,
-    config_path: Optional[Path] = None,
+    environ: Mapping[str, str] | None = None,
+    config_path: Path | None = None,
 ) -> Settings:
     """
     Resolve defaults, then the config file, then the environment.
@@ -422,7 +423,7 @@ def load_settings(
     path = config_path if config_path is not None else config_file_path(env)
     document = _read_config_file(path) if path is not None else {}
 
-    values: Dict[str, Any] = {}
+    values: dict[str, Any] = {}
     for name, (file_key, env_key, coerce) in _FIELD_SPECS.items():
         if file_key in document:
             values[name] = coerce(document[file_key], f"{file_key} (from {path})")
@@ -433,7 +434,7 @@ def load_settings(
     return _validate(Settings(**values))
 
 
-_CACHED: Optional[Settings] = None
+_CACHED: Settings | None = None
 
 
 def settings() -> Settings:

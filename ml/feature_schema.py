@@ -4,10 +4,10 @@ import hashlib
 import json
 import math
 from collections import Counter
-from typing import Any, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
 
 from pipeline.event_stream import Event, EventType
-
 
 SCHEMA_VERSION = "canonical-window.v1"
 FEATURE_DEFINITIONS = {

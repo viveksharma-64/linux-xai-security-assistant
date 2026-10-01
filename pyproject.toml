@@ -166,6 +166,11 @@ ignore = ["E501"]
 [tool.ruff.lint.per-file-ignores]
 # Tests bind fixtures and construct objects for their side effects.
 "tests/*" = ["B011"]
+# ml/scoring.py is under a deliberate change-freeze (ML behavior is invariant); its
+# lone UP035 (typing.Sequence -> collections.abc.Sequence) is a behavior-preserving
+# import rewrite deferred until the freeze lifts. Everything else in the file is
+# still linted.
+"ml/scoring.py" = ["UP035"]
 
 [tool.mypy]
 # Advisory in CI, same reason as ruff. Scoped and lenient on purpose: this is a
