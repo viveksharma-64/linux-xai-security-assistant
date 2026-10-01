@@ -733,7 +733,7 @@ def test_native_scoring_is_bitwise_identical_to_sklearn(tmp_path):
     # Self-check: routing in full float64 must disagree somewhere on the boundary
     # rows, or they are not boundary rows and the parity above is vacuous.
     unrounded = _reference_decision(np.asarray(boundary).tolist(), export, route_float32=False)
-    differing = sum(1 for produced, want in zip(unrounded, sklearn_decisions(boundary)) if produced != want)
+    differing = sum(1 for produced, want in zip(unrounded, sklearn_decisions(boundary), strict=True) if produced != want)
     assert differing > 0, "engineered rows did not land on any routing boundary"
 
 

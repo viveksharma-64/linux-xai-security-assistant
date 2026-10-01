@@ -97,6 +97,12 @@ class SecurityRule(ABC):
             mitre=dict(self.mitre),
         )
 
+    @classmethod
+    @abstractmethod
+    def from_entry(cls, entry: Mapping[str, Any]) -> "SecurityRule":
+        """Build a configured rule instance from its catalog entry."""
+        raise NotImplementedError
+
     @abstractmethod
     def evaluate(self, context: Dict[str, Any]) -> RuleResult:
         """Evaluate one explicit rule against a detection context."""
@@ -222,7 +228,7 @@ class MultiUidActivityRule(SecurityRule):
 
 # rule_id -> implementing class. load_rules() dispatches on this; a catalog entry
 # whose rule_id is absent here is an error, not a silently ignored rule.
-_RULE_TYPES = {
+_RULE_TYPES: dict[str, type[SecurityRule]] = {
     "privileged_unusual_execution": PrivilegedUnusualExecutionRule,
     "suspicious_utility_activity": SuspiciousUtilityActivityRule,
     "execution_burst": ExecutionBurstRule,

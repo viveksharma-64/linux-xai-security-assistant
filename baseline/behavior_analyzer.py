@@ -48,6 +48,7 @@ class BehaviorAnalyzer:
         normalizer = CanonicalNormalizer()
         normalized = []
         for event in events:
+            parsed: Optional[Event]
             if isinstance(event, Event):
                 parsed = event
             elif isinstance(event, dict):

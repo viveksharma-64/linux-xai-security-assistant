@@ -5,7 +5,7 @@ from detection.rules import RuleCatalogError, load_catalog
 from storage.sqlite_store import SQLiteEventStore
 
 
-UNAVAILABLE_TELEMETRY = []
+UNAVAILABLE_TELEMETRY: List[str] = []
 
 
 # Counterfactual boundaries per rule: what observed signal had to cross which

@@ -241,7 +241,7 @@ def test_one_instance_shared_across_cpus_produces_a_process_wide_total():
     core count, which is why the collectors hold a single module-level instance.
     """
     reporter, stream, clock = _reporter(report_interval_seconds=1.0)
-    for cpu in range(8):
+    for _ in range(8):
         # Simulate bcc invoking the shared instance from each CPU's registration.
         reporter(10)
         clock.advance(1.0)

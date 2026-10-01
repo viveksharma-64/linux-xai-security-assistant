@@ -51,10 +51,10 @@ TRACEPOINT_PROBE(sched, sched_process_exec) {
     ev.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
     ev.gid = (bpf_get_current_uid_gid() >> 32) & 0xFFFFFFFF;
     bpf_get_current_comm(&ev.comm, sizeof(ev.comm));
-    
+
     void *name_ptr = (void *)args->__data_loc_filename + (args->__data_loc_filename >> 16);
     bpf_probe_read_kernel_str(&ev.filename, sizeof(ev.filename), name_ptr);
-    
+
     sched_events.perf_submit(args, &ev, sizeof(ev));
     return 0;
 }
@@ -96,7 +96,7 @@ try:
                     "mem_percent": psutil.virtual_memory().percent,
                 }), flush=True)
                 health_count = 0
-            except:
+            except Exception:
                 pass
 except KeyboardInterrupt:
     print(json.dumps({"event_type": "telemetry_shutdown", "timestamp": time.time()}), file=sys.stderr)

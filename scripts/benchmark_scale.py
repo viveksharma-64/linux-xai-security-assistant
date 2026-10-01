@@ -91,8 +91,8 @@ def _raw_event(seq: int) -> Dict[str, Any]:
         "ppid": 1,
         "uid": 1000,
         "gid": 1000,
-        "comm": "proc%d" % (seq % 512),
-        "filename": "/usr/bin/tool%d" % (seq % 512),
+        "comm": f"proc{seq % 512}",
+        "filename": f"/usr/bin/tool{seq % 512}",
         "source": "benchmark",
         "version": "1.0",
         "argv": ["tool", "--seq", str(seq)],
@@ -110,20 +110,20 @@ def _finding(seq: int) -> Dict[str, Any]:
         "window_start": EVENT_EPOCH + seq,
         "window_end": EVENT_EPOCH + seq + 300.0,
         "entity_type": "process" if seq % 2 == 0 else "network",
-        "entity_key": "entity-%d" % (seq % 1024),
+        "entity_key": f"entity-{seq % 1024}",
         "risk_score": ratio,
         "severity": _SEVERITIES[seq % 4],
         "behavior_score": ratio,
         "rule_score": (seq % 50) / 100.0,
         "context_score": (seq % 25) / 100.0,
-        "evidence": {"seq": seq, "signals": ["signal-%d" % (seq % 8)]},
-        "explanation": "synthetic scale finding %d" % seq,
+        "evidence": {"seq": seq, "signals": [f"signal-{seq % 8}"]},
+        "explanation": f"synthetic scale finding {seq}",
         "mode": "monitor",
         "provenance_hash": hashlib.sha256(
-            ("scale-finding-%d" % seq).encode("utf-8")
+            f"scale-finding-{seq}".encode("utf-8")
         ).hexdigest(),
         "detector_version": "scale-harness",
-        "correlation_id": "corr-%d" % (seq % 256),
+        "correlation_id": f"corr-{seq % 256}",
     }
 
 
@@ -132,9 +132,9 @@ def _policy(seq: int, finding_id: int) -> Dict[str, Any]:
     # active response, mirroring the system's own posture.
     return {
         "finding_id": finding_id,
-        "policy_id": "policy-%d" % (seq % 16),
+        "policy_id": f"policy-{seq % 16}",
         "decision": "advise",
-        "reason": "synthetic scale decision %d" % seq,
+        "reason": f"synthetic scale decision {seq}",
         "risk_score": (seq % 100) / 100.0,
         "severity": _SEVERITIES[seq % 4],
         "required_approval": bool(seq % 2),
@@ -222,9 +222,9 @@ def _populate_ml_floor(store: SQLiteEventStore, count: int) -> None:
     # never touched: this records lifecycle events, it does not cause one.
     for seq in range(count):
         store.write_ml_lifecycle_transition(
-            "scale-model-%d" % (seq % 8),
+            f"scale-model-{seq % 8}",
             "trained" if seq % 2 == 0 else "evaluated",
-            reason="synthetic scale lifecycle %d" % seq,
+            reason=f"synthetic scale lifecycle {seq}",
             evidence={"seq": seq},
             from_state=None,
             activation_eligible=False,

@@ -37,7 +37,7 @@ class MockProvider(LLMProvider):
     def __init__(self, content: Any = None, error: Optional[Exception] = None):
         self.content = content
         self.error = error
-        self.prompts = []
+        self.prompts: list[str] = []
 
     def generate(self, prompt: str, request_id: str) -> ProviderResponse:
         self.prompts.append(prompt)

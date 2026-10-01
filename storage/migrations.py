@@ -606,7 +606,7 @@ def _backfill_chain(conn: sqlite3.Connection, table: str, columns) -> None:
     names = [description[0] for description in cursor.description]
     pending = cursor.fetchall()
     for row in pending:
-        stored = dict(zip(names, row))
+        stored = dict(zip(names, row, strict=True))
         link = next_link(prev_seq, prev_hash, columns, stored)
         conn.execute(
             f"UPDATE {table} SET chain_seq = ?, chain_prev_hash = ?, chain_hash = ? WHERE id = ?",

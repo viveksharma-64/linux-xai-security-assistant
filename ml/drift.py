@@ -388,7 +388,7 @@ def assess_drift(
 
     features: List[Dict[str, Any]] = []
     out_of_range_total = 0
-    for name, test, correction in zip(FEATURE_NAMES, tests, corrections):
+    for name, test, correction in zip(FEATURE_NAMES, tests, corrections, strict=True):
         reference_values = reference_columns[name]
         comparison_values = comparison_columns[name]
         lower, upper = min(reference_values), max(reference_values)

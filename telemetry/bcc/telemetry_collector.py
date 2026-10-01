@@ -11,7 +11,7 @@ on it.
 
 Extended version of process_exec_probe.py with:
 - Process execution events
-- TCP connection events  
+- TCP connection events
 - System health metrics (CPU, memory, disk)
 - Minimal, kernel-compatible eBPF probes
 

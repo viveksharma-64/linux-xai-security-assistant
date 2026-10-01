@@ -55,7 +55,7 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from queue import Empty, Full, Queue
-from typing import Any, Callable, Iterable, Iterator, Optional, Union
+from typing import Any, Callable, cast, Iterable, Iterator, Optional
 
 from assistant.service import AssistantService
 from baseline.behavior_analyzer import BehaviorAnalyzer
@@ -71,7 +71,7 @@ from storage.sqlite_store import SQLiteEventStore
 
 LOGGER = logging.getLogger(__name__)
 
-RawInput = Union[str, bytes, dict]
+RawInput = str | bytes | dict
 _SENTINEL = object()
 
 # The wire name of a collector's kernel-loss report. Duplicated from
@@ -161,7 +161,7 @@ class SubprocessJSONLSource:
             raise ValueError("collector command is required")
         self.command = list(command)
         self.process: Optional[subprocess.Popen[str]] = None
-        self._stderr_lines = deque(maxlen=20)
+        self._stderr_lines: deque[str] = deque(maxlen=20)
         self._stderr_thread: Optional[threading.Thread] = None
         self._closed = threading.Event()
 
@@ -180,8 +180,7 @@ class SubprocessJSONLSource:
         self._stderr_thread.start()
         assert self.process.stdout is not None
         try:
-            for line in self.process.stdout:
-                yield line
+            yield from self.process.stdout
             return_code = self.process.wait()
             if self._stderr_thread is not None:
                 self._stderr_thread.join(timeout=1)
@@ -598,7 +597,9 @@ class LiveIngestionService:
                     continue
                 if item is _SENTINEL:
                     break
-                event = self.normalizer.normalize(item)
+                # The queue is Queue[object] only so it can also carry _SENTINEL;
+                # every other item the producer enqueues is a raw event mapping.
+                event = self.normalizer.normalize(cast(dict[str, Any], item))
                 if event is None:
                     with self._health_lock:
                         self._health.malformed_count += 1

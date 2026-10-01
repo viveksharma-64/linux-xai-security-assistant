@@ -199,7 +199,7 @@ class NativeIsolationForest:
         # `transform` stays float64, so the z-score diagnostics are unrounded.
         routed = scaled.astype(np.float32).astype(np.float64)
         depths = np.zeros(scaled.shape[0], dtype=np.float64)
-        for tree, path_lengths in zip(self.trees, self._path_lengths):
+        for tree, path_lengths in zip(self.trees, self._path_lengths, strict=True):
             leaves = _apply_tree(tree, routed[:, tree["features"]])
             depths += path_lengths[leaves] - 1.0
         # sklearn guards a zero denominator the same way rather than dividing;
@@ -248,7 +248,7 @@ class NativeIsolationForest:
             split_counts: dict[int, int] = {}
             total_splits = 0
             depths = 0.0
-            for tree, path_lengths in zip(self.trees, self._path_lengths):
+            for tree, path_lengths in zip(self.trees, self._path_lengths, strict=True):
                 children_left = tree["children_left"]
                 children_right = tree["children_right"]
                 feature = tree["feature"]
@@ -301,7 +301,7 @@ def export_from_sklearn(model: Any, scaler: Any) -> dict[str, Any]:
     """
     n_features = int(scaler.mean_.shape[0])
     trees = []
-    for estimator, features in zip(model.estimators_, model.estimators_features_):
+    for estimator, features in zip(model.estimators_, model.estimators_features_, strict=True):
         internals = estimator.tree_
         feature_indices = np.asarray(features, dtype=np.int64)
         # IsolationForest fits with max_features=1.0, so this is the identity
