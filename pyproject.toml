@@ -148,10 +148,9 @@ markers = [
 ]
 
 [tool.ruff]
-# Advisory in CI (see .github/workflows/ci.yml): the linter is not installable on
-# the offline build host, so it cannot be a merge gate until a maintainer with it
-# installed has baselined the pre-existing tree. Config lives here so `ruff check`
-# is uniform wherever it does run.
+# A required merge gate (see .github/workflows/ci.yml). It was advisory until the
+# pre-existing tree had been baselined to zero findings; that is done, so a new
+# finding now fails CI. Config lives here so `ruff check` is uniform everywhere.
 target-version = "py311"
 line-length = 120
 extend-exclude = [".venv", "ml/models", "dashboard"]
@@ -173,10 +172,10 @@ ignore = ["E501"]
 "ml/scoring.py" = ["UP035"]
 
 [tool.mypy]
-# Advisory in CI, same reason as ruff. Scoped and lenient on purpose: this is a
-# large tree that was not written against a type checker, so the value here is
-# catching regressions in the Phase B modules, not retrofitting annotations
-# everywhere at once.
+# A required merge gate, same as ruff. Still scoped and lenient on purpose: this
+# is a large tree that was not written against a type checker, so the value here
+# is catching regressions in the Phase B modules (the checked file list lives in
+# the CI workflow), not retrofitting annotations everywhere at once.
 python_version = "3.11"
 ignore_missing_imports = true
 warn_redundant_casts = true

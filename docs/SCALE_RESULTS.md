@@ -206,8 +206,8 @@ current engine is not the constraint.
 
 ## Note on tooling
 
-`ruff` and `mypy` are advisory in CI (the merge gate is the pytest suite). Neither
-was installed in the environment where this run was produced, so they were not
-executed here; the two new files were written to the configured rules (120-column
-lines, `from __future__ import annotations`, fully typed signatures). The scale
-tests and the full suite are the enforced gate and are green.
+`ruff` and `mypy` were advisory in CI when this run was produced, and neither was
+installed in the environment that produced it, so they were not executed here; the
+two new files were written to the configured rules (120-column lines,
+`from __future__ import annotations`, fully typed signatures). Both are required
+merge gates now. The scale tests and the full suite are green.

@@ -75,7 +75,7 @@ load-bearing invariants:
 - **Self-bounding storage.** `storage/retention.py` prunes by age and by a byte cap and `VACUUM`s on a timer, all **in-process** on the ingest daemon (there is deliberately no `.timer` unit). `retention_max_age_days: 0` keeps events indefinitely (byte cap only).
 - **Observability.** `observability/metrics.py` serves a Prometheus-style `/metrics`; `observability/alerts.py` logs disk/queue/collector-silence alerts on *transition* (not every interval) at a level a journald paging rule can key on.
 - **Layered config.** `observability/config.py`: defaults < config file < environment, fail-closed on an unknown key or unparseable value. File modes must be quoted in YAML so `0600` is not reinterpreted as decimal. Env var per field is `SECURITY_<NAME>` (e.g. `SECURITY_API_REQUIRE_AUTH`, `SECURITY_API_TOKENS`, `SECURITY_API_TOKEN_FILE`).
-- **CI.** `.github/workflows/ci.yml`. pytest is the hard gate; `ruff`/`mypy` run but are advisory (they could not be baselined on the offline build host). Do not describe them as gating until they are.
+- **CI.** `.github/workflows/ci.yml`. Four required gates: pytest across 3.11–3.13, the scikit-learn execution check, `ruff`, and `mypy`. `ruff`/`mypy` were advisory until the pre-existing tree was baselined to zero findings; that is done, so a new finding now fails CI. `mypy` is still scoped to the Phase B modules listed in the workflow rather than the whole tree — widen that list as other packages are annotated, and do not describe it as whole-tree type coverage.
 
 Rationale and measured numbers live in `docs/THREAT_MODEL.md` (STRIDE for this surface) and `docs/PHASE_B_RESULTS.md` (throughput/latency and the soak result); deployment and capability tuning live in `deploy/README.md`.
 
