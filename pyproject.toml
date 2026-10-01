@@ -128,7 +128,10 @@ filterwarnings = [
     # Show everything by default. Python silences ResourceWarning out of the box;
     # un-silencing it is what surfaced ~113 unclosed SQLite connections in
     # storage/sqlite_store.py and the leaked collector pipes in
-    # pipeline/live_ingestion.py. Later entries take precedence.
+    # pipeline/live_ingestion.py. Both sets are now closed -- the pipes by
+    # pipeline/live_ingestion.py itself, the connections by the `_close_stores`
+    # fixture in tests/conftest.py -- so the expected state is zero. Later entries
+    # take precedence.
     #
     # Deliberately NOT "error::ResourceWarning": ResourceWarning is raised during
     # finalization, so the exception cannot propagate and pytest never fails on

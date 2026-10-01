@@ -1,7 +1,8 @@
 """
 Shared test fixtures.
 
-Two concerns, both about the process-wide configuration singleton.
+Three concerns. The first two are about the process-wide configuration singleton,
+the third about store handles outliving the test that opened them.
 
 Isolation. `observability.config.settings()` caches the resolved `Settings` for the
 lifetime of the process. Under pytest that process runs every test, so a cache
@@ -17,13 +18,21 @@ auth error instead of the behaviour it was written to check. Rather than weaken 
 default, tests that are not about authentication turn it off explicitly through
 `SECURITY_API_REQUIRE_AUTH`, and the tests in test_api_auth.py turn it back on to
 exercise the gate itself.
+
+Store lifetime. `SQLiteEventStore` pools one connection per thread and reclaims
+them in `close()`. Most tests build a store inline and never close it, which is
+only visible once a request has been served on an API worker thread -- see
+`_close_stores`.
 """
 
 from __future__ import annotations
 
+import weakref
+
 import pytest
 
 from observability.config import reset_settings_cache
+from storage.sqlite_store import SQLiteEventStore
 
 
 @pytest.fixture(scope="session")
@@ -60,6 +69,43 @@ def _api_auth_disabled(monkeypatch, request):
         return
     monkeypatch.setenv("SECURITY_API_REQUIRE_AUTH", "0")
     reset_settings_cache()
+
+
+@pytest.fixture(autouse=True)
+def _close_stores(monkeypatch):
+    """
+    Close every store a test opens, including handles opened on API worker threads.
+
+    `SQLiteEventStore` caches one connection per thread, so a request served
+    through `TestClient` -- which runs a sync endpoint on an anyio worker thread --
+    leaves that thread's pooled handle in `store._connections` until someone calls
+    `close()`. Tests that build a store, hand it to `create_app` and then POST
+    through the client mostly never do, so the handle survives the test and SQLite
+    reports it as an `unclosed database` ResourceWarning during interpreter
+    shutdown -- blamed on whichever test happened to trigger the collection, which
+    is why it never reproduces when that file is run on its own.
+
+    Closing is driven off construction rather than a `gc.get_objects()` sweep at
+    teardown: the sweep reaches the same result but walks every live object once
+    per test, costing more than the rest of the suite put together (167s against
+    62s). `close()` is idempotent, so tests that close their own store are
+    unaffected.
+    """
+    live: weakref.WeakSet[SQLiteEventStore] = weakref.WeakSet()
+    original_init = SQLiteEventStore.__init__
+
+    def tracking_init(self, *args, **kwargs):
+        # Tracked only once __init__ returns: a store whose construction raised
+        # (unreadable path, rejected file mode) has no connections to reclaim.
+        original_init(self, *args, **kwargs)
+        live.add(self)
+
+    monkeypatch.setattr(SQLiteEventStore, "__init__", tracking_init)
+    yield
+    # Materialised first: holding strong references for the duration keeps the set
+    # from shrinking under collection while it is being iterated.
+    for store in list(live):
+        store.close()
 
 
 def pytest_configure(config):
