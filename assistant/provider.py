@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any
 
 
 class ProviderError(RuntimeError):
@@ -34,7 +34,7 @@ class MockProvider(LLMProvider):
 
     name = "mock"
 
-    def __init__(self, content: Any = None, error: Optional[Exception] = None):
+    def __init__(self, content: Any = None, error: Exception | None = None):
         self.content = content
         self.error = error
         self.prompts: list[str] = []
@@ -58,7 +58,7 @@ class MockProvider(LLMProvider):
         return ProviderResponse(content=content, provider=self.name, request_id=request_id)
 
 
-def provider_from_environment() -> Optional[LLMProvider]:
+def provider_from_environment() -> LLMProvider | None:
     """Return only explicitly configured providers; no API key is read or logged here."""
     import os
 

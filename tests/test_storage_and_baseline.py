@@ -1,10 +1,10 @@
 import json
 from pathlib import Path
 
-from telemetry.auditd.file_access_monitor import _filter_capture_records, parse_ausearch_text
+from baseline.behavioral_baseline import BehavioralBaseline
 from pipeline.event_stream import Event, EventType
 from storage.sqlite_store import SQLiteEventStore
-from baseline.behavioral_baseline import BehavioralBaseline
+from telemetry.auditd.file_access_monitor import _filter_capture_records, parse_ausearch_text
 
 
 def _sample_event(event_type="process_exec", **extra):

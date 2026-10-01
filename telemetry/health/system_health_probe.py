@@ -50,7 +50,7 @@ import signal
 import sys
 import threading
 import time
-from typing import Any, Dict, Optional, TextIO
+from typing import Any, TextIO
 
 try:  # Importable both as a package module and as a sibling file.
     import psutil
@@ -82,7 +82,7 @@ class SystemHealthCollector:
         self,
         interval: float = DEFAULT_INTERVAL_SECONDS,
         disk_path: str = DEFAULT_DISK_PATH,
-        output: Optional[TextIO] = None,
+        output: TextIO | None = None,
     ) -> None:
         self.interval = max(MIN_INTERVAL_SECONDS, float(interval))
         self.disk_path = disk_path
@@ -102,7 +102,7 @@ class SystemHealthCollector:
         """Ask the loop to end. Safe from a signal handler."""
         self._stop.set()
 
-    def sample(self) -> Dict[str, Any]:
+    def sample(self) -> dict[str, Any]:
         """
         One health reading, with every metric independently best-effort.
 
@@ -110,7 +110,7 @@ class SystemHealthCollector:
         or faked: the detector distinguishes "not measured" from "measured and
         fine", and a failing disk path must not suppress the memory rules.
         """
-        record: Dict[str, Any] = {
+        record: dict[str, Any] = {
             "event_type": "system_health",
             "timestamp": time.time(),
             "cpu_percent": None,
@@ -147,10 +147,10 @@ class SystemHealthCollector:
 
         return record
 
-    def emit(self, record: Dict[str, Any]) -> None:
+    def emit(self, record: dict[str, Any]) -> None:
         print(json.dumps(record, sort_keys=True), file=self.output, flush=True)
 
-    def run(self, max_samples: Optional[int] = None) -> int:
+    def run(self, max_samples: int | None = None) -> int:
         """
         Sample and emit until stopped, or until `max_samples` records (tests).
 
@@ -189,7 +189,7 @@ def install_signal_handlers(collector: SystemHealthCollector) -> tuple:
     return tuple(handled)
 
 
-def main(argv: Optional[list] = None) -> int:
+def main(argv: list | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Read-only host health telemetry (CPU, memory, disk) sampled from psutil.",
     )

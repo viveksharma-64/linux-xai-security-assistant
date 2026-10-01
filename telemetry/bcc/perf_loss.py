@@ -45,7 +45,7 @@ would be broken for reasons well beyond this accounting.
 import json
 import sys
 import time
-from typing import Any, Optional, TextIO
+from typing import Any, TextIO
 
 # The wire name of the loss record. `pipeline.live_ingestion` carries its own
 # copy because a collector run as a bare script -- which is how the README
@@ -69,7 +69,7 @@ class PerfBufferLossReporter:
         self,
         buffer_name: str,
         source: str,
-        stream: Optional[TextIO] = None,
+        stream: TextIO | None = None,
         report_interval_seconds: float = DEFAULT_REPORT_INTERVAL_SECONDS,
         clock: Any = time.monotonic,
         wall_clock: Any = time.time,
@@ -88,7 +88,7 @@ class PerfBufferLossReporter:
         self._clock = clock
         self._wall_clock = wall_clock
         self._pending = 0
-        self._last_report: Optional[float] = None
+        self._last_report: float | None = None
 
     def __call__(self, lost: int) -> None:
         try:

@@ -36,9 +36,9 @@ peak) so they never manufacture a phantom burst. Only the ``execution_burst``
 attack concentrates executions into a single second.
 """
 
-from dataclasses import dataclass, field
 import random
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any
 
 from pipeline.event_stream import Event
 
@@ -89,12 +89,12 @@ class LabeledWindow:
     name: str
     label: int  # 1 == attack, 0 == benign
     kind: str  # "attack" | "benign"
-    events: List[Event]
+    events: list[Event]
     description: str = ""
     # Present only for attack windows: the ATT&CK mapping and the signal the
     # scenario is designed to trip. Purely descriptive -- the harness measures
     # the actual outcome, it never trusts this field.
-    attack: Optional[Dict[str, Any]] = field(default=None)
+    attack: dict[str, Any] | None = field(default=None)
 
 
 class _Pid:
@@ -117,7 +117,7 @@ def _exec(
     gid: int,
     ppid: int,
     pid: int,
-    executable: Optional[str] = None,
+    executable: str | None = None,
 ) -> Event:
     """
     Build one PROCESS_EXEC ``Event`` through the canonical factory.
@@ -143,7 +143,7 @@ def _exec(
     )
 
 
-def _spread_seconds(count: int) -> List[int]:
+def _spread_seconds(count: int) -> list[int]:
     """
     Distinct second-offsets spread evenly across the full window.
 
@@ -158,7 +158,7 @@ def _spread_seconds(count: int) -> List[int]:
 # Baseline (throwaway verified-normal stand-in)
 # --------------------------------------------------------------------------- #
 
-def build_baseline_events(count: int = DEFAULT_BASELINE_EXECS, seed: int = DEFAULT_SEED) -> List[Event]:
+def build_baseline_events(count: int = DEFAULT_BASELINE_EXECS, seed: int = DEFAULT_SEED) -> list[Event]:
     """
     Synthesize ``count`` normal PROCESS_EXEC events for a *throwaway* baseline.
 
@@ -177,7 +177,7 @@ def build_baseline_events(count: int = DEFAULT_BASELINE_EXECS, seed: int = DEFAU
     pid = _Pid(5000)
     total_weight = sum(weight for *_, weight in _BASELINE_MIX)
 
-    population: List[tuple] = []
+    population: list[tuple] = []
     for comm, uid, gid, ppid, weight in _BASELINE_MIX:
         scaled = round(weight * count / total_weight)
         population.extend([(comm, uid, gid, ppid)] * scaled)
@@ -190,7 +190,7 @@ def build_baseline_events(count: int = DEFAULT_BASELINE_EXECS, seed: int = DEFAU
     buckets = 60
     per_bucket = max(1, count // buckets)
     step = max(1, 60 // per_bucket)
-    events: List[Event] = []
+    events: list[Event] = []
     for index, (comm, uid, gid, ppid) in enumerate(population):
         bucket = index % buckets
         slot = index // buckets
@@ -384,7 +384,7 @@ _PRIV_MAINTENANCE_COMMANDS = ("apt-get", "dpkg")
 def labeled_windows(
     seed: int = DEFAULT_SEED,
     benign_clean: int = DEFAULT_BENIGN_CLEAN_WINDOWS,
-) -> List[LabeledWindow]:
+) -> list[LabeledWindow]:
     """
     Build the full labeled corpus: attacks, honest FPs, then clean benign windows.
 
@@ -394,7 +394,7 @@ def labeled_windows(
     """
     rng = random.Random(seed)
     pid = _Pid(100_000)
-    windows: List[LabeledWindow] = []
+    windows: list[LabeledWindow] = []
 
     for builder in _ATTACK_BUILDERS:
         base_ts = CORPUS_EPOCH + len(windows) * WINDOW_SECONDS
@@ -413,7 +413,7 @@ def labeled_windows(
     return windows
 
 
-def manifest(seed: int = DEFAULT_SEED, benign_clean: int = DEFAULT_BENIGN_CLEAN_WINDOWS) -> Dict[str, Any]:
+def manifest(seed: int = DEFAULT_SEED, benign_clean: int = DEFAULT_BENIGN_CLEAN_WINDOWS) -> dict[str, Any]:
     """A serializable description of the corpus, for the published docs."""
     windows = labeled_windows(seed=seed, benign_clean=benign_clean)
     attacks = [w for w in windows if w.kind == "attack"]

@@ -28,7 +28,8 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any, Mapping, Optional
+from collections.abc import Mapping
+from typing import Any
 
 INSTALL_HINT = (
     "ERROR: could not import bcc (BPF Compiler Collection). Install with:\n"
@@ -75,7 +76,7 @@ def _kernel_supports_ringbuf() -> bool:
     return (major, minor) >= _RINGBUF_MIN_KERNEL
 
 
-def ringbuf_supported(bpf: Optional[Any]) -> bool:
+def ringbuf_supported(bpf: Any | None) -> bool:
     """
     True only when both halves of the ring buffer are present.
 
@@ -90,7 +91,7 @@ def ringbuf_supported(bpf: Optional[Any]) -> bool:
 
 
 def select_event_buffer(
-    bpf: Optional[Any], *, env: Optional[Mapping[str, str]] = None
+    bpf: Any | None, *, env: Mapping[str, str] | None = None
 ) -> str:
     """
     Resolve SECURITY_BPF_EVENT_BUFFER to a concrete transport: 'ringbuf' or 'perf'.
@@ -134,7 +135,7 @@ def request_keyboard_interrupt_on_sigterm() -> None:
     signal.signal(signal.SIGTERM, _raise)
 
 
-def load_bpf() -> Optional[Any]:
+def load_bpf() -> Any | None:
     """Return the `BPF` class, or None when bcc is not installed."""
     try:
         from bcc import BPF  # type: ignore[import-not-found]
@@ -143,7 +144,7 @@ def load_bpf() -> Optional[Any]:
     return BPF
 
 
-def require_bpf(bpf: Optional[Any]) -> Any:
+def require_bpf(bpf: Any | None) -> Any:
     """
     Assert that bcc was importable, exiting with the install hint if it was not.
 

@@ -47,7 +47,7 @@ import json
 import os
 import sqlite3
 import sys
-from typing import Any, Dict, List
+from typing import Any
 
 # Runnable as a bare script from anywhere.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -83,7 +83,7 @@ class ReadOnlyWindowSource:
     def __init__(self, db_path: str):
         self.db_path = db_path
 
-    def read_ml_training_windows(self, dataset_id: str) -> List[Dict[str, Any]]:
+    def read_ml_training_windows(self, dataset_id: str) -> list[dict[str, Any]]:
         connection = _read_only(self.db_path)
         try:
             rows = connection.execute(
@@ -102,7 +102,7 @@ class ReadOnlyWindowSource:
         return windows
 
 
-def _list_models(path: str) -> List[Dict[str, Any]]:
+def _list_models(path: str) -> list[dict[str, Any]]:
     connection = _read_only(path)
     try:
         rows = connection.execute(
@@ -115,7 +115,7 @@ def _list_models(path: str) -> List[Dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def _list_datasets(path: str) -> List[Dict[str, Any]]:
+def _list_datasets(path: str) -> list[dict[str, Any]]:
     connection = _read_only(path)
     try:
         rows = connection.execute(
@@ -128,7 +128,7 @@ def _list_datasets(path: str) -> List[Dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def _print_assessment(assessment: Dict[str, Any]) -> None:
+def _print_assessment(assessment: dict[str, Any]) -> None:
     summary = drift_summary(assessment)
     print(f"model:      {summary['model_id']}")
     print(f"comparison: {summary['comparison_dataset_id']}")
@@ -164,7 +164,7 @@ def _print_assessment(assessment: Dict[str, Any]) -> None:
             print(f"      - {limitation}")
 
 
-def main(argv: List[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--db", help="database holding the model and its training windows")
     parser.add_argument("--model-id", help="model to assess")

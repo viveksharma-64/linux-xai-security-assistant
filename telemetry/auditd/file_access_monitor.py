@@ -14,13 +14,12 @@ It emits real file events only from the Linux system it is running on.
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import time
-import shlex
 from pathlib import Path
-
 
 CANONICAL_EVENT_TYPES = {"file_open", "file_write"}
 SYSCALL_NAMES = {

@@ -1,14 +1,15 @@
-import json
 import hashlib
+import json
 import logging
 import os
 import sqlite3
 import stat
 import threading
 import time
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any
 
 from pipeline.event_stream import CanonicalNormalizer, Event, EventStore
 from storage.evidence_chain import (
@@ -22,7 +23,6 @@ from storage.evidence_chain import (
     verify_chain,
 )
 from storage.migrations import migrate
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -116,7 +116,7 @@ class BatchWriteResult:
     attempted: int = 0
     inserted: int = 0
     duplicates: int = 0
-    rejected: List[Tuple[Any, str]] = field(default_factory=list)
+    rejected: list[tuple[Any, str]] = field(default_factory=list)
 
     @property
     def rejected_count(self) -> int:
@@ -172,14 +172,14 @@ class SQLiteEventStore(EventStore):
     def __init__(
         self,
         db_path: str = "phase2_events.db",
-        file_mode: Optional[int] = 0o600,
+        file_mode: int | None = 0o600,
         enforce_file_mode: bool = True,
     ):
         self.db_path = db_path
         self.file_mode = file_mode
         self.enforce_file_mode = enforce_file_mode
         self._local = threading.local()
-        self._connections: "set[sqlite3.Connection]" = set()
+        self._connections: set[sqlite3.Connection] = set()
         self._connections_lock = threading.Lock()
         # Serialises chain extension across writer threads. The chain fold reads
         # MAX(chain_seq) and inserts the successor; two concurrent finding writes
@@ -228,7 +228,7 @@ class SQLiteEventStore(EventStore):
         """
         if self._closed:
             raise sqlite3.ProgrammingError("event store is closed")
-        conn: Optional[sqlite3.Connection] = getattr(self._local, "conn", None)
+        conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
         if conn is not None:
             return conn
         conn = self._new_connection()
@@ -368,7 +368,7 @@ class SQLiteEventStore(EventStore):
         """
         if self.file_mode is None or self.db_path == ":memory:":
             return
-        problems: List[str] = []
+        problems: list[str] = []
         for path in self._database_files():
             try:
                 os.chmod(path, self.file_mode)
@@ -387,18 +387,18 @@ class SQLiteEventStore(EventStore):
             raise DatabasePermissionError(message)
         LOGGER.warning("db_permissions_unenforced detail=%r", message)
 
-    def _database_files(self) -> List[str]:
+    def _database_files(self) -> list[str]:
         """The main database file and the WAL sidecars that may hold its data."""
         return [self.db_path, f"{self.db_path}-wal", f"{self.db_path}-shm"]
 
-    def file_permissions(self) -> Dict[str, Optional[int]]:
+    def file_permissions(self) -> dict[str, int | None]:
         """
         Current mode of each database file, for the readiness endpoint to report.
 
         None for a file that does not exist -- a database with no `-wal` has no
         permission problem there, and reporting 0 would read as "no access".
         """
-        modes: Dict[str, Optional[int]] = {}
+        modes: dict[str, int | None] = {}
         for path in self._database_files():
             try:
                 modes[path] = stat.S_IMODE(os.stat(path).st_mode)
@@ -488,7 +488,7 @@ class SQLiteEventStore(EventStore):
         encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
-    def _event_row(self, event: Event) -> Tuple[Any, ...]:
+    def _event_row(self, event: Event) -> tuple[Any, ...]:
         """
         Bind parameters for one event, in `EVENT_INSERT_SQL` column order.
 
@@ -561,7 +561,7 @@ class SQLiteEventStore(EventStore):
         if not events:
             return result
 
-        rows: List[Tuple[Any, ...]] = []
+        rows: list[tuple[Any, ...]] = []
         for event in events:
             if event is None:
                 result.rejected.append((event, "event is None"))
@@ -582,7 +582,7 @@ class SQLiteEventStore(EventStore):
         return result
 
 
-    def write_raw(self, raw_event: Dict[str, Any]) -> bool:
+    def write_raw(self, raw_event: dict[str, Any]) -> bool:
         try:
             normalized = CanonicalNormalizer().normalize(raw_event)
             if normalized is None:
@@ -592,7 +592,7 @@ class SQLiteEventStore(EventStore):
         except ValueError:
             return False
 
-    def create_ml_dataset(self, dataset: Dict[str, Any]) -> str:
+    def create_ml_dataset(self, dataset: dict[str, Any]) -> str:
         """Create immutable metadata for an explicitly verified-normal dataset."""
         required = ("id", "name", "schema_version", "schema_hash", "environment", "verification", "created_at")
         missing = [key for key in required if key not in dataset]
@@ -608,7 +608,7 @@ class SQLiteEventStore(EventStore):
             )
         return str(dataset["id"])
 
-    def write_ml_training_window(self, window: Dict[str, Any]) -> int:
+    def write_ml_training_window(self, window: dict[str, Any]) -> int:
         """Append a verified-normal feature window; rows intentionally have no update API."""
         required = ("dataset_id", "window_start", "window_end", "event_ids", "features", "schema_version", "schema_hash", "collector_context", "verified_normal", "verification", "created_at")
         missing = [key for key in required if key not in window]
@@ -631,12 +631,12 @@ class SQLiteEventStore(EventStore):
             assert cursor.lastrowid is not None
             return int(cursor.lastrowid)
 
-    def read_ml_training_windows(self, dataset_id: str) -> List[Dict[str, Any]]:
+    def read_ml_training_windows(self, dataset_id: str) -> list[dict[str, Any]]:
         with self._transaction() as conn:
             rows = conn.execute("SELECT * FROM ml_training_windows WHERE dataset_id = ? ORDER BY window_start, id", (dataset_id,)).fetchall()
         return self._decode_ml_training_windows(rows)
 
-    def read_ml_training_windows_by_ids(self, window_ids: List[int]) -> List[Dict[str, Any]]:
+    def read_ml_training_windows_by_ids(self, window_ids: list[int]) -> list[dict[str, Any]]:
         """Read immutable training windows for scorer diagnostics without changing them."""
         if not window_ids:
             return []
@@ -649,7 +649,7 @@ class SQLiteEventStore(EventStore):
         return self._decode_ml_training_windows(rows)
 
     @staticmethod
-    def _decode_ml_training_windows(rows: List[sqlite3.Row]) -> List[Dict[str, Any]]:
+    def _decode_ml_training_windows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
         records = []
         for row in rows:
             record = dict(row)
@@ -659,7 +659,7 @@ class SQLiteEventStore(EventStore):
             records.append(record)
         return records
 
-    def write_ml_model(self, model: Dict[str, Any]) -> str:
+    def write_ml_model(self, model: dict[str, Any]) -> str:
         required = ("id", "version", "algorithm", "hyperparameters", "artifact_path", "artifact_checksum", "schema_version", "schema_hash", "training_window_ids", "runtime", "evaluation", "active", "created_at")
         missing = [key for key in required if key not in model]
         if missing:
@@ -673,7 +673,7 @@ class SQLiteEventStore(EventStore):
             )
         return str(model["id"])
 
-    def read_ml_model(self, model_id: str) -> Optional[Dict[str, Any]]:
+    def read_ml_model(self, model_id: str) -> dict[str, Any] | None:
         with self._transaction() as conn:
             row = conn.execute("SELECT * FROM ml_models WHERE id = ?", (model_id,)).fetchone()
         if row is None:
@@ -684,7 +684,7 @@ class SQLiteEventStore(EventStore):
         record["active"] = bool(record["active"])
         return record
 
-    def read_ml_models(self) -> List[Dict[str, Any]]:
+    def read_ml_models(self) -> list[dict[str, Any]]:
         """
         Enumerate models newest-first; read-only, and never a scoring input.
 
@@ -710,12 +710,12 @@ class SQLiteEventStore(EventStore):
         to_state: str,
         *,
         reason: str,
-        evidence: Optional[Dict[str, Any]] = None,
-        from_state: Optional[str] = None,
+        evidence: dict[str, Any] | None = None,
+        from_state: str | None = None,
         activation_eligible: bool = False,
-        actor: Optional[str] = None,
-        created_at: Optional[float] = None,
-    ) -> Dict[str, Any]:
+        actor: str | None = None,
+        created_at: float | None = None,
+    ) -> dict[str, Any]:
         """
         Append one model lifecycle event and fold it into the lifecycle hash chain.
 
@@ -766,11 +766,11 @@ class SQLiteEventStore(EventStore):
         conn: sqlite3.Connection,
         model_id: str,
         to_state: str,
-        from_state: Optional[str],
+        from_state: str | None,
         reason: str,
-        evidence: Dict[str, Any],
+        evidence: dict[str, Any],
         activation_eligible: bool,
-        actor: Optional[str],
+        actor: str | None,
         created_at: float,
     ) -> int:
         """Insert one lifecycle row and chain it; caller holds the chain lock."""
@@ -791,11 +791,11 @@ class SQLiteEventStore(EventStore):
 
     def write_ml_drift_assessment(
         self,
-        assessment: Dict[str, Any],
+        assessment: dict[str, Any],
         *,
-        from_state: Optional[str] = None,
-        actor: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        from_state: str | None = None,
+        actor: str | None = None,
+    ) -> dict[str, Any]:
         """
         Append one drift assessment together with the lifecycle row that commits to it.
 
@@ -878,11 +878,11 @@ class SQLiteEventStore(EventStore):
                 }
 
     def read_ml_drift_assessments(
-        self, model_id: Optional[str] = None, limit: int = 100
-    ) -> List[Dict[str, Any]]:
+        self, model_id: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
         """Read drift assessments newest-first; read-only, and never a scoring input."""
         clause = "WHERE model_id = ? " if model_id else ""
-        parameters: List[Any] = [model_id] if model_id else []
+        parameters: list[Any] = [model_id] if model_id else []
         parameters.append(max(1, int(limit)))
         with self._transaction() as conn:
             rows = conn.execute(
@@ -892,11 +892,11 @@ class SQLiteEventStore(EventStore):
         return [self._decode_ml_drift_row(dict(row)) for row in rows]
 
     def read_ml_lifecycle(
-        self, model_id: Optional[str] = None, limit: int = 500
-    ) -> List[Dict[str, Any]]:
+        self, model_id: str | None = None, limit: int = 500
+    ) -> list[dict[str, Any]]:
         """Read lifecycle rows oldest-first, so the sequence reads as a history."""
         clause = "WHERE model_id = ? " if model_id else ""
-        parameters: List[Any] = [model_id] if model_id else []
+        parameters: list[Any] = [model_id] if model_id else []
         parameters.append(max(1, int(limit)))
         with self._transaction() as conn:
             rows = conn.execute(
@@ -905,7 +905,7 @@ class SQLiteEventStore(EventStore):
             ).fetchall()
         return [self._decode_ml_lifecycle_row(row) for row in rows]
 
-    def verify_ml_lifecycle_chain(self) -> Dict[str, Any]:
+    def verify_ml_lifecycle_chain(self) -> dict[str, Any]:
         """
         Recompute the ml_model_lifecycle hash chain from on-disk columns.
 
@@ -963,20 +963,20 @@ class SQLiteEventStore(EventStore):
         return verification
 
     @staticmethod
-    def _decode_ml_drift_row(row: Any) -> Dict[str, Any]:
+    def _decode_ml_drift_row(row: Any) -> dict[str, Any]:
         record = dict(row)
         for key in ("features_json", "reasons_json"):
             record[key.removesuffix("_json")] = json.loads(record.pop(key))
         return record
 
     @staticmethod
-    def _decode_ml_lifecycle_row(row: Any) -> Dict[str, Any]:
+    def _decode_ml_lifecycle_row(row: Any) -> dict[str, Any]:
         record = dict(row)
         record["evidence"] = json.loads(record.pop("evidence_json"))
         record["activation_eligible"] = bool(record["activation_eligible"])
         return record
 
-    def write_feature_record(self, feature_data: Dict[str, Any]) -> None:
+    def write_feature_record(self, feature_data: dict[str, Any]) -> None:
         with self._transaction() as conn:
             conn.execute(
                 """
@@ -1000,7 +1000,7 @@ class SQLiteEventStore(EventStore):
                 ),
             )
 
-    def write_baseline_record(self, baseline_data: Dict[str, Any]) -> None:
+    def write_baseline_record(self, baseline_data: dict[str, Any]) -> None:
         with self._transaction() as conn:
             conn.execute(
                 """
@@ -1020,7 +1020,7 @@ class SQLiteEventStore(EventStore):
                 ),
             )
 
-    def write_anomaly_record(self, anomaly_data: Dict[str, Any]) -> None:
+    def write_anomaly_record(self, anomaly_data: dict[str, Any]) -> None:
         anomaly_score = anomaly_data.get("anomaly_score")
         if anomaly_score is not None:
             anomaly_score = float(anomaly_score)
@@ -1046,14 +1046,14 @@ class SQLiteEventStore(EventStore):
                 ),
             )
 
-    def read_anomaly_records(self) -> List[Dict[str, Any]]:
+    def read_anomaly_records(self) -> list[dict[str, Any]]:
         with self._transaction() as conn:
             rows = conn.execute(
                 "SELECT * FROM anomaly_scores ORDER BY id ASC"
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def write_risk_record(self, risk_data: Dict[str, Any]) -> None:
+    def write_risk_record(self, risk_data: dict[str, Any]) -> None:
         anomaly_score = float(risk_data["anomaly_score"])
         if not 0.0 <= anomaly_score <= 1.0:
             raise ValueError("anomaly_score must be between 0 and 1")
@@ -1081,7 +1081,7 @@ class SQLiteEventStore(EventStore):
                 ),
             )
 
-    def read_risk_records(self) -> List[Dict[str, Any]]:
+    def read_risk_records(self) -> list[dict[str, Any]]:
         with self._transaction() as conn:
             rows = conn.execute(
                 "SELECT * FROM behavior_risks ORDER BY window_start ASC, id ASC"
@@ -1093,7 +1093,7 @@ class SQLiteEventStore(EventStore):
                 records.append(record)
             return records
 
-    def write_detection_finding(self, finding: Dict[str, Any]) -> int:
+    def write_detection_finding(self, finding: dict[str, Any]) -> int:
         score_fields = ("risk_score", "behavior_score", "rule_score", "context_score")
         scores = {field: float(finding[field]) for field in score_fields}
         if any(not 0.0 <= score <= 1.0 for score in scores.values()):
@@ -1151,7 +1151,7 @@ class SQLiteEventStore(EventStore):
                 )
                 return finding_id
 
-    def read_detection_findings(self) -> List[Dict[str, Any]]:
+    def read_detection_findings(self) -> list[dict[str, Any]]:
         with self._transaction() as conn:
             rows = conn.execute(
                 "SELECT * FROM detection_findings ORDER BY window_start ASC, id ASC"
@@ -1165,7 +1165,7 @@ class SQLiteEventStore(EventStore):
                 findings.append(finding)
             return findings
 
-    def count_findings_by_severity(self) -> Dict[str, int]:
+    def count_findings_by_severity(self) -> dict[str, int]:
         """
         How many findings exist at each severity, as a SQL aggregate.
 
@@ -1187,7 +1187,7 @@ class SQLiteEventStore(EventStore):
             ).fetchall()
         return {str(row["severity"]): int(row["c"]) for row in rows}
 
-    def read_detection_finding(self, finding_id: int) -> Optional[Dict[str, Any]]:
+    def read_detection_finding(self, finding_id: int) -> dict[str, Any] | None:
         with self._transaction() as conn:
             row = conn.execute(
                 "SELECT * FROM detection_findings WHERE id = ?",
@@ -1201,7 +1201,7 @@ class SQLiteEventStore(EventStore):
                 finding["suppressed"] = bool(finding["suppressed"])
             return finding
 
-    def read_findings_by_correlation(self, correlation_id: str) -> List[Dict[str, Any]]:
+    def read_findings_by_correlation(self, correlation_id: str) -> list[dict[str, Any]]:
         """
         Read the findings sharing one correlation id, in window order.
 
@@ -1229,7 +1229,7 @@ class SQLiteEventStore(EventStore):
                 findings.append(finding)
             return findings
 
-    def write_explanation(self, explanation: Dict[str, Any]) -> None:
+    def write_explanation(self, explanation: dict[str, Any]) -> None:
         with self._transaction() as conn:
             conn.execute(
                 """
@@ -1243,14 +1243,14 @@ class SQLiteEventStore(EventStore):
                 ),
             )
 
-    def read_explanations(self) -> List[Dict[str, Any]]:
+    def read_explanations(self) -> list[dict[str, Any]]:
         with self._transaction() as conn:
             rows = conn.execute(
                 "SELECT explanation_json FROM finding_explanations ORDER BY finding_id ASC"
             ).fetchall()
             return [json.loads(row["explanation_json"]) for row in rows]
 
-    def read_explanation(self, finding_id: int) -> Optional[Dict[str, Any]]:
+    def read_explanation(self, finding_id: int) -> dict[str, Any] | None:
         with self._transaction() as conn:
             row = conn.execute(
                 "SELECT explanation_json FROM finding_explanations WHERE finding_id = ?",
@@ -1258,7 +1258,7 @@ class SQLiteEventStore(EventStore):
             ).fetchone()
             return json.loads(row["explanation_json"]) if row else None
 
-    def write_policy_decision(self, decision: Dict[str, Any]) -> int:
+    def write_policy_decision(self, decision: dict[str, Any]) -> int:
         # policy_decisions is append-only (no dedup), so every insert extends the
         # chain. Same lock discipline as findings: head read and successor write
         # are atomic against concurrent writers.
@@ -1294,7 +1294,7 @@ class SQLiteEventStore(EventStore):
                 )
                 return decision_id
 
-    def read_policy_decisions(self) -> List[Dict[str, Any]]:
+    def read_policy_decisions(self) -> list[dict[str, Any]]:
         with self._transaction() as conn:
             rows = conn.execute(
                 "SELECT * FROM policy_decisions ORDER BY timestamp ASC, id ASC"
@@ -1308,7 +1308,7 @@ class SQLiteEventStore(EventStore):
                 decisions.append(decision)
             return decisions
 
-    def verify_findings_chain(self) -> Dict[str, Any]:
+    def verify_findings_chain(self) -> dict[str, Any]:
         """
         Recompute the detection_findings hash chain from on-disk columns.
 
@@ -1328,7 +1328,7 @@ class SQLiteEventStore(EventStore):
             ]
         return verify_chain(FINDING_CHAIN_COLUMNS, rows)
 
-    def verify_policy_chain(self) -> Dict[str, Any]:
+    def verify_policy_chain(self) -> dict[str, Any]:
         """
         Recompute the policy_decisions hash chain from on-disk columns.
 
@@ -1349,11 +1349,11 @@ class SQLiteEventStore(EventStore):
         finding_id: int,
         action: str,
         *,
-        disposition: Optional[str] = None,
-        note: Optional[str] = None,
-        actor: Optional[str] = None,
-        created_at: Optional[float] = None,
-    ) -> Dict[str, Any]:
+        disposition: str | None = None,
+        note: str | None = None,
+        actor: str | None = None,
+        created_at: float | None = None,
+    ) -> dict[str, Any]:
         """
         Append one analyst triage event and fold it into the triage hash chain.
 
@@ -1400,7 +1400,7 @@ class SQLiteEventStore(EventStore):
                     ).fetchone()
                 )
 
-    def verify_triage_chain(self) -> Dict[str, Any]:
+    def verify_triage_chain(self) -> dict[str, Any]:
         """
         Recompute the triage_annotations hash chain from on-disk columns.
 
@@ -1418,8 +1418,8 @@ class SQLiteEventStore(EventStore):
         return verify_chain(TRIAGE_CHAIN_COLUMNS, rows)
 
     def read_triage_annotations(
-        self, finding_id: Optional[int] = None, limit: int = 500
-    ) -> List[Dict[str, Any]]:
+        self, finding_id: int | None = None, limit: int = 500
+    ) -> list[dict[str, Any]]:
         """
         The append-only triage history, oldest first, optionally for one finding.
 
@@ -1447,7 +1447,7 @@ class SQLiteEventStore(EventStore):
                 ).fetchall()
             return [dict(row) for row in rows]
 
-    def read_latest_triage_state(self) -> Dict[int, Dict[str, Any]]:
+    def read_latest_triage_state(self) -> dict[int, dict[str, Any]]:
         """
         The effective triage state of every annotated finding.
 
@@ -1464,7 +1464,7 @@ class SQLiteEventStore(EventStore):
         aspects in SQL for server-side filtering; the definitions are kept
         identical.
         """
-        state: Dict[int, Dict[str, Any]] = {}
+        state: dict[int, dict[str, Any]] = {}
         with self._transaction() as conn:
             rows = conn.execute(
                 "SELECT finding_id, action, disposition FROM triage_annotations "
@@ -1500,14 +1500,14 @@ class SQLiteEventStore(EventStore):
         offset: int = 0,
         sort: str = "window_start",
         order: str = "desc",
-        severity: Optional[str] = None,
-        entity_type: Optional[str] = None,
-        disposition: Optional[str] = None,
-        acknowledged: Optional[bool] = None,
-        suppressed: Optional[bool] = None,
-        window_start: Optional[float] = None,
-        window_end: Optional[float] = None,
-    ) -> Tuple[List[Dict[str, Any]], int]:
+        severity: str | None = None,
+        entity_type: str | None = None,
+        disposition: str | None = None,
+        acknowledged: bool | None = None,
+        suppressed: bool | None = None,
+        window_start: float | None = None,
+        window_end: float | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
         """
         A filtered, sorted, paginated slice of detection_findings plus its total.
 
@@ -1532,8 +1532,8 @@ class SQLiteEventStore(EventStore):
         if direction is None:
             raise ValueError(f"invalid sort order: {order!r}")
 
-        clauses: List[str] = []
-        values: List[Any] = []
+        clauses: list[str] = []
+        values: list[Any] = []
         if severity is not None:
             clauses.append("severity = ?")
             values.append(severity)
@@ -1604,7 +1604,7 @@ class SQLiteEventStore(EventStore):
             findings.append(finding)
         return findings, int(total)
 
-    def write_assistant_response(self, response: Dict[str, Any], created_at: Optional[float] = None) -> None:
+    def write_assistant_response(self, response: dict[str, Any], created_at: float | None = None) -> None:
         import time
 
         with self._transaction() as conn:
@@ -1623,7 +1623,7 @@ class SQLiteEventStore(EventStore):
                 ),
             )
 
-    def read_assistant_response(self, finding_id: int) -> Optional[Dict[str, Any]]:
+    def read_assistant_response(self, finding_id: int) -> dict[str, Any] | None:
         with self._transaction() as conn:
             row = conn.execute(
                 "SELECT response_json FROM assistant_responses WHERE finding_id = ?",
@@ -1631,7 +1631,7 @@ class SQLiteEventStore(EventStore):
             ).fetchone()
             return json.loads(row["response_json"]) if row else None
 
-    def read_latest_ready_baseline(self, baseline_name: str = "default") -> Optional[Dict[str, Any]]:
+    def read_latest_ready_baseline(self, baseline_name: str = "default") -> dict[str, Any] | None:
         with self._transaction() as conn:
             row = conn.execute(
                 """
@@ -1678,8 +1678,8 @@ class SQLiteEventStore(EventStore):
         """
         base = "SELECT * FROM events"
         conditions = list(clauses)
-        cursor_timestamp: Optional[float] = None
-        cursor_id: Optional[int] = None
+        cursor_timestamp: float | None = None
+        cursor_id: int | None = None
 
         while True:
             page_conditions = list(conditions)
@@ -1708,7 +1708,7 @@ class SQLiteEventStore(EventStore):
             yield self._row_to_event(row)
 
 
-    def read_event_records(self, limit: int = 100, event_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    def read_event_records(self, limit: int = 100, event_type: str | None = None) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 500))
         with self._transaction() as conn:
             if event_type is None:
@@ -1733,7 +1733,7 @@ class SQLiteEventStore(EventStore):
                 records.append(record)
             return records
 
-    def read_event_record(self, event_id: int) -> Optional[Dict[str, Any]]:
+    def read_event_record(self, event_id: int) -> dict[str, Any] | None:
         with self._transaction() as conn:
             row = conn.execute(
                 "SELECT * FROM events WHERE id = ?",
@@ -1746,7 +1746,7 @@ class SQLiteEventStore(EventStore):
             record["payload"] = json.loads(record.pop("payload_json"))
             return record
 
-    def query(self, filters: Dict[str, Any]) -> Iterator[Event]:
+    def query(self, filters: dict[str, Any]) -> Iterator[Event]:
         if not filters:
             yield from self.read_all()
             return
@@ -1768,7 +1768,7 @@ class SQLiteEventStore(EventStore):
         for row in self._stream_event_rows(clauses, values):
             yield self._row_to_event(row)
 
-    def get_recent_events(self, limit: int = 100) -> List[Event]:
+    def get_recent_events(self, limit: int = 100) -> list[Event]:
         with self._transaction() as conn:
             rows = conn.execute(
                 "SELECT * FROM events ORDER BY timestamp DESC LIMIT ?",
@@ -1781,12 +1781,12 @@ class SQLiteEventStore(EventStore):
             row = conn.execute("SELECT COUNT(*) AS c FROM events").fetchone()
             return int(row["c"])
 
-    def latest_event_timestamp(self) -> Optional[float]:
+    def latest_event_timestamp(self) -> float | None:
         with self._transaction() as conn:
             row = conn.execute("SELECT MAX(timestamp) AS latest FROM events").fetchone()
             return float(row["latest"]) if row["latest"] is not None else None
 
-    def latest_event_timestamp_by_type(self) -> Dict[str, float]:
+    def latest_event_timestamp_by_type(self) -> dict[str, float]:
         """
         Newest event timestamp per `event_type`, for event types present at all.
 
@@ -1810,13 +1810,13 @@ class SQLiteEventStore(EventStore):
             if row["event_type"] is not None and row["latest"] is not None
         }
 
-    def oldest_event_timestamp(self) -> Optional[float]:
+    def oldest_event_timestamp(self) -> float | None:
         """Coverage floor of the database, and the number retention moves."""
         with self._transaction() as conn:
             row = conn.execute("SELECT MIN(timestamp) AS oldest FROM events").fetchone()
             return float(row["oldest"]) if row["oldest"] is not None else None
 
-    def write_maintenance_record(self, record: Dict[str, Any]) -> int:
+    def write_maintenance_record(self, record: dict[str, Any]) -> int:
         """Append one data-lifecycle action to the durable maintenance log."""
         with self._transaction() as conn:
             cursor = conn.execute(
@@ -1844,7 +1844,7 @@ class SQLiteEventStore(EventStore):
             assert cursor.lastrowid is not None
             return int(cursor.lastrowid)
 
-    def read_maintenance_records(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def read_maintenance_records(self, limit: int = 100) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 1000))
         with self._transaction() as conn:
             rows = conn.execute(
@@ -1881,7 +1881,7 @@ class SQLiteEventStore(EventStore):
             if removed < batch:
                 return deleted
 
-    def delete_oldest_events(self, count: int) -> Tuple[int, Optional[float]]:
+    def delete_oldest_events(self, count: int) -> tuple[int, float | None]:
         """
         Delete the `count` oldest events, returning how many went and the new floor.
 
@@ -1993,7 +1993,7 @@ class SQLiteEventStore(EventStore):
     # dashboard could never show. `tests/test_live_ingestion.py` asserts every
     # CollectorHealth field appears here, so adding one without a migration is a
     # test failure rather than a quiet hole in the record.
-    COLLECTOR_HEALTH_COLUMNS: Dict[str, Any] = {
+    COLLECTOR_HEALTH_COLUMNS: dict[str, Any] = {
         "status": "unknown",
         "detail": None,
         "error": None,
@@ -2020,7 +2020,7 @@ class SQLiteEventStore(EventStore):
         "quarantined_event_count": 0,
     }
 
-    def write_collector_health(self, health: Dict[str, Any]) -> None:
+    def write_collector_health(self, health: dict[str, Any]) -> None:
         columns = list(self.COLLECTOR_HEALTH_COLUMNS)
         placeholders = ", ".join("?" for _ in columns)
         assignments = ", ".join(f"{column}=excluded.{column}" for column in columns)
@@ -2041,7 +2041,7 @@ class SQLiteEventStore(EventStore):
                 tuple(values),
             )
 
-    def read_collector_health(self) -> Optional[Dict[str, Any]]:
+    def read_collector_health(self) -> dict[str, Any] | None:
         with self._transaction() as conn:
             row = conn.execute("SELECT * FROM collector_runtime WHERE id = 1").fetchone()
             return dict(row) if row else None
@@ -2050,7 +2050,7 @@ class SQLiteEventStore(EventStore):
     # omits one. Same declared-columns approach as COLLECTOR_HEALTH_COLUMNS, and
     # for the same reason: a supervision field the supervisor tracks but never
     # persists is a field the API and the operator cannot see.
-    COLLECTOR_SOURCE_COLUMNS: Dict[str, Any] = {
+    COLLECTOR_SOURCE_COLUMNS: dict[str, Any] = {
         "status": "unknown",
         "detail": None,
         "error": None,
@@ -2069,7 +2069,7 @@ class SQLiteEventStore(EventStore):
         "updated_at": None,
     }
 
-    def write_source_state(self, name: str, state: Dict[str, Any]) -> None:
+    def write_source_state(self, name: str, state: dict[str, Any]) -> None:
         """
         Upsert one collector's supervision state.
 
@@ -2084,7 +2084,7 @@ class SQLiteEventStore(EventStore):
         columns = list(self.COLLECTOR_SOURCE_COLUMNS)
         placeholders = ", ".join("?" for _ in columns)
         assignments = ", ".join(f"{column}=excluded.{column}" for column in columns)
-        values: List[Any] = []
+        values: list[Any] = []
         for column, default in self.COLLECTOR_SOURCE_COLUMNS.items():
             value = state.get(column, default)
             if value is None and default is not None:
@@ -2102,7 +2102,7 @@ class SQLiteEventStore(EventStore):
                 (name, *values),
             )
 
-    def read_source_states(self) -> List[Dict[str, Any]]:
+    def read_source_states(self) -> list[dict[str, Any]]:
         with self._transaction() as conn:
             rows = conn.execute("SELECT * FROM collector_sources ORDER BY name ASC").fetchall()
         states = []

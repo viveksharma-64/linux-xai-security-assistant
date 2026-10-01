@@ -22,16 +22,17 @@ import logging
 import math
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, asdict, field
+from collections.abc import Iterator
+from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Dict, Iterator, Optional, Union
+from typing import Any
 
 from pipeline import identity
 
 LOGGER = logging.getLogger(__name__)
 
 
-def _coerce_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+def _coerce_float(value: Any, default: float | None = None) -> float | None:
     """Safely coerce numeric values while rejecting invalid input."""
     if value is None:
         return default
@@ -45,7 +46,7 @@ def _coerce_float(value: Any, default: Optional[float] = None) -> Optional[float
     return default
 
 
-def _coerce_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+def _coerce_int(value: Any, default: int | None = None) -> int | None:
     if value is None or isinstance(value, bool):
         return default
     try:
@@ -137,22 +138,22 @@ class Event:
     # Core fields (present in all events)
     event_type: EventType
     timestamp: float  # Unix timestamp (seconds)
-    timestamp_ns: Optional[int] = None  # Kernel clock (nanoseconds, if available)
+    timestamp_ns: int | None = None  # Kernel clock (nanoseconds, if available)
     # CLOCK_MONOTONIC, valid only within boot_id. compare=False: see above.
-    timestamp_monotonic: Optional[float] = field(default=None, compare=False)
+    timestamp_monotonic: float | None = field(default=None, compare=False)
 
     # Process context (present in kernel events)
-    pid: Optional[int] = None
-    ppid: Optional[int] = None
-    uid: Optional[int] = None
-    gid: Optional[int] = None
-    comm: Optional[str] = None  # Process name
-    executable: Optional[str] = None
-    parent_comm: Optional[str] = None
-    ancestry: Optional[list] = None
+    pid: int | None = None
+    ppid: int | None = None
+    uid: int | None = None
+    gid: int | None = None
+    comm: str | None = None  # Process name
+    executable: str | None = None
+    parent_comm: str | None = None
+    ancestry: list | None = None
 
     # Event-specific payload
-    payload: Dict[str, Any] = field(default_factory=dict)  # Event-specific data
+    payload: dict[str, Any] = field(default_factory=dict)  # Event-specific data
 
     # Metadata
     source: str = "telemetry_bcc"  # Origin (BCC, auditd, etc.)
@@ -161,9 +162,9 @@ class Event:
     # Observation identity. Nullable because a container without /etc/machine-id
     # must still be able to ingest: an event with unknown provenance is worth
     # more than no event. See pipeline/identity.py.
-    host_id: Optional[str] = None
-    boot_id: Optional[str] = field(default=None, compare=False)
-    agent_id: Optional[str] = field(default=None, compare=False)
+    host_id: str | None = None
+    boot_id: str | None = field(default=None, compare=False)
+    agent_id: str | None = field(default=None, compare=False)
 
     def __post_init__(self):
         # object.__setattr__ because the dataclass is frozen. These are
@@ -174,7 +175,7 @@ class Event:
         if self.ancestry is None:
             object.__setattr__(self, "ancestry", [])
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert event to dictionary for JSON serialization."""
         return asdict(self)
 
@@ -325,7 +326,7 @@ class EventCollector(ABC):
     """
 
     @abstractmethod
-    def collect(self) -> Iterator[Dict[str, Any]]:
+    def collect(self) -> Iterator[dict[str, Any]]:
         """
         Collect raw events (as dicts/JSON).
 
@@ -344,7 +345,7 @@ class EventNormalizer(ABC):
     """
 
     @abstractmethod
-    def normalize(self, raw_event: Dict[str, Any]) -> Optional[Event]:
+    def normalize(self, raw_event: dict[str, Any]) -> Event | None:
         """
         Normalize a raw event to canonical Event.
 
@@ -381,7 +382,7 @@ class EventStore(ABC):
         pass
 
     @abstractmethod
-    def query(self, filters: Dict[str, Any]) -> Iterator[Event]:
+    def query(self, filters: dict[str, Any]) -> Iterator[Event]:
         """
         Query events by filter criteria.
 
@@ -406,9 +407,9 @@ class JSONLineCollector(EventCollector):
     def __init__(self, file_path: str):
         self.file_path = file_path
 
-    def collect(self) -> Iterator[Dict[str, Any]]:
+    def collect(self) -> Iterator[dict[str, Any]]:
         """Yield raw events from JSON lines file."""
-        with open(self.file_path, "r") as f:
+        with open(self.file_path) as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -434,7 +435,7 @@ class CanonicalNormalizer(EventNormalizer):
     would mean seven places to keep correct and seven ways to forget.
     """
 
-    def normalize(self, raw_event: Dict[str, Any]) -> Optional[Event]:
+    def normalize(self, raw_event: dict[str, Any]) -> Event | None:
         """Convert raw event to canonical Event or None if invalid."""
         try:
             if "event_type" not in raw_event or not raw_event.get("event_type"):
@@ -479,7 +480,7 @@ class CanonicalNormalizer(EventNormalizer):
             return None
 
     @staticmethod
-    def _stamp_observation(record: Dict[str, Any]) -> None:
+    def _stamp_observation(record: dict[str, Any]) -> None:
         """
         Record who observed this event and when, on the monotonic clock.
 
@@ -527,7 +528,7 @@ class InMemoryEventStore(EventStore):
         """Yield all stored events."""
         yield from self.events
 
-    def query(self, filters: Dict[str, Any]) -> Iterator[Event]:
+    def query(self, filters: dict[str, Any]) -> Iterator[Event]:
         """Simple in-memory filter."""
         for event in self.events:
             match = True

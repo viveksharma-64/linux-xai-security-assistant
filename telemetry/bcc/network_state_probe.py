@@ -5,7 +5,7 @@ import json
 import socket
 import sys
 import time
-from typing import Any, Optional
+from typing import Any
 
 # Importable both as a package module and as a sibling file: the documented way
 # to run this collector is `python3 telemetry/bcc/network_state_probe.py`, where
@@ -117,7 +117,7 @@ TRACEPOINT_PROBE(sock, inet_sock_set_state) {
 """
 
 
-def _decode_comm(value: Any) -> Optional[str]:
+def _decode_comm(value: Any) -> str | None:
     if isinstance(value, bytes):
         value = value.split(b"\0", 1)[0].decode("utf-8", "replace")
     if not isinstance(value, str):
@@ -126,7 +126,7 @@ def _decode_comm(value: Any) -> Optional[str]:
     return value or None
 
 
-def _decode_ipv4(value: Any) -> Optional[str]:
+def _decode_ipv4(value: Any) -> str | None:
     try:
         packed = bytes(value)
     except (TypeError, ValueError):
@@ -139,7 +139,7 @@ def _decode_ipv4(value: Any) -> Optional[str]:
         return None
 
 
-def normalize_state_event(event: Any, timestamp: Optional[float] = None) -> Optional[dict]:
+def normalize_state_event(event: Any, timestamp: float | None = None) -> dict | None:
     """Convert one tracepoint payload into the existing tcp_connect contract."""
     try:
         pid = int(event.pid)

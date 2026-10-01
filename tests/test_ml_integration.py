@@ -7,7 +7,13 @@ from explainability.explainer import FindingExplainer
 from ml.evaluation import MIN_NORMAL_HOLDOUT_WINDOWS, evaluate_threshold, normal_fpr_acceptance
 from ml.feature_schema import FEATURE_NAMES, extract_features, feature_vector, schema_hash
 from ml.scoring import MLScorer, MLScoringError
-from ml.training import SKLEARN_AVAILABLE, MLTrainingError, add_verified_normal_window, create_verified_normal_dataset, train_isolation_forest
+from ml.training import (
+    SKLEARN_AVAILABLE,
+    MLTrainingError,
+    add_verified_normal_window,
+    create_verified_normal_dataset,
+    train_isolation_forest,
+)
 from pipeline.event_stream import Event
 from storage.sqlite_store import SQLiteEventStore
 

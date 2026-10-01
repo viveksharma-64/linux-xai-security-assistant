@@ -44,20 +44,19 @@ an alert or it does not. Sub-MEDIUM findings (LOW) are treated as not-an-alert,
 so a window can carry a finding yet still be a true negative.
 """
 
-from dataclasses import dataclass, field
 import os
 import statistics
 import tempfile
-from typing import Any, Dict, List, Optional, Sequence
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from typing import Any
 
 from baseline.behavior_analyzer import BehaviorAnalyzer
 from detection.detector import DetectionEngine
 from ml.evaluation import _wilson_upper_bound
-from pipeline.event_stream import Event
-from storage.sqlite_store import SQLiteEventStore
-
 from simulation import corpus
 from simulation.corpus import LabeledWindow
+from storage.sqlite_store import SQLiteEventStore
 
 # --------------------------------------------------------------------------- #
 # Evaluation policy
@@ -92,8 +91,8 @@ class WindowOutcome:
     severity: str  # highest finding severity, or "NONE" when nothing was found
     max_risk_score: float  # highest fused score among findings, else 0.0
     finding_count: int
-    matched_rules: List[str] = field(default_factory=list)
-    attack: Optional[Dict[str, Any]] = None
+    matched_rules: list[str] = field(default_factory=list)
+    attack: dict[str, Any] | None = None
     description: str = ""
 
 
@@ -121,7 +120,7 @@ def build_analyzer(
     return analyzer
 
 
-def _matched_rule_ids(finding: Dict[str, Any]) -> List[str]:
+def _matched_rule_ids(finding: dict[str, Any]) -> list[str]:
     for item in finding.get("evidence", []):
         if item.get("signal") == "rule_fusion":
             return sorted(rule["rule_id"] for rule in item.get("rules", []) if rule.get("matched"))
@@ -171,7 +170,7 @@ def evaluate_window(
     )
 
 
-def _confusion(outcomes: Sequence[WindowOutcome]) -> Dict[str, Any]:
+def _confusion(outcomes: Sequence[WindowOutcome]) -> dict[str, Any]:
     """
     Confusion matrix + precision/recall/F1 over windows.
 
@@ -194,7 +193,7 @@ def _confusion(outcomes: Sequence[WindowOutcome]) -> Dict[str, Any]:
     }
 
 
-def _threshold_sweep(outcomes: Sequence[WindowOutcome]) -> List[Dict[str, Any]]:
+def _threshold_sweep(outcomes: Sequence[WindowOutcome]) -> list[dict[str, Any]]:
     """
     Precision/recall at each severity band if the flag gate were set there.
 
@@ -204,7 +203,7 @@ def _threshold_sweep(outcomes: Sequence[WindowOutcome]) -> List[Dict[str, Any]]:
     the higher bands quantify what raising the flag gate would cost, which is the
     evidence for leaving the bands unchanged (Deliverable 2).
     """
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     for band, threshold in _SEVERITY_BANDS:
         tp = sum(o.label == 1 and o.max_risk_score >= threshold for o in outcomes)
         fp = sum(o.label == 0 and o.max_risk_score >= threshold for o in outcomes)
@@ -227,7 +226,7 @@ def _threshold_sweep(outcomes: Sequence[WindowOutcome]) -> List[Dict[str, Any]]:
     return rows
 
 
-def _score_distribution(outcomes: Sequence[WindowOutcome]) -> Dict[str, Any]:
+def _score_distribution(outcomes: Sequence[WindowOutcome]) -> dict[str, Any]:
     """
     Per-group summary of the published per-window score, plus the separation gap.
 
@@ -238,7 +237,7 @@ def _score_distribution(outcomes: Sequence[WindowOutcome]) -> Dict[str, Any]:
     execution), so it is reported separately rather than folded into "benign".
     """
 
-    def summarize(group: List[WindowOutcome]) -> Optional[Dict[str, Any]]:
+    def summarize(group: list[WindowOutcome]) -> dict[str, Any] | None:
         if not group:
             return None
         scores = sorted(o.max_risk_score for o in group)
@@ -270,8 +269,8 @@ def run_efficacy(
     seed: int = corpus.DEFAULT_SEED,
     benign_clean: int = corpus.DEFAULT_BENIGN_CLEAN_WINDOWS,
     baseline_execs: int = corpus.DEFAULT_BASELINE_EXECS,
-    store: Optional[SQLiteEventStore] = None,
-) -> Dict[str, Any]:
+    store: SQLiteEventStore | None = None,
+) -> dict[str, Any]:
     """
     Run the full corpus and return a published-metrics report.
 
@@ -286,7 +285,7 @@ def run_efficacy(
     # in-memory DB -- would lose the schema before first use. A temp file is what
     # the store's tests use for the same reason.
     owned_store = store is None
-    tmp_dir: Optional[tempfile.TemporaryDirectory] = None
+    tmp_dir: tempfile.TemporaryDirectory | None = None
     if owned_store:
         tmp_dir = tempfile.TemporaryDirectory(prefix="efficacy-")
         store = SQLiteEventStore(os.path.join(tmp_dir.name, "efficacy.db"))

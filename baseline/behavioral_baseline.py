@@ -1,6 +1,7 @@
 import math
 from collections import Counter
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from collections.abc import Iterable, Sequence
+from typing import Any
 
 from pipeline.event_stream import CanonicalNormalizer, Event, EventType
 
@@ -19,14 +20,14 @@ class BehavioralBaseline:
         self.minimum_samples = minimum_samples
         self.time_window_seconds = time_window_seconds
 
-    def _normalize_event(self, event: Any) -> Optional[Event]:
+    def _normalize_event(self, event: Any) -> Event | None:
         if isinstance(event, Event):
             return event
         if isinstance(event, dict):
             return CanonicalNormalizer().normalize(event)
         return None
 
-    def _extract_exec_events(self, events: Sequence[Event]) -> List[Event]:
+    def _extract_exec_events(self, events: Sequence[Event]) -> list[Event]:
         return [event for event in events if event and event.event_type == EventType.PROCESS_EXEC]
 
     def _window_counts(self, events: Sequence[Event], bucket_seconds: int = 60) -> Counter:
@@ -43,7 +44,7 @@ class BehavioralBaseline:
             return 0.0
         return float(numerator) / float(denominator)
 
-    def feature_summary(self, events: Sequence[Event]) -> Dict[str, Any]:
+    def feature_summary(self, events: Sequence[Event]) -> dict[str, Any]:
         exec_events = self._extract_exec_events(events)
         command_counts = Counter(event.comm for event in exec_events if event.comm)
         executable_counts = Counter(event.executable for event in exec_events if event.executable)
@@ -83,7 +84,7 @@ class BehavioralBaseline:
             "sample_window_seconds": self.time_window_seconds,
         }
 
-    def learn(self, events: Iterable[Any]) -> Dict[str, Any]:
+    def learn(self, events: Iterable[Any]) -> dict[str, Any]:
         normalized_events = []
         for event in events:
             parsed = self._normalize_event(event)
@@ -123,9 +124,9 @@ class BehavioralBaseline:
     def _event_feature_vector(
         self,
         event: Event,
-        baseline_summary: Dict[str, Any],
-        current_summary: Dict[str, Any],
-    ) -> Dict[str, Any]:
+        baseline_summary: dict[str, Any],
+        current_summary: dict[str, Any],
+    ) -> dict[str, Any]:
         command_name = event.comm or "unknown"
         uid_value = event.uid if event.uid is not None else -1
 
@@ -160,7 +161,7 @@ class BehavioralBaseline:
             "burst_ratio": min(1.0, burst_excess),
         }
 
-    def score_events(self, events: Iterable[Any], baseline_summary: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    def score_events(self, events: Iterable[Any], baseline_summary: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         normalized_events = []
         for event in events:
             parsed = self._normalize_event(event)
@@ -174,7 +175,7 @@ class BehavioralBaseline:
             baseline_summary = self.feature_summary(normalized_events)
         current_summary = self.feature_summary(normalized_events)
 
-        scored: List[Dict[str, Any]] = []
+        scored: list[dict[str, Any]] = []
         exec_events = self._extract_exec_events(normalized_events)
         if not exec_events:
             return scored

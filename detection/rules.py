@@ -22,9 +22,10 @@ raised as `RuleCatalogError`, never silently defaulted -- the same posture
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any
 
 from pipeline.event_stream import Event
 
@@ -53,7 +54,7 @@ class RuleResult:
     rule_id: str
     matched: bool
     score: float
-    evidence: Dict[str, Any]
+    evidence: dict[str, Any]
     explanation: str
     # Provenance stamped from the catalog entry. Defaulted so a RuleResult built
     # by hand in a test stays valid; every rule-produced result sets them.
@@ -86,7 +87,7 @@ class SecurityRule(ABC):
         self.mitre = dict(mitre)
         self.enabled = bool(enabled)
 
-    def _result(self, matched: bool, evidence: Dict[str, Any], explanation: str) -> RuleResult:
+    def _result(self, matched: bool, evidence: dict[str, Any], explanation: str) -> RuleResult:
         return RuleResult(
             rule_id=self.rule_id,
             matched=matched,
@@ -104,12 +105,12 @@ class SecurityRule(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def evaluate(self, context: Dict[str, Any]) -> RuleResult:
+    def evaluate(self, context: dict[str, Any]) -> RuleResult:
         """Evaluate one explicit rule against a detection context."""
         raise NotImplementedError
 
 
-def _common(entry: Mapping[str, Any]) -> Dict[str, Any]:
+def _common(entry: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "rule_id": entry["rule_id"],
         "version": entry["version"],
@@ -133,7 +134,7 @@ class PrivilegedUnusualExecutionRule(SecurityRule):
             **_common(entry),
         )
 
-    def evaluate(self, context: Dict[str, Any]) -> RuleResult:
+    def evaluate(self, context: dict[str, Any]) -> RuleResult:
         events: Sequence[Event] = context["events"]
         behavior_score = float(context["behavior_score"])
         matches = [
@@ -164,7 +165,7 @@ class SuspiciousUtilityActivityRule(SecurityRule):
             **_common(entry),
         )
 
-    def evaluate(self, context: Dict[str, Any]) -> RuleResult:
+    def evaluate(self, context: dict[str, Any]) -> RuleResult:
         events: Sequence[Event] = context["events"]
         behavior_score = float(context["behavior_score"])
         commands = sorted({event.comm or "unknown" for event in events})
@@ -192,7 +193,7 @@ class ExecutionBurstRule(SecurityRule):
             **_common(entry),
         )
 
-    def evaluate(self, context: Dict[str, Any]) -> RuleResult:
+    def evaluate(self, context: dict[str, Any]) -> RuleResult:
         features = context["features"]
         peak = int(features.get("burst_activity", {}).get("peak_execs_per_second", 0))
         total = int(features.get("execution_frequency", 0))
@@ -214,7 +215,7 @@ class MultiUidActivityRule(SecurityRule):
     def from_entry(cls, entry: Mapping[str, Any]) -> "MultiUidActivityRule":
         return cls(min_unique_uids=entry["min_unique_uids"], **_common(entry))
 
-    def evaluate(self, context: Dict[str, Any]) -> RuleResult:
+    def evaluate(self, context: dict[str, Any]) -> RuleResult:
         features = context["features"]
         unique_uids = int(features.get("unique_uids", 0))
         matched = unique_uids >= self.min_unique_uids
@@ -261,7 +262,7 @@ def _validate_entry(catalog_path: Path, entry: Any, seen: set) -> None:
             raise RuleCatalogError(f"rule {rule_id} needs a non-empty {text_field}")
 
 
-def load_catalog(path: Optional[Any] = None) -> Dict[str, Any]:
+def load_catalog(path: Any | None = None) -> dict[str, Any]:
     """
     Parse and validate a rules catalog, returning the whole document.
 
@@ -297,7 +298,7 @@ def load_catalog(path: Optional[Any] = None) -> Dict[str, Any]:
     return dict(document)
 
 
-def load_rules(path: Optional[Any] = None) -> List[SecurityRule]:
+def load_rules(path: Any | None = None) -> list[SecurityRule]:
     """
     Build one rule instance per enabled catalog entry (bundled catalog default).
 
@@ -307,7 +308,7 @@ def load_rules(path: Optional[Any] = None) -> List[SecurityRule]:
     load, not mid-detection.
     """
     document = load_catalog(path)
-    rules: List[SecurityRule] = []
+    rules: list[SecurityRule] = []
     for entry in document["rules"]:
         if not entry.get("enabled", True):
             continue
@@ -325,6 +326,6 @@ def load_rules(path: Optional[Any] = None) -> List[SecurityRule]:
     return rules
 
 
-def default_rules() -> List[SecurityRule]:
+def default_rules() -> list[SecurityRule]:
     """The engine's default rule set: every enabled rule in the bundled catalog."""
     return load_rules()

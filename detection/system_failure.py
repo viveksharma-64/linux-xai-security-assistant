@@ -50,7 +50,8 @@ import hashlib
 import json
 import threading
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from collections.abc import Sequence
+from typing import Any
 
 from observability.config import Settings
 from pipeline.event_stream import Event, EventType
@@ -74,7 +75,7 @@ def _window_start_for(ts: float) -> float:
 # Configurable thresholds (all read from Settings; see observability/config.py)
 # ---------------------------------------------------------------------------
 
-def _thresholds(settings: Settings) -> Dict[str, Any]:
+def _thresholds(settings: Settings) -> dict[str, Any]:
     """Return all failure thresholds as a plain dict for evidence embedding."""
     return {
         "failure_memory_high_pct": settings.failure_memory_high_pct,
@@ -144,9 +145,9 @@ class _HysteresisCounter:
         self._breach_count: int = 0
         self._clear_count: int = 0
         self._active: bool = False
-        self._last_window: Optional[float] = None
+        self._last_window: float | None = None
 
-    def observe(self, in_breach: bool, window_start: float) -> Tuple[bool, bool]:
+    def observe(self, in_breach: bool, window_start: float) -> tuple[bool, bool]:
         """
         Record one window observation.
 
@@ -196,7 +197,7 @@ class _ServiceState:
     """Per-unit crash-loop tracking: unit → list of 'failed' event timestamps."""
 
     def __init__(self) -> None:
-        self._failures: Dict[str, List[float]] = defaultdict(list)
+        self._failures: dict[str, list[float]] = defaultdict(list)
 
     def record_failure(self, unit: str, timestamp: float) -> None:
         self._failures[unit].append(timestamp)
@@ -221,11 +222,11 @@ class SystemFailureScorer:
     system action.
     """
 
-    def __init__(self, store: SQLiteEventStore, settings: Optional[Settings] = None) -> None:
+    def __init__(self, store: SQLiteEventStore, settings: Settings | None = None) -> None:
         self.store = store
-        self._settings: Optional[Settings] = settings
+        self._settings: Settings | None = settings
         # Per-host hysteresis state — keyed by host_id (falls back to "unknown")
-        self._host_states: Dict[str, _HostState] = {}
+        self._host_states: dict[str, _HostState] = {}
         # Per-unit crash-loop tracking
         self._service_state = _ServiceState()
         # One scorer instance is shared by every consumer thread of a
@@ -257,7 +258,7 @@ class SystemFailureScorer:
     # Provenance hash (same structure as detector.py but failure-specific)
     # ------------------------------------------------------------------
 
-    def _provenance_hash(self, finding: Dict[str, Any]) -> str:
+    def _provenance_hash(self, finding: dict[str, Any]) -> str:
         # The hash pins the identity of a finding for dedup. It intentionally
         # covers only the STABLE identity of the condition — detector, window,
         # entity, and the condition/severity — not the fluctuating observed
@@ -301,9 +302,9 @@ class SystemFailureScorer:
         risk_score: float,
         condition: str,
         detail: str,
-        threshold_context: Dict[str, Any],
+        threshold_context: dict[str, Any],
         consecutive_windows: int,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Construct a failure finding dict ready for write_detection_finding."""
         severity = self._severity(risk_score)
         evidence = [
@@ -321,7 +322,7 @@ class SystemFailureScorer:
             f"entity={entity_type}:{entity_key}; "
             f"consecutive_windows={consecutive_windows}"
         )
-        finding: Dict[str, Any] = {
+        finding: dict[str, Any] = {
             "detector_version": FAILURE_DETECTOR_VERSION,
             "source_risk_id": None,
             "window_start": window_start,
@@ -352,7 +353,7 @@ class SystemFailureScorer:
         self,
         events: Sequence[Event],
         persist: bool = True,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """
         Group SYSTEM_HEALTH and SERVICE_STATE events into epoch-aligned 300s
         windows and score each window in increasing window order.
@@ -367,14 +368,14 @@ class SystemFailureScorer:
         separately: ascending window order only advances the counters correctly
         if no other thread interleaves a later window part-way through.
         """
-        by_window: Dict[float, List[Event]] = defaultdict(list)
+        by_window: dict[float, list[Event]] = defaultdict(list)
         for event in events:
             if event.event_type not in (EventType.SYSTEM_HEALTH, EventType.SERVICE_STATE):
                 continue
             ws = _window_start_for(float(event.timestamp))
             by_window[ws].append(event)
 
-        findings: List[Dict[str, Any]] = []
+        findings: list[dict[str, Any]] = []
         with self._lock:
             for ws in sorted(by_window):
                 findings.extend(
@@ -392,7 +393,7 @@ class SystemFailureScorer:
         window_start: float,
         window_end: float,
         persist: bool = True,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """
         Score a single window of events for system failures.
 
@@ -418,13 +419,13 @@ class SystemFailureScorer:
         window_start: float,
         window_end: float,
         persist: bool = True,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Score one window. The caller must hold ``self._lock``."""
         s = self._s()
 
         # Partition by type within this window
-        health_events: List[Event] = []
-        service_events: List[Event] = []
+        health_events: list[Event] = []
+        service_events: list[Event] = []
         for event in events:
             ts = float(event.timestamp)
             if not (window_start <= ts < window_end):
@@ -434,7 +435,7 @@ class SystemFailureScorer:
             elif event.event_type == EventType.SERVICE_STATE:
                 service_events.append(event)
 
-        findings: List[Dict[str, Any]] = []
+        findings: list[dict[str, Any]] = []
         findings.extend(
             self._score_health(health_events, window_start, window_end, s, persist)
         )
@@ -449,22 +450,22 @@ class SystemFailureScorer:
 
     def _score_health(
         self,
-        events: List[Event],
+        events: list[Event],
         window_start: float,
         window_end: float,
         s: Settings,
         persist: bool,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         if not events:
             return []
 
         # Group by host_id; fall back to "unknown" if absent
-        by_host: Dict[str, List[Event]] = defaultdict(list)
+        by_host: dict[str, list[Event]] = defaultdict(list)
         for event in events:
             host_id = event.host_id or "unknown"
             by_host[host_id].append(event)
 
-        findings: List[Dict[str, Any]] = []
+        findings: list[dict[str, Any]] = []
         for host_id, host_events in by_host.items():
             findings.extend(
                 self._score_host(host_id, host_events, window_start, window_end, s, persist)
@@ -474,12 +475,12 @@ class SystemFailureScorer:
     def _score_host(
         self,
         host_id: str,
-        events: List[Event],
+        events: list[Event],
         window_start: float,
         window_end: float,
         s: Settings,
         persist: bool,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         # Use the last sample in the window as representative (most recent).
         rep = max(events, key=lambda e: float(e.timestamp))
         payload = rep.payload or {}
@@ -492,7 +493,7 @@ class SystemFailureScorer:
         state = self._host_state(host_id)
         thresholds = _thresholds(s)
         ratio = s.failure_clear_ratio
-        findings: List[Dict[str, Any]] = []
+        findings: list[dict[str, Any]] = []
 
         # --- disk full (HIGH) ---
         # A None reading is "unknown": we do NOT observe the counter, so a gap in
@@ -610,20 +611,20 @@ class SystemFailureScorer:
 
     def _score_service(
         self,
-        events: List[Event],
+        events: list[Event],
         window_start: float,
         window_end: float,
         s: Settings,
         persist: bool,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         # Aggregate to at most one finding per unit per window. A window may
         # carry several 'failed' reports for one unit (repeated restarts); they
         # collapse into a single finding whose crash-loop count reflects the
         # rolling window. The most recent failure timestamp in the window drives
         # the crash-loop lookback.
-        failed_ts_by_unit: Dict[str, List[float]] = defaultdict(list)
-        last_action_by_unit: Dict[str, Optional[str]] = {}
-        last_result_by_unit: Dict[str, Optional[str]] = {}
+        failed_ts_by_unit: dict[str, list[float]] = defaultdict(list)
+        last_action_by_unit: dict[str, str | None] = {}
+        last_result_by_unit: dict[str, str | None] = {}
 
         for event in events:
             payload = event.payload or {}
@@ -637,7 +638,7 @@ class SystemFailureScorer:
                 last_action_by_unit[unit] = action
                 last_result_by_unit[unit] = result
 
-        findings: List[Dict[str, Any]] = []
+        findings: list[dict[str, Any]] = []
         for unit in sorted(failed_ts_by_unit):
             timestamps = sorted(failed_ts_by_unit[unit])
             # Record every failure so the rolling crash-loop window spans batches,
@@ -681,7 +682,7 @@ class SystemFailureScorer:
     # Persistence helper
     # ------------------------------------------------------------------
 
-    def _persist_maybe(self, finding: Dict[str, Any], persist: bool) -> Dict[str, Any]:
+    def _persist_maybe(self, finding: dict[str, Any], persist: bool) -> dict[str, Any]:
         if persist:
             finding["id"] = self.store.write_detection_finding(finding)
         return finding

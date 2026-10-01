@@ -48,7 +48,8 @@ import os
 import sys
 import tempfile
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from collections.abc import Callable
+from typing import Any
 
 # Runnable as a bare script from anywhere: put the repository root on the path so
 # the package imports resolve without a PYTHONPATH incantation.
@@ -80,7 +81,7 @@ _DISPOSITIONS = ("true-positive", "false-positive", "benign")
 # --------------------------------------------------------------- synthetic data
 
 
-def _raw_event(seq: int) -> Dict[str, Any]:
+def _raw_event(seq: int) -> dict[str, Any]:
     # A process_exec event shaped like the exec probe's output. `seq` keeps the
     # content hash unique so dedupe does not silently absorb the batch and flatter
     # both the write rate and the row count the read curve is measured against.
@@ -99,7 +100,7 @@ def _raw_event(seq: int) -> Dict[str, Any]:
     }
 
 
-def _finding(seq: int) -> Dict[str, Any]:
+def _finding(seq: int) -> dict[str, Any]:
     # A minimal but valid finding. provenance_hash is the dedup key
     # (sqlite_store.write_detection_finding): a unique, seq-derived hash is what
     # makes every finding extend the chain instead of collapsing onto an existing
@@ -120,14 +121,14 @@ def _finding(seq: int) -> Dict[str, Any]:
         "explanation": f"synthetic scale finding {seq}",
         "mode": "monitor",
         "provenance_hash": hashlib.sha256(
-            f"scale-finding-{seq}".encode("utf-8")
+            f"scale-finding-{seq}".encode()
         ).hexdigest(),
         "detector_version": "scale-harness",
         "correlation_id": f"corr-{seq % 256}",
     }
 
 
-def _policy(seq: int, finding_id: int) -> Dict[str, Any]:
+def _policy(seq: int, finding_id: int) -> dict[str, Any]:
     # Advisory-only and dry_run throughout: the synthetic corpus never proposes an
     # active response, mirroring the system's own posture.
     return {
@@ -149,7 +150,7 @@ def _policy(seq: int, finding_id: int) -> Dict[str, Any]:
 # ------------------------------------------------------------------- utilities
 
 
-def _percentile(sorted_values: List[float], fraction: float) -> float:
+def _percentile(sorted_values: list[float], fraction: float) -> float:
     if not sorted_values:
         return float("nan")
     index = min(
@@ -158,9 +159,9 @@ def _percentile(sorted_values: List[float], fraction: float) -> float:
     return sorted_values[index]
 
 
-def _time_repeated(fn: Callable[[], Any], repeats: int) -> Dict[str, float]:
+def _time_repeated(fn: Callable[[], Any], repeats: int) -> dict[str, float]:
     """Run `fn` `repeats` times and return read-latency percentiles in ms."""
-    samples: List[float] = []
+    samples: list[float] = []
     for _ in range(repeats):
         start = time.perf_counter()
         fn()
@@ -182,10 +183,10 @@ def _populate_events(
     start_seq: int,
     count: int,
     batch: int,
-) -> Tuple[int, float]:
+) -> tuple[int, float]:
     """Write `count` fresh events via the real normalize+write_events path."""
     inserted = 0
-    pending: List[Any] = []
+    pending: list[Any] = []
     start = time.perf_counter()
     for seq in range(start_seq, start_seq + count):
         event = normalizer.normalize(_raw_event(seq))
@@ -234,7 +235,7 @@ def _populate_ml_floor(store: SQLiteEventStore, count: int) -> None:
 # ----------------------------------------------------------------- measurement
 
 
-def _measure_event_reads(store: SQLiteEventStore, repeats: int) -> Dict[str, Any]:
+def _measure_event_reads(store: SQLiteEventStore, repeats: int) -> dict[str, Any]:
     return {
         "count_events_ms": _time_repeated(store.count_events, repeats),
         "get_recent_100_ms": _time_repeated(
@@ -251,7 +252,7 @@ def _measure_event_reads(store: SQLiteEventStore, repeats: int) -> Dict[str, Any
 
 def _measure_finding_reads(
     store: SQLiteEventStore, total: int, repeats: int
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     deep_offset = max(0, total - 100)
     return {
         "first_page_ms": _time_repeated(
@@ -280,7 +281,7 @@ def _measure_finding_reads(
     }
 
 
-def _verify(fn: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
+def _verify(fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
     start = time.perf_counter()
     verdict = fn()
     seconds = time.perf_counter() - start
@@ -293,7 +294,7 @@ def _verify(fn: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _measure_chains(store: SQLiteEventStore) -> Dict[str, Any]:
+def _measure_chains(store: SQLiteEventStore) -> dict[str, Any]:
     return {
         "findings": _verify(store.verify_findings_chain),
         "policy": _verify(store.verify_policy_chain),
@@ -302,7 +303,7 @@ def _measure_chains(store: SQLiteEventStore) -> Dict[str, Any]:
     }
 
 
-def _measure_retention(store: SQLiteEventStore) -> Dict[str, Any]:
+def _measure_retention(store: SQLiteEventStore) -> dict[str, Any]:
     """
     Drive age prune, size cap, and a standalone VACUUM at the top event tier, and
     record both their (illustrative) cost and the (deterministic) invariants they
@@ -411,16 +412,16 @@ def _measure_retention(store: SQLiteEventStore) -> Dict[str, Any]:
 
 
 def run_event_sweep(
-    tiers: Tuple[int, ...],
+    tiers: tuple[int, ...],
     batch: int,
     repeats: int,
     db_path: str,
     measure_retention: bool = True,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Grow events cumulatively through `tiers`, measuring reads at each tier."""
     store = SQLiteEventStore(db_path)
     normalizer = CanonicalNormalizer()
-    reports: List[Dict[str, Any]] = []
+    reports: list[dict[str, Any]] = []
     written = 0
     seq = 0
     for target in tiers:
@@ -456,11 +457,11 @@ def run_event_sweep(
 
 
 def run_finding_sweep(
-    tiers: Tuple[int, ...],
+    tiers: tuple[int, ...],
     repeats: int,
     ml_floor: int,
     db_path: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Grow the finding / triage / policy chains cumulatively through `tiers`,
     measuring the page query and all four chain verifications at each tier. The ML
@@ -468,7 +469,7 @@ def run_finding_sweep(
     """
     store = SQLiteEventStore(db_path)
     _populate_ml_floor(store, ml_floor)
-    reports: List[Dict[str, Any]] = []
+    reports: list[dict[str, Any]] = []
     written = 0
     seq = 0
     for target in tiers:
@@ -501,10 +502,10 @@ def run_finding_sweep(
 
 
 def check_invariants(
-    event_sweep: Dict[str, Any], finding_sweep: Dict[str, Any]
-) -> List[str]:
+    event_sweep: dict[str, Any], finding_sweep: dict[str, Any]
+) -> list[str]:
     """Return a list of invariant violations; empty means everything held."""
-    violations: List[str] = []
+    violations: list[str] = []
 
     for tier in event_sweep["tiers"]:
         n = tier["events_in_db"]
@@ -545,11 +546,11 @@ def check_invariants(
 # ----------------------------------------------------------------- presentation
 
 
-def _fmt_pct(block: Dict[str, float]) -> str:
+def _fmt_pct(block: dict[str, float]) -> str:
     return f"p50={block['p50']:.3f} p95={block['p95']:.3f} p99={block['p99']:.3f}"
 
 
-def print_report(event_sweep: Dict[str, Any], finding_sweep: Dict[str, Any]) -> None:
+def print_report(event_sweep: dict[str, Any], finding_sweep: dict[str, Any]) -> None:
     print("=" * 78)
     print("EVENT SWEEP  (write throughput held at volume, and bounded read latency)")
     print("=" * 78)
@@ -606,14 +607,14 @@ def print_report(event_sweep: Dict[str, Any], finding_sweep: Dict[str, Any]) -> 
 # ------------------------------------------------------------------------ main
 
 
-def _parse_tiers(text: str) -> Tuple[int, ...]:
+def _parse_tiers(text: str) -> tuple[int, ...]:
     tiers = tuple(int(part) for part in text.split(",") if part.strip())
     if not tiers:
         raise argparse.ArgumentTypeError("expected a comma-separated list of integers")
     return tiers
 
 
-def _with_temp_db(prefix: str, fn: Callable[[str], Dict[str, Any]]) -> Dict[str, Any]:
+def _with_temp_db(prefix: str, fn: Callable[[str], dict[str, Any]]) -> dict[str, Any]:
     """Run `fn` against a fresh temp database path, cleaning up all sidecars."""
     handle, db_path = tempfile.mkstemp(prefix=prefix, suffix=".db")
     os.close(handle)
@@ -628,7 +629,7 @@ def _with_temp_db(prefix: str, fn: Callable[[str], Dict[str, Any]]) -> Dict[str,
                 pass
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--event-tiers", type=_parse_tiers, default=DEFAULT_EVENT_TIERS)
     parser.add_argument(
@@ -648,8 +649,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.check:
         # A tiny, fast corpus: --check proves the invariant logic and that the
         # harness builds valid chains, without the volume a timing run needs.
-        event_tiers: Tuple[int, ...] = (200,)
-        finding_tiers: Tuple[int, ...] = (50,)
+        event_tiers: tuple[int, ...] = (200,)
+        finding_tiers: tuple[int, ...] = (50,)
         repeats = 3
         ml_floor = 20
     else:

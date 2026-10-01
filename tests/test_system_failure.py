@@ -15,15 +15,14 @@ import pytest
 
 from detection.system_failure import (
     FAILURE_DETECTOR_VERSION,
-    SystemFailureScorer,
     WINDOW_SECONDS,
+    SystemFailureScorer,
     _breach_high,
     _breach_low,
 )
 from observability.config import ConfigError, Settings, _validate
 from pipeline.event_stream import Event, EventType
 from storage.sqlite_store import SQLiteEventStore
-
 
 # ---------------------------------------------------------------------------
 # Fixtures / builders

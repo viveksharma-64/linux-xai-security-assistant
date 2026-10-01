@@ -40,7 +40,8 @@ of X (see `decision_function`), which is what makes the parity bitwise rather
 than merely close.
 """
 
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import numpy as np
 

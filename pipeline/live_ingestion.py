@@ -52,10 +52,11 @@ import subprocess
 import threading
 import time
 from collections import deque
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from queue import Empty, Full, Queue
-from typing import Any, Callable, cast, Iterable, Iterator, Optional
+from typing import Any, cast
 
 from assistant.service import AssistantService
 from baseline.behavior_analyzer import BehaviorAnalyzer
@@ -67,7 +68,6 @@ from pipeline.event_stream import CanonicalNormalizer, Event
 from pipeline.quarantine import BatchQuarantine
 from policy.engine import PolicyEngine
 from storage.sqlite_store import SQLiteEventStore
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -112,16 +112,16 @@ def _crossed_order_of_magnitude(before: int, after: int) -> bool:
 class CollectorHealth:
     status: str = "unknown"
     detail: str = ""
-    error: Optional[str] = None
-    started_at: Optional[float] = None
-    stopped_at: Optional[float] = None
-    last_event_timestamp: Optional[float] = None
+    error: str | None = None
+    started_at: float | None = None
+    stopped_at: float | None = None
+    last_event_timestamp: float | None = None
     processed_count: int = 0
     malformed_count: int = 0
     dropped_event_count: int = 0
     duplicate_count: int = 0
     throughput: float = 0.0
-    updated_at: Optional[float] = None
+    updated_at: float | None = None
     # Backpressure and event-loss accounting. `backpressure_wait_count` counts
     # every event that had to wait for queue space, whether or not it was
     # eventually queued, so dropped_event_count <= backpressure_wait_count
@@ -132,16 +132,16 @@ class CollectorHealth:
     queue_high_water_mark: int = 0
     backpressure_wait_seconds: float = 0.0
     backpressure_wait_count: int = 0
-    first_drop_timestamp: Optional[float] = None
-    last_drop_timestamp: Optional[float] = None
+    first_drop_timestamp: float | None = None
+    last_drop_timestamp: float | None = None
     # Kernel-side loss, reported by the collector rather than observed here. Held
     # apart from dropped_event_count because the two have different causes and
     # different fixes: a perf ring overrun means the collector could not drain
     # the kernel fast enough, while a dropped event means this consumer could not
     # keep up with the collector. Summing them would hide which one is happening.
     kernel_lost_event_count: int = 0
-    first_kernel_loss_timestamp: Optional[float] = None
-    last_kernel_loss_timestamp: Optional[float] = None
+    first_kernel_loss_timestamp: float | None = None
+    last_kernel_loss_timestamp: float | None = None
     # Batches the database refused, set aside for replay. Counted separately from
     # every other loss figure because it is the only one that is recoverable: the
     # events still exist on disk, and the operator's action is a replay rather
@@ -160,9 +160,9 @@ class SubprocessJSONLSource:
         if not command:
             raise ValueError("collector command is required")
         self.command = list(command)
-        self.process: Optional[subprocess.Popen[str]] = None
+        self.process: subprocess.Popen[str] | None = None
         self._stderr_lines: deque[str] = deque(maxlen=20)
-        self._stderr_thread: Optional[threading.Thread] = None
+        self._stderr_thread: threading.Thread | None = None
         self._closed = threading.Event()
 
     def __iter__(self) -> Iterator[str]:
@@ -248,7 +248,7 @@ class SubprocessJSONLSource:
 class DatabaseAnalysisPipeline:
     """Run existing analysis stages without learning from monitoring data."""
 
-    def __init__(self, store: SQLiteEventStore, policy_path: Optional[str] = None, ml_scorer: Optional[Any] = None):
+    def __init__(self, store: SQLiteEventStore, policy_path: str | None = None, ml_scorer: Any | None = None):
         self.store = store
         self.analyzer = BehaviorAnalyzer(store)
         self.detector = DetectionEngine(store, ml_scorer=ml_scorer)
@@ -291,13 +291,13 @@ class LiveIngestionService:
         source: Iterable[RawInput],
         store: SQLiteEventStore,
         queue_size: int = 1024,
-        normalizer: Optional[CanonicalNormalizer] = None,
-        analysis_pipeline: Optional[Callable[[list[Event]], None]] = None,
+        normalizer: CanonicalNormalizer | None = None,
+        analysis_pipeline: Callable[[list[Event]], None] | None = None,
         health_interval_seconds: float = 1.0,
         backpressure_timeout_seconds: float = 2.0,
         ingest_batch_size: int = 50,
-        quarantine: Optional[BatchQuarantine] = None,
-        source_name: Optional[str] = None,
+        quarantine: BatchQuarantine | None = None,
+        source_name: str | None = None,
     ):
         if queue_size <= 0:
             raise ValueError("queue_size must be positive")
@@ -328,8 +328,8 @@ class LiveIngestionService:
         self._stop = threading.Event()
         self._producer_done = threading.Event()
         self._health_lock = threading.Lock()
-        self._producer: Optional[threading.Thread] = None
-        self._consumer: Optional[threading.Thread] = None
+        self._producer: threading.Thread | None = None
+        self._consumer: threading.Thread | None = None
         self._health = CollectorHealth(queue_capacity=queue_size)
         self._queue_depth = 0
         self._queue_high_water_mark = 0

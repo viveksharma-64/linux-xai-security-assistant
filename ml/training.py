@@ -1,11 +1,11 @@
 """Explicit verified-normal dataset capture and Isolation Forest training."""
 
-import os
 import platform
 import sys
 import time
 import uuid
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 try:
     import numpy as np
@@ -25,7 +25,6 @@ from ml.feature_schema import FEATURE_NAMES, SCHEMA_VERSION, extract_features, s
 from ml.iforest import export_from_sklearn
 from pipeline.event_stream import Event
 from storage.sqlite_store import SQLiteEventStore
-
 
 MIN_TRAINING_WINDOWS = 10
 MIN_DISTINCT_TRAINING_WINDOWS = 3

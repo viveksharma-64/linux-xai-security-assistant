@@ -5,7 +5,8 @@ import argparse
 import json
 import re
 import subprocess
-from typing import Any, Iterable, Iterator, Optional
+from collections.abc import Iterable, Iterator
+from typing import Any
 
 # Importable both as a package module and as a sibling file: this collector is
 # run as `python3 telemetry/journald/service_monitor.py`, where the repository
@@ -22,7 +23,7 @@ COLLECTOR_NAME = "service"
 _UNIT_NAME = re.compile(r"\b(?P<unit>[^\s]+\.(?:service|target|scope|timer|socket|path))\b")
 
 
-def _lifecycle(message: str) -> Optional[tuple[str, str, str]]:
+def _lifecycle(message: str) -> tuple[str, str, str] | None:
     """Classify only explicit systemd-manager lifecycle statements."""
     unit_match = _UNIT_NAME.search(message)
     if unit_match is None:
@@ -37,7 +38,7 @@ def _lifecycle(message: str) -> Optional[tuple[str, str, str]]:
     return None
 
 
-def normalize_journal_record(record: dict[str, Any]) -> Optional[dict[str, Any]]:
+def normalize_journal_record(record: dict[str, Any]) -> dict[str, Any] | None:
     """Map an explicit systemd unit lifecycle record without inferring state."""
     reporter_unit = record.get("_SYSTEMD_UNIT")
     message = record.get("MESSAGE")

@@ -42,7 +42,8 @@ links, because earlier rows are never re-serialized.
 
 import hashlib
 import json
-from typing import Any, Dict, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 # The prev-hash recorded by the first link in a chain. A fixed, all-zero digest
 # rather than NULL so the genesis row is hashed by the same rule as every other
@@ -196,7 +197,7 @@ def link_hash(seq: int, prev_hash: str, serialized: str) -> str:
     unambiguous (a hash is fixed-length hex and the seq is digits, so neither can
     absorb the delimiter).
     """
-    return hashlib.sha256(f"{seq}\n{prev_hash}\n{serialized}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{seq}\n{prev_hash}\n{serialized}".encode()).hexdigest()
 
 
 def next_link(
@@ -204,7 +205,7 @@ def next_link(
     prev_hash: Any,
     columns: Sequence[str],
     row: Mapping[str, Any],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Compute the chain fields for the row that follows `(prev_seq, prev_hash)`.
 
@@ -223,7 +224,7 @@ def next_link(
     }
 
 
-def verify_chain(columns: Sequence[str], rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+def verify_chain(columns: Sequence[str], rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """
     Recompute a whole chain from stored columns and report the first break.
 

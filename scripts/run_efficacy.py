@@ -23,7 +23,7 @@ import argparse
 import json
 import os
 import sys
-from typing import Any, Dict, List
+from typing import Any
 
 # Runnable as a bare script from anywhere: put the repository root on the path so
 # the package imports resolve without a PYTHONPATH incantation.
@@ -52,13 +52,13 @@ def _f2(value: Any) -> str:
     return "n/a" if value is None else f"{float(value):.2f}"
 
 
-def render_markdown(report: Dict[str, Any]) -> str:
+def render_markdown(report: dict[str, Any]) -> str:
     """Render the efficacy report as deterministic Markdown (one trailing newline)."""
     manifest = report["manifest"]
     cm = report["confusion_matrix"]
     outcomes_by_name = {o.name: o for o in report["outcomes"]}
 
-    lines: List[str] = []
+    lines: list[str] = []
     lines.append("# Detection Efficacy")
     lines.append("")
     lines.append(_GENERATED_NOTE)
@@ -283,7 +283,7 @@ def render_markdown(report: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def main(argv: List[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the detection-efficacy harness.")
     parser.add_argument("--seed", type=int, default=efficacy.corpus.DEFAULT_SEED)
     parser.add_argument("--benign-clean", type=int, default=efficacy.corpus.DEFAULT_BENIGN_CLEAN_WINDOWS)
@@ -314,7 +314,7 @@ def main(argv: List[str] | None = None) -> int:
 
     if args.check:
         try:
-            with open(args.output, "r", encoding="utf-8") as handle:
+            with open(args.output, encoding="utf-8") as handle:
                 current = handle.read()
         except OSError as error:
             print(f"cannot read {args.output}: {error}", file=sys.stderr)

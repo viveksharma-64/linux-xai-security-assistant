@@ -1,11 +1,10 @@
-import json
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from collections.abc import Iterable, Mapping
+from typing import Any
 
 from detection.rules import RuleCatalogError, load_catalog
 from storage.sqlite_store import SQLiteEventStore
 
-
-UNAVAILABLE_TELEMETRY: List[str] = []
+UNAVAILABLE_TELEMETRY: list[str] = []
 
 
 # Counterfactual boundaries per rule: what observed signal had to cross which
@@ -15,8 +14,8 @@ UNAVAILABLE_TELEMETRY: List[str] = []
 # A rule_id absent here yields no boundary rather than a fabricated one; the
 # comparator is `>=` because every rule below matches on meeting-or-exceeding.
 def _boundaries_privileged_unusual_execution(
-    item_evidence: Mapping[str, Any], entry: Mapping[str, Any], finding: Dict[str, Any]
-) -> List[Dict[str, Any]]:
+    item_evidence: Mapping[str, Any], entry: Mapping[str, Any], finding: dict[str, Any]
+) -> list[dict[str, Any]]:
     return [
         {"signal": "behavior_score", "observed": round(float(finding["behavior_score"]), 4),
          "comparator": ">=", "threshold": float(entry["behavior_gate"])},
@@ -26,8 +25,8 @@ def _boundaries_privileged_unusual_execution(
 
 
 def _boundaries_suspicious_utility_activity(
-    item_evidence: Mapping[str, Any], entry: Mapping[str, Any], finding: Dict[str, Any]
-) -> List[Dict[str, Any]]:
+    item_evidence: Mapping[str, Any], entry: Mapping[str, Any], finding: dict[str, Any]
+) -> list[dict[str, Any]]:
     observed_behavior = item_evidence.get("behavior_score_gate", finding["behavior_score"])
     return [
         {"signal": "behavior_score", "observed": round(float(observed_behavior), 4),
@@ -38,8 +37,8 @@ def _boundaries_suspicious_utility_activity(
 
 
 def _boundaries_execution_burst(
-    item_evidence: Mapping[str, Any], entry: Mapping[str, Any], finding: Dict[str, Any]
-) -> List[Dict[str, Any]]:
+    item_evidence: Mapping[str, Any], entry: Mapping[str, Any], finding: dict[str, Any]
+) -> list[dict[str, Any]]:
     return [
         {"signal": "peak_execs_per_second", "observed": int(item_evidence.get("peak_execs_per_second", 0)),
          "comparator": ">=", "threshold": int(entry["peak_execs_per_second"])},
@@ -49,8 +48,8 @@ def _boundaries_execution_burst(
 
 
 def _boundaries_multi_uid_activity(
-    item_evidence: Mapping[str, Any], entry: Mapping[str, Any], finding: Dict[str, Any]
-) -> List[Dict[str, Any]]:
+    item_evidence: Mapping[str, Any], entry: Mapping[str, Any], finding: dict[str, Any]
+) -> list[dict[str, Any]]:
     return [
         {"signal": "unique_uids", "observed": int(item_evidence.get("unique_uids", 0)),
          "comparator": ">=", "threshold": int(entry["min_unique_uids"])},
@@ -79,9 +78,9 @@ class FindingExplainer:
         # only for counterfactual thresholds. Loading is deferred and never fatal:
         # a missing or malformed catalog degrades the counterfactual to "threshold
         # unavailable", it does not stop an explanation being produced.
-        self._catalog_by_id: Optional[Dict[str, Mapping[str, Any]]] = None
+        self._catalog_by_id: dict[str, Mapping[str, Any]] | None = None
 
-    def _require_fields(self, finding: Dict[str, Any]) -> None:
+    def _require_fields(self, finding: dict[str, Any]) -> None:
         required = {
             "id",
             "window_start",
@@ -100,7 +99,7 @@ class FindingExplainer:
         if missing:
             raise ValueError(f"finding is missing required fields: {', '.join(missing)}")
 
-    def _evidence_by_signal(self, finding: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    def _evidence_by_signal(self, finding: dict[str, Any]) -> dict[str, dict[str, Any]]:
         evidence = finding["evidence"]
         if not isinstance(evidence, list):
             raise ValueError("finding evidence must be a list")
@@ -115,7 +114,7 @@ class FindingExplainer:
             raise ValueError(f"finding evidence is missing signals: {', '.join(missing)}")
         return by_signal
 
-    def _calculation(self, finding: Dict[str, Any], evidence: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    def _calculation(self, finding: dict[str, Any], evidence: dict[str, dict[str, Any]]) -> dict[str, Any]:
         behavior_score = float(finding["behavior_score"])
         rule_score = float(finding["rule_score"])
         context_score = float(finding["context_score"])
@@ -160,7 +159,7 @@ class FindingExplainer:
             "severity": finding["severity"],
         }
 
-    def _rule_catalog(self) -> Dict[str, Mapping[str, Any]]:
+    def _rule_catalog(self) -> dict[str, Mapping[str, Any]]:
         if self._catalog_by_id is None:
             try:
                 document = load_catalog()
@@ -174,8 +173,8 @@ class FindingExplainer:
         return self._catalog_by_id
 
     def _counterfactual_factor(
-        self, finding: Dict[str, Any], evidence: Dict[str, Dict[str, Any]]
-    ) -> Dict[str, Any]:
+        self, finding: dict[str, Any], evidence: dict[str, dict[str, Any]]
+    ) -> dict[str, Any]:
         """
         Which matched-rule thresholds, if not crossed, would drop the rule signal.
 
@@ -192,12 +191,12 @@ class FindingExplainer:
             if item.get("matched")
         ]
         rule_score = round(float(finding["rule_score"]), 4)
-        details: List[Dict[str, Any]] = []
+        details: list[dict[str, Any]] = []
         for item in matched:
             rule_id = item.get("rule_id")
             entry = catalog.get(rule_id)
             builder = _COUNTERFACTUAL_BOUNDARIES.get(rule_id)
-            record: Dict[str, Any] = {
+            record: dict[str, Any] = {
                 "rule_id": rule_id,
                 "score": round(float(item.get("score", 0.0)), 4),
                 "version_recorded": item.get("version"),
@@ -256,7 +255,7 @@ class FindingExplainer:
             },
         }
 
-    def _cross_finding_factor(self, finding: Dict[str, Any]) -> Dict[str, Any]:
+    def _cross_finding_factor(self, finding: dict[str, Any]) -> dict[str, Any]:
         """
         Sibling findings sharing this finding's correlation id.
 
@@ -309,7 +308,7 @@ class FindingExplainer:
             },
         }
 
-    def _baseline_factors(self, finding: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _baseline_factors(self, finding: dict[str, Any]) -> list[dict[str, Any]]:
         """
         Baseline provenance (FACT) plus a sufficiency judgment (INTERPRETATION).
 
@@ -378,7 +377,7 @@ class FindingExplainer:
             },
         ]
 
-    def explain_finding(self, finding: Dict[str, Any], persist: bool = True) -> Dict[str, Any]:
+    def explain_finding(self, finding: dict[str, Any], persist: bool = True) -> dict[str, Any]:
         """Build one explanation from a stored or detector-produced finding."""
         self._require_fields(finding)
         evidence = self._evidence_by_signal(finding)
@@ -495,6 +494,6 @@ class FindingExplainer:
             self.store.write_explanation(explanation)
         return explanation
 
-    def explain_all(self, findings: Optional[Iterable[Dict[str, Any]]] = None, persist: bool = True) -> List[Dict[str, Any]]:
+    def explain_all(self, findings: Iterable[dict[str, Any]] | None = None, persist: bool = True) -> list[dict[str, Any]]:
         records = list(findings) if findings is not None else self.store.read_detection_findings()
         return [self.explain_finding(finding, persist=persist) for finding in records]

@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from observability.config import Settings
 from observability.config import settings as load_process_settings
@@ -60,11 +60,11 @@ class Alert:
     # The measured value and the threshold it crossed, so the alert is
     # self-justifying: an operator should not have to query anything to see why it
     # fired or what would clear it.
-    value: Optional[float] = None
-    threshold: Optional[float] = None
-    labels: Optional[Dict[str, str]] = None
+    value: float | None = None
+    threshold: float | None = None
+    labels: dict[str, str] | None = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "severity": self.severity,
@@ -77,9 +77,9 @@ class Alert:
 
 def evaluate(
     snapshot: MetricsSnapshot,
-    config: Optional[Settings] = None,
-    chain_status: Optional[Dict[str, bool]] = None,
-) -> List[Alert]:
+    config: Settings | None = None,
+    chain_status: dict[str, bool] | None = None,
+) -> list[Alert]:
     """
     All conditions currently firing, worst first.
 
@@ -99,7 +99,7 @@ def evaluate(
     demand at `/api/integrity`, but does not appear on `/api/alerts`.
     """
     resolved = config or load_process_settings()
-    alerts: List[Alert] = []
+    alerts: list[Alert] = []
 
     if snapshot.database_error:
         alerts.append(
@@ -272,7 +272,7 @@ def evaluate(
     return alerts
 
 
-def log_alerts(alerts: List[Alert]) -> None:
+def log_alerts(alerts: list[Alert]) -> None:
     """
     Emit each alert to the log at a level matching its severity.
 

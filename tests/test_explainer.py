@@ -1,6 +1,6 @@
+from baseline.behavior_analyzer import BehaviorAnalyzer
 from detection.detector import DetectionEngine
 from explainability.explainer import FindingExplainer
-from baseline.behavior_analyzer import BehaviorAnalyzer
 from pipeline.event_stream import Event
 from storage.sqlite_store import SQLiteEventStore
 

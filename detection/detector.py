@@ -1,7 +1,8 @@
-from collections import defaultdict
 import hashlib
 import json
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from collections import defaultdict
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
 
 from detection.rules import RuleResult, SecurityRule, default_rules
 from pipeline.event_stream import Event
@@ -29,10 +30,10 @@ class DetectionEngine:
     def __init__(
         self,
         store: SQLiteEventStore,
-        rules: Optional[Sequence[SecurityRule]] = None,
+        rules: Sequence[SecurityRule] | None = None,
         persist: bool = True,
-        ml_scorer: Optional[Any] = None,
-        suppressions: Optional[Sequence[Mapping[str, Any]]] = None,
+        ml_scorer: Any | None = None,
+        suppressions: Sequence[Mapping[str, Any]] | None = None,
     ):
         self.store = store
         self.rules = list(rules) if rules is not None else default_rules()
@@ -42,7 +43,7 @@ class DetectionEngine:
         self.suppressions = self._validate_suppressions(suppressions or [])
 
     @staticmethod
-    def _validate_suppressions(specs: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    def _validate_suppressions(specs: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         """
         Normalize and fail-closed-validate operator suppression specs.
 
@@ -51,7 +52,7 @@ class DetectionEngine:
         ``matched_rule`` (a spec matching everything would silently mute the whole
         detector). ``entity_type`` is an optional additional constraint.
         """
-        validated: List[Dict[str, Any]] = []
+        validated: list[dict[str, Any]] = []
         for spec in specs:
             if not isinstance(spec, Mapping):
                 raise ValueError("each suppression spec must be a mapping")
@@ -74,7 +75,7 @@ class DetectionEngine:
             )
         return validated
 
-    def _provenance_hash(self, finding: Dict[str, Any]) -> str:
+    def _provenance_hash(self, finding: dict[str, Any]) -> str:
         material = {
             "detector_version": self.detector_version,
             "window_start": finding["window_start"],
@@ -90,7 +91,7 @@ class DetectionEngine:
         encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
-    def _events_for_risk(self, risk: Dict[str, Any], events: Sequence[Event]) -> List[Event]:
+    def _events_for_risk(self, risk: dict[str, Any], events: Sequence[Event]) -> list[Event]:
         start = float(risk["window_start"])
         end = float(risk["window_end"])
         entity_type = risk["entity_type"]
@@ -107,7 +108,7 @@ class DetectionEngine:
                 matching.append(event)
         return matching
 
-    def _context_score(self, events: Sequence[Event], features: Dict[str, Any]) -> float:
+    def _context_score(self, events: Sequence[Event], features: dict[str, Any]) -> float:
         score = 0.0
         if any(event.uid == 0 for event in events):
             score += 0.60
@@ -117,10 +118,10 @@ class DetectionEngine:
             score += 0.20
         return min(1.0, score)
 
-    def _window_events(self, risk: Dict[str, Any], events: Sequence[Event]) -> List[Event]:
+    def _window_events(self, risk: dict[str, Any], events: Sequence[Event]) -> list[Event]:
         return [event for event in events if float(risk["window_start"]) <= float(event.timestamp) < float(risk["window_end"])]
 
-    def _ml_evidence(self, risk: Dict[str, Any], events: Sequence[Event]) -> Dict[str, Any]:
+    def _ml_evidence(self, risk: dict[str, Any], events: Sequence[Event]) -> dict[str, Any]:
         if self.ml_scorer is None:
             return {"available": False, "reason": "no compatible ML model is configured"}
         try:
@@ -146,9 +147,9 @@ class DetectionEngine:
 
     def _finding(
         self,
-        risk: Dict[str, Any],
+        risk: dict[str, Any],
         events: Sequence[Event],
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         behavior_score = float(risk["anomaly_score"])
         features = risk["contributing_features"]
         context = {
@@ -244,7 +245,7 @@ class DetectionEngine:
         key = f"{entity_type}|{entity_key}|{float(anchor_window_start)!r}"
         return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
-    def _assign_correlation(self, findings: Sequence[Dict[str, Any]]) -> None:
+    def _assign_correlation(self, findings: Sequence[dict[str, Any]]) -> None:
         """
         Group findings about one entity across a contiguous run of windows.
 
@@ -255,13 +256,13 @@ class DetectionEngine:
         for a given batch and identical inputs yield identical ids. It is a
         triage-grouping key, not an incident-timeline reconstruction.
         """
-        by_entity: Dict[Any, List[Dict[str, Any]]] = defaultdict(list)
+        by_entity: dict[Any, list[dict[str, Any]]] = defaultdict(list)
         for finding in findings:
             by_entity[(finding["entity_type"], str(finding["entity_key"]))].append(finding)
         for (entity_type, entity_key), group in by_entity.items():
             group.sort(key=lambda item: float(item["window_start"]))
-            run_anchor: Optional[float] = None
-            prev_end: Optional[float] = None
+            run_anchor: float | None = None
+            prev_end: float | None = None
             for finding in group:
                 start = float(finding["window_start"])
                 end = float(finding["window_end"])
@@ -272,13 +273,13 @@ class DetectionEngine:
                 prev_end = end if prev_end is None else max(prev_end, end)
 
     @staticmethod
-    def _matched_rule_ids(finding: Dict[str, Any]) -> set:
+    def _matched_rule_ids(finding: dict[str, Any]) -> set:
         for item in finding["evidence"]:
             if item.get("signal") == "rule_fusion":
                 return {rule["rule_id"] for rule in item["rules"] if rule["matched"]}
         return set()
 
-    def _apply_suppressions(self, findings: Sequence[Dict[str, Any]]) -> None:
+    def _apply_suppressions(self, findings: Sequence[dict[str, Any]]) -> None:
         """
         Apply operator suppression specs as a disposition, never a drop.
 
@@ -289,7 +290,7 @@ class DetectionEngine:
         if not self.suppressions:
             return
         for finding in findings:
-            matched_rules: Optional[set] = None
+            matched_rules: set | None = None
             for spec in self.suppressions:
                 if spec["entity_type"] is not None and spec["entity_type"] != finding["entity_type"]:
                     continue
@@ -306,10 +307,10 @@ class DetectionEngine:
 
     def detect(
         self,
-        risks: Optional[Iterable[Dict[str, Any]]] = None,
-        events: Optional[Iterable[Event]] = None,
-        persist: Optional[bool] = None,
-    ) -> Dict[str, Any]:
+        risks: Iterable[dict[str, Any]] | None = None,
+        events: Iterable[Event] | None = None,
+        persist: bool | None = None,
+    ) -> dict[str, Any]:
         risk_records = list(risks) if risks is not None else self.store.read_risk_records()
         event_records = list(events) if events is not None else list(self.store.read_all())
         findings = []

@@ -24,7 +24,6 @@ Stop with Ctrl+C.
 Requires: bpfcc-tools, python3-bpfcc (see scripts/verify_environment.sh)
 """
 
-import ctypes as ct
 import json
 import socket
 import struct

@@ -1,6 +1,6 @@
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Literal
 
 import yaml
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -17,7 +17,6 @@ from observability import metrics as metrics_module
 from observability.config import Settings
 from observability.config import settings as load_process_settings
 from storage.sqlite_store import MAX_TRIAGE_ANNOTATION_LIMIT, SQLiteEventStore
-
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_POLICY_PATH = ROOT / "policy" / "default_policy.yaml"
@@ -83,11 +82,11 @@ class HealthResponse(StrictModel):
 class TelemetrySource(StrictModel):
     status: str
     detail: str
-    last_event_timestamp: Optional[float] = None
+    last_event_timestamp: float | None = None
 
 
 class TelemetryStatusResponse(StrictModel):
-    sources: Dict[str, TelemetrySource]
+    sources: dict[str, TelemetrySource]
 
 
 class StatusResponse(StrictModel):
@@ -95,68 +94,68 @@ class StatusResponse(StrictModel):
     read_only: bool
     total_events: int
     total_detections: int
-    severity_counts: Dict[str, int]
+    severity_counts: dict[str, int]
     baseline_status: str
-    telemetry: Dict[str, TelemetrySource]
+    telemetry: dict[str, TelemetrySource]
     collector_status: str
     collector_detail: str
     event_count: int
-    last_event_timestamp: Optional[float] = None
+    last_event_timestamp: float | None = None
     stale_data: bool
-    dropped_event_count: Optional[int] = None
-    collector_error: Optional[str] = None
+    dropped_event_count: int | None = None
+    collector_error: str | None = None
     collector_throughput: float = 0.0
     collector_processed_count: int = 0
     collector_malformed_count: int = 0
-    collector_updated_at: Optional[float] = None
+    collector_updated_at: float | None = None
     # Backpressure and event-loss detail. Optional because a database written
     # before these columns existed, or one no collector has ever reported into,
     # has nothing to say -- and "unknown" must not be rendered as zero loss.
-    collector_queue_depth: Optional[int] = None
-    collector_queue_capacity: Optional[int] = None
-    collector_queue_high_water_mark: Optional[int] = None
-    collector_backpressure_wait_count: Optional[int] = None
-    collector_backpressure_wait_seconds: Optional[float] = None
-    first_drop_timestamp: Optional[float] = None
-    last_drop_timestamp: Optional[float] = None
+    collector_queue_depth: int | None = None
+    collector_queue_capacity: int | None = None
+    collector_queue_high_water_mark: int | None = None
+    collector_backpressure_wait_count: int | None = None
+    collector_backpressure_wait_seconds: float | None = None
+    first_drop_timestamp: float | None = None
+    last_drop_timestamp: float | None = None
     # Kernel-side loss, reported by the collector rather than observed by the
     # supervisor. Separate from dropped_event_count because a kernel ring-buffer
     # overrun (perf or BPF ring) and a full ingestion queue are different
     # failures with different fixes.
-    kernel_lost_event_count: Optional[int] = None
-    first_kernel_loss_timestamp: Optional[float] = None
-    last_kernel_loss_timestamp: Optional[float] = None
+    kernel_lost_event_count: int | None = None
+    first_kernel_loss_timestamp: float | None = None
+    last_kernel_loss_timestamp: float | None = None
 
 
 class EventResponse(StrictModel):
     id: int
     event_type: str
     timestamp: float
-    timestamp_ns: Optional[int] = None
-    timestamp_monotonic: Optional[float] = None
-    pid: Optional[int] = None
-    ppid: Optional[int] = None
-    uid: Optional[int] = None
-    gid: Optional[int] = None
-    comm: Optional[str] = None
-    executable: Optional[str] = None
-    parent_comm: Optional[str] = None
-    ancestry: List[Dict[str, Any]] = Field(default_factory=list)
-    source: Optional[str] = None
-    version: Optional[str] = None
-    event_hash: Optional[str] = None
+    timestamp_ns: int | None = None
+    timestamp_monotonic: float | None = None
+    pid: int | None = None
+    ppid: int | None = None
+    uid: int | None = None
+    gid: int | None = None
+    comm: str | None = None
+    executable: str | None = None
+    parent_comm: str | None = None
+    ancestry: list[dict[str, Any]] = Field(default_factory=list)
+    source: str | None = None
+    version: str | None = None
+    event_hash: str | None = None
     # Which host, boot, and agent observed the event. Null for rows written
     # before identity existed, and for hosts with no readable machine-id -- the
     # dashboard must be able to say "unknown", not imply a single host.
-    host_id: Optional[str] = None
-    boot_id: Optional[str] = None
-    agent_id: Optional[str] = None
-    payload: Dict[str, Any]
+    host_id: str | None = None
+    boot_id: str | None = None
+    agent_id: str | None = None
+    payload: dict[str, Any]
 
 
 class FindingResponse(StrictModel):
     id: int
-    source_risk_id: Optional[int] = None
+    source_risk_id: int | None = None
     window_start: float
     window_end: float
     entity_type: str
@@ -166,24 +165,24 @@ class FindingResponse(StrictModel):
     behavior_score: float = Field(ge=0.0, le=1.0)
     rule_score: float = Field(ge=0.0, le=1.0)
     context_score: float = Field(ge=0.0, le=1.0)
-    evidence: List[Dict[str, Any]]
+    evidence: list[dict[str, Any]]
     explanation: str
     mode: str
-    provenance_hash: Optional[str] = None
-    detector_version: Optional[str] = None
-    created_at: Optional[float] = None
+    provenance_hash: str | None = None
+    detector_version: str | None = None
+    created_at: float | None = None
     # Correlation/suppression disposition (migration 8). Suppression is a
     # disposition only -- it never alters a score; a suppressed finding is still
     # persisted, explained, and chained.
-    correlation_id: Optional[str] = None
+    correlation_id: str | None = None
     suppressed: bool = False
-    suppression_reason: Optional[str] = None
+    suppression_reason: str | None = None
     # Append-only evidence-chain integrity (migration 8). Surfaced so an API
     # consumer can independently verify continuity; Optional so a pre-chain
     # legacy row still serializes rather than 500-ing the read API.
-    chain_seq: Optional[int] = None
-    chain_prev_hash: Optional[str] = None
-    chain_hash: Optional[str] = None
+    chain_seq: int | None = None
+    chain_prev_hash: str | None = None
+    chain_hash: str | None = None
     # Effective triage state (Phase D, migration 9), folded read-only from the
     # append-only annotation layer -- never a mutation of the finding row above.
     # Defaulted so the readers that do not enrich (single lookup falls back to a
@@ -191,7 +190,7 @@ class FindingResponse(StrictModel):
     # a pre-triage client sees benign defaults. `triage_suppressed` is the
     # *effective* suppression (config `suppressed` OR the latest analyst suppress
     # not since lifted); the immutable `suppressed` column is left truthful above.
-    triage_disposition: Optional[str] = None
+    triage_disposition: str | None = None
     triage_acknowledged: bool = False
     triage_suppressed: bool = False
     triage_annotation_count: int = 0
@@ -200,15 +199,15 @@ class FindingResponse(StrictModel):
 class ExplanationResponse(StrictModel):
     finding_id: int
     timestamp: float
-    window: Dict[str, float]
+    window: dict[str, float]
     severity: str
     risk_score: float = Field(ge=0.0, le=1.0)
     summary: str
-    contributing_factors: List[Dict[str, Any]]
-    evidence: List[Dict[str, Any]]
-    calculation: Dict[str, Any]
-    data_sources: List[str]
-    limitations: List[str]
+    contributing_factors: list[dict[str, Any]]
+    evidence: list[dict[str, Any]]
+    calculation: dict[str, Any]
+    data_sources: list[str]
+    limitations: list[str]
     mode: str
 
 
@@ -216,22 +215,22 @@ class AssistantStatusResponse(StrictModel):
     finding_id: int
     status: str
     message: str
-    response: Optional[Dict[str, Any]] = None
+    response: dict[str, Any] | None = None
 
 
 class PolicyResponse(StrictModel):
     policy_id: str
     priority: int
-    match: Dict[str, Any]
+    match: dict[str, Any]
     decision: str
     required_approval: bool
     proposed_action: str
-    allowed_recommendation_keywords: List[str]
+    allowed_recommendation_keywords: list[str]
 
 
 class PolicyDecisionResponse(StrictModel):
     id: int
-    finding_id: Optional[int] = None
+    finding_id: int | None = None
     policy_id: str
     decision: str
     reason: str
@@ -239,15 +238,15 @@ class PolicyDecisionResponse(StrictModel):
     severity: str
     required_approval: bool
     proposed_action: str
-    limitations: List[str]
+    limitations: list[str]
     timestamp: float
     dry_run: bool
-    advisory_rejection: Optional[str] = None
+    advisory_rejection: str | None = None
     # Append-only evidence-chain integrity (migration 8), Optional for the same
     # reason as FindingResponse: a pre-chain legacy row still serializes.
-    chain_seq: Optional[int] = None
-    chain_prev_hash: Optional[str] = None
-    chain_hash: Optional[str] = None
+    chain_seq: int | None = None
+    chain_prev_hash: str | None = None
+    chain_hash: str | None = None
 
 
 class LivenessResponse(StrictModel):
@@ -260,10 +259,10 @@ class ReadinessResponse(StrictModel):
     # Every failing condition, not the first one. An operator restarting a service
     # because of stale data should also learn in the same response that the file
     # permissions are wrong, rather than after the restart fails to help.
-    reasons: List[str]
+    reasons: list[str]
     event_count: int
-    data_age_seconds: Optional[float] = None
-    degraded_sources: List[str]
+    data_age_seconds: float | None = None
+    degraded_sources: list[str]
     collected_at: float
 
 
@@ -271,37 +270,37 @@ class AlertResponse(StrictModel):
     name: str
     severity: str
     summary: str
-    value: Optional[float] = None
-    threshold: Optional[float] = None
-    labels: Dict[str, str]
+    value: float | None = None
+    threshold: float | None = None
+    labels: dict[str, str]
 
 
 class AlertsResponse(StrictModel):
     firing: int
     critical: int
     warning: int
-    alerts: List[AlertResponse]
+    alerts: list[AlertResponse]
     collected_at: float
 
 
 class SourceStateResponse(StrictModel):
     name: str
     status: str
-    detail: Optional[str] = None
-    error: Optional[str] = None
-    started_at: Optional[float] = None
-    stopped_at: Optional[float] = None
-    last_event_timestamp: Optional[float] = None
+    detail: str | None = None
+    error: str | None = None
+    started_at: float | None = None
+    stopped_at: float | None = None
+    last_event_timestamp: float | None = None
     processed_count: int
     restart_count: int
     consecutive_failures: int
-    last_failure_at: Optional[float] = None
-    next_restart_at: Optional[float] = None
+    last_failure_at: float | None = None
+    next_restart_at: float | None = None
     backoff_seconds: float
     crash_looping: bool
     quarantined_batch_count: int
     quarantined_event_count: int
-    updated_at: Optional[float] = None
+    updated_at: float | None = None
 
 
 class MaintenanceRecordResponse(StrictModel):
@@ -310,12 +309,12 @@ class MaintenanceRecordResponse(StrictModel):
     reason: str
     events_deleted: int
     rows_deleted: int
-    cutoff_timestamp: Optional[float] = None
-    oldest_retained_timestamp: Optional[float] = None
-    db_bytes_before: Optional[int] = None
-    db_bytes_after: Optional[int] = None
+    cutoff_timestamp: float | None = None
+    oldest_retained_timestamp: float | None = None
+    db_bytes_before: int | None = None
+    db_bytes_after: int | None = None
     duration_seconds: float
-    detail: Optional[str] = None
+    detail: str | None = None
     created_at: float
 
 
@@ -342,19 +341,19 @@ _MAX_ACTOR = 256
 
 
 class TriageAcknowledgeRequest(StrictModel):
-    note: Optional[str] = Field(default=None, max_length=_MAX_NOTE)
-    actor: Optional[str] = Field(default=None, max_length=_MAX_ACTOR)
+    note: str | None = Field(default=None, max_length=_MAX_NOTE)
+    actor: str | None = Field(default=None, max_length=_MAX_ACTOR)
 
 
 class TriageAnnotateRequest(StrictModel):
     note: str = Field(min_length=1, max_length=_MAX_NOTE)
-    actor: Optional[str] = Field(default=None, max_length=_MAX_ACTOR)
+    actor: str | None = Field(default=None, max_length=_MAX_ACTOR)
 
 
 class TriageDispositionRequest(StrictModel):
     disposition: TriageDisposition
-    note: Optional[str] = Field(default=None, max_length=_MAX_NOTE)
-    actor: Optional[str] = Field(default=None, max_length=_MAX_ACTOR)
+    note: str | None = Field(default=None, max_length=_MAX_NOTE)
+    actor: str | None = Field(default=None, max_length=_MAX_ACTOR)
 
 
 class TriageSuppressRequest(StrictModel):
@@ -362,27 +361,27 @@ class TriageSuppressRequest(StrictModel):
     # alerting/presentation decision the record must justify, never a silent
     # drop. Stored as the annotation's note.
     reason: str = Field(min_length=1, max_length=_MAX_NOTE)
-    actor: Optional[str] = Field(default=None, max_length=_MAX_ACTOR)
+    actor: str | None = Field(default=None, max_length=_MAX_ACTOR)
 
 
 class TriageAnnotationResponse(StrictModel):
     id: int
     finding_id: int
     action: str
-    disposition: Optional[str] = None
-    note: Optional[str] = None
-    actor: Optional[str] = None
+    disposition: str | None = None
+    note: str | None = None
+    actor: str | None = None
     created_at: float
     # The triage layer is itself hash-chained (migration 9), so a recorded
     # disposition is as tamper-evident as the finding it annotates.
-    chain_seq: Optional[int] = None
-    chain_prev_hash: Optional[str] = None
-    chain_hash: Optional[str] = None
+    chain_seq: int | None = None
+    chain_prev_hash: str | None = None
+    chain_hash: str | None = None
 
 
 class TriageStateResponse(StrictModel):
     finding_id: int
-    disposition: Optional[str] = None
+    disposition: str | None = None
     acknowledged: bool = False
     # Config suppression lives on the immutable finding row; analyst suppression
     # is the latest suppress/unsuppress in the annotation layer. Both are shown,
@@ -395,14 +394,14 @@ class TriageStateResponse(StrictModel):
 class TriageHistoryResponse(StrictModel):
     finding_id: int
     state: TriageStateResponse
-    annotations: List[TriageAnnotationResponse]
+    annotations: list[TriageAnnotationResponse]
 
 
 class ChainVerdictResponse(StrictModel):
     ok: bool
     checked: int
-    break_seq: Optional[int] = None
-    reason: Optional[str] = None
+    break_seq: int | None = None
+    reason: str | None = None
 
 
 class IntegrityResponse(StrictModel):
@@ -429,20 +428,20 @@ class IntegrityResponse(StrictModel):
 # was trained but never evaluated, say) still serializes rather than 500-ing the read.
 class ModelLifecycleTransitionResponse(StrictModel):
     model_id: str
-    from_state: Optional[str] = None
+    from_state: str | None = None
     to_state: str
     reason: str
     # The recorded gate verdict lives under evidence['acceptance'] for eligible/active
     # rows; passed through as-is so the numbers behind an eligibility claim travel with it.
-    evidence: Dict[str, Any] = Field(default_factory=dict)
+    evidence: dict[str, Any] = Field(default_factory=dict)
     activation_eligible: bool = False
-    actor: Optional[str] = None
+    actor: str | None = None
     created_at: float
     # The lifecycle log is itself hash-chained (migration 10), so this history is as
     # tamper-evident as the findings it can influence.
-    chain_seq: Optional[int] = None
-    chain_prev_hash: Optional[str] = None
-    chain_hash: Optional[str] = None
+    chain_seq: int | None = None
+    chain_prev_hash: str | None = None
+    chain_hash: str | None = None
 
 
 class DriftSummaryResponse(StrictModel):
@@ -452,13 +451,13 @@ class DriftSummaryResponse(StrictModel):
     model_id: str
     comparison_dataset_id: str
     drifted_feature_count: int
-    drifted_features: List[str]
-    out_of_range_rate: Optional[float] = None
+    drifted_features: list[str]
+    out_of_range_rate: float | None = None
     reference_window_count: int
     comparison_window_count: int
     alpha: float
     method: str
-    reasons: List[str]
+    reasons: list[str]
 
 
 class ModelSummaryResponse(StrictModel):
@@ -473,9 +472,9 @@ class ModelSummaryResponse(StrictModel):
     # Latest recorded lifecycle state and the eligibility that row carried; None/False
     # on a model with no history yet. `latest_drift_status` is the newest assessment's
     # status, or None if none has been run.
-    state: Optional[str] = None
+    state: str | None = None
     activation_eligible: bool = False
-    latest_drift_status: Optional[str] = None
+    latest_drift_status: str | None = None
 
 
 class ModelDetailResponse(StrictModel):
@@ -490,14 +489,14 @@ class ModelDetailResponse(StrictModel):
     created_at: float
     artifact_checksum: str
     training_window_count: int
-    training_window_ids: List[int]
-    hyperparameters: Dict[str, Any]
+    training_window_ids: list[int]
+    hyperparameters: dict[str, Any]
     # Lifecycle: the latest state, the full transition history, and the chain verdict
     # that says whether to trust it -- all read from `ml/lifecycle.py:lifecycle_report`.
-    state: Optional[str] = None
+    state: str | None = None
     activation_eligible: bool = False
-    transitions: List[ModelLifecycleTransitionResponse]
-    latest_drift: Optional[DriftSummaryResponse] = None
+    transitions: list[ModelLifecycleTransitionResponse]
+    latest_drift: DriftSummaryResponse | None = None
     drift_assessment_count: int = 0
     chain: ChainVerdictResponse
 
@@ -522,14 +521,14 @@ class OperationalEfficacyResponse(StrictModel):
     # measurable", not a zero). Population FPR and recall are not measurable from
     # dispositions -- they are always None here and reported by the seeded
     # evaluation and the ML acceptance gate instead. See detection.operational_efficacy.
-    precision: Optional[float] = None
-    reviewed_false_positive_rate: Optional[float] = None
-    population_false_positive_rate: Optional[float] = None
-    recall: Optional[float] = None
+    precision: float | None = None
+    reviewed_false_positive_rate: float | None = None
+    population_false_positive_rate: float | None = None
+    recall: float | None = None
     note: str
 
 
-def _read_policies() -> List[Dict[str, Any]]:
+def _read_policies() -> list[dict[str, Any]]:
     try:
         with DEFAULT_POLICY_PATH.open("r", encoding="utf-8") as handle:
             document = yaml.safe_load(handle)
@@ -541,8 +540,8 @@ def _read_policies() -> List[Dict[str, Any]]:
 
 
 def create_app(
-    store: Optional[SQLiteEventStore] = None,
-    config: Optional[Settings] = None,
+    store: SQLiteEventStore | None = None,
+    config: Settings | None = None,
 ) -> FastAPI:
     """
     Build the application.
@@ -669,13 +668,13 @@ def create_app(
             collected_at=snapshot.collected_at,
         )
 
-    @app.get("/api/sources", response_model=List[SourceStateResponse])
-    def sources() -> List[SourceStateResponse]:
+    @app.get("/api/sources", response_model=list[SourceStateResponse])
+    def sources() -> list[SourceStateResponse]:
         """Per-source supervision state: which collector is running, restarting, or given up on."""
         return event_store.read_source_states()
 
-    @app.get("/api/maintenance", response_model=List[MaintenanceRecordResponse])
-    def maintenance(limit: int = Query(default=50, ge=1, le=500)) -> List[MaintenanceRecordResponse]:
+    @app.get("/api/maintenance", response_model=list[MaintenanceRecordResponse])
+    def maintenance(limit: int = Query(default=50, ge=1, le=500)) -> list[MaintenanceRecordResponse]:
         """
         The retention audit trail.
 
@@ -771,14 +770,14 @@ def create_app(
             last_kernel_loss_timestamp=collector.get("last_kernel_loss_timestamp"),
         )
 
-    @app.get("/api/events", response_model=List[EventResponse])
+    @app.get("/api/events", response_model=list[EventResponse])
     def events(
         limit: int = Query(default=100, ge=1, le=500),
-        event_type: Optional[str] = Query(default=None, min_length=1, max_length=64),
-    ) -> List[EventResponse]:
+        event_type: str | None = Query(default=None, min_length=1, max_length=64),
+    ) -> list[EventResponse]:
         return event_store.read_event_records(limit=limit, event_type=event_type)
 
-    @app.get("/api/detections", response_model=List[FindingResponse])
+    @app.get("/api/detections", response_model=list[FindingResponse])
     def detections(
         response: Response,
         limit: int = Query(default=100, ge=1, le=500),
@@ -790,16 +789,14 @@ def create_app(
             "id", "window_start", "window_end", "risk_score", "severity", "entity_type"
         ] = "window_start",
         order: Literal["asc", "desc"] = "desc",
-        severity: Optional[str] = Query(default=None, min_length=1, max_length=32),
-        entity_type: Optional[str] = Query(default=None, min_length=1, max_length=64),
-        disposition: Optional[
-            Literal["true-positive", "false-positive", "benign", "none"]
-        ] = None,
-        acknowledged: Optional[bool] = None,
-        suppressed: Optional[bool] = None,
-        window_start: Optional[float] = Query(default=None),
-        window_end: Optional[float] = Query(default=None),
-    ) -> List[FindingResponse]:
+        severity: str | None = Query(default=None, min_length=1, max_length=32),
+        entity_type: str | None = Query(default=None, min_length=1, max_length=64),
+        disposition: Literal["true-positive", "false-positive", "benign", "none"] | None = None,
+        acknowledged: bool | None = None,
+        suppressed: bool | None = None,
+        window_start: float | None = Query(default=None),
+        window_end: float | None = Query(default=None),
+    ) -> list[FindingResponse]:
         """
         A filtered, sorted, paginated page of findings, enriched with effective
         triage state.
@@ -873,12 +870,12 @@ def create_app(
             message="No assistant response is persisted for this finding; the dashboard does not generate one.",
         )
 
-    @app.get("/api/policies", response_model=List[PolicyResponse])
-    def policies() -> List[PolicyResponse]:
+    @app.get("/api/policies", response_model=list[PolicyResponse])
+    def policies() -> list[PolicyResponse]:
         return _read_policies()
 
-    @app.get("/api/policy-decisions", response_model=List[PolicyDecisionResponse])
-    def policy_decisions() -> List[PolicyDecisionResponse]:
+    @app.get("/api/policy-decisions", response_model=list[PolicyDecisionResponse])
+    def policy_decisions() -> list[PolicyDecisionResponse]:
         return event_store.read_policy_decisions()
 
     # --------------------------------------------------------------------- #
@@ -957,7 +954,7 @@ def create_app(
             finding_id, "unsuppress", note=body.reason, actor=body.actor
         )
 
-    def _triage_state_for(finding: Dict[str, Any], state: Dict[str, Any]) -> TriageStateResponse:
+    def _triage_state_for(finding: dict[str, Any], state: dict[str, Any]) -> TriageStateResponse:
         config_suppressed = bool(finding.get("suppressed"))
         return TriageStateResponse(
             finding_id=int(finding["id"]),
@@ -969,7 +966,7 @@ def create_app(
         )
 
     @app.get("/api/triage/export")
-    def triage_export() -> Dict[str, Any]:
+    def triage_export() -> dict[str, Any]:
         """
         A faithful, complete export of the evidence record and its triage trail.
 
@@ -996,7 +993,7 @@ def create_app(
             limit=MAX_TRIAGE_ANNOTATION_LIMIT
         )
         annotations_truncated = len(all_annotations) >= MAX_TRIAGE_ANNOTATION_LIMIT
-        by_finding: Dict[int, List[Dict[str, Any]]] = {}
+        by_finding: dict[int, list[dict[str, Any]]] = {}
         for annotation in all_annotations:
             by_finding.setdefault(int(annotation["finding_id"]), []).append(annotation)
         exported = []
@@ -1080,8 +1077,8 @@ def create_app(
             ok=bool(findings["ok"] and policy["ok"] and triage["ok"] and ml_lifecycle["ok"]),
         )
 
-    @app.get("/api/models", response_model=List[ModelSummaryResponse])
-    def models() -> List[ModelSummaryResponse]:
+    @app.get("/api/models", response_model=list[ModelSummaryResponse])
+    def models() -> list[ModelSummaryResponse]:
         """
         Enumerate recorded ML models with their latest lifecycle state and drift status.
 
@@ -1091,7 +1088,7 @@ def create_app(
         the honest and expected answer, since detection runs deterministically until
         a model passes the activation gate.
         """
-        summaries: List[ModelSummaryResponse] = []
+        summaries: list[ModelSummaryResponse] = []
         for record in event_store.read_ml_models():
             latest = current_state(event_store, record["id"])
             drift = event_store.read_ml_drift_assessments(record["id"], limit=1)

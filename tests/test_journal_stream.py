@@ -33,6 +33,8 @@ import pytest
 
 from telemetry.journald.auth_session_monitor import (
     normalize_journal_record as normalize_auth,
+)
+from telemetry.journald.auth_session_monitor import (
     parse_journal_json as parse_auth,
 )
 from telemetry.journald.journal_stream import (
@@ -51,6 +53,8 @@ from telemetry.journald.journal_stream import (
 )
 from telemetry.journald.service_monitor import (
     normalize_journal_record as normalize_service,
+)
+from telemetry.journald.service_monitor import (
     parse_journal_json as parse_service,
 )
 

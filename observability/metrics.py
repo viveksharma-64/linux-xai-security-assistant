@@ -38,7 +38,7 @@ import os
 import shutil
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from observability.config import Settings
 from observability.config import settings as load_process_settings
@@ -80,32 +80,32 @@ class MetricsSnapshot:
 
     collected_at: float = 0.0
     event_count: int = 0
-    latest_event_timestamp: Optional[float] = None
-    oldest_event_timestamp: Optional[float] = None
+    latest_event_timestamp: float | None = None
+    oldest_event_timestamp: float | None = None
     finding_count: int = 0
-    severity_counts: Dict[str, int] = field(default_factory=dict)
+    severity_counts: dict[str, int] = field(default_factory=dict)
     database_bytes: int = 0
-    file_permissions: Dict[str, Optional[int]] = field(default_factory=dict)
-    collector: Dict[str, Any] = field(default_factory=dict)
-    sources: List[Dict[str, Any]] = field(default_factory=list)
+    file_permissions: dict[str, int | None] = field(default_factory=dict)
+    collector: dict[str, Any] = field(default_factory=dict)
+    sources: list[dict[str, Any]] = field(default_factory=list)
     disk: DiskUsage = field(default_factory=DiskUsage)
-    database_error: Optional[str] = None
+    database_error: str | None = None
 
     @property
-    def data_age_seconds(self) -> Optional[float]:
+    def data_age_seconds(self) -> float | None:
         if self.latest_event_timestamp is None:
             return None
         return max(self.collected_at - self.latest_event_timestamp, 0.0)
 
     @property
-    def collector_age_seconds(self) -> Optional[float]:
+    def collector_age_seconds(self) -> float | None:
         updated_at = self.collector.get("updated_at")
         if updated_at is None:
             return None
         return max(self.collected_at - float(updated_at), 0.0)
 
     @property
-    def degraded_sources(self) -> List[str]:
+    def degraded_sources(self) -> list[str]:
         return [
             str(source.get("name"))
             for source in self.sources
@@ -113,7 +113,7 @@ class MetricsSnapshot:
         ]
 
     @property
-    def insecure_files(self) -> List[str]:
+    def insecure_files(self) -> list[str]:
         """Database files whose mode grants group or other any access."""
         return [
             path
@@ -122,7 +122,7 @@ class MetricsSnapshot:
         ]
 
     @property
-    def queue_fill_ratio(self) -> Optional[float]:
+    def queue_fill_ratio(self) -> float | None:
         capacity = self.collector.get("queue_capacity") or 0
         if not capacity:
             return None
@@ -160,7 +160,7 @@ def _disk_usage(db_path: str) -> DiskUsage:
     return DiskUsage(total_bytes=usage.total, used_bytes=usage.used, free_bytes=usage.free)
 
 
-def collect_snapshot(store: Any, config: Optional[Settings] = None) -> MetricsSnapshot:
+def collect_snapshot(store: Any, config: Settings | None = None) -> MetricsSnapshot:
     """
     Read the current operational picture from one store.
 
@@ -197,7 +197,7 @@ def collect_snapshot(store: Any, config: Optional[Settings] = None) -> MetricsSn
 _METRIC_PREFIX = "linux_xai"
 
 
-def _line(name: str, value: Any, labels: Optional[Dict[str, str]] = None) -> str:
+def _line(name: str, value: Any, labels: dict[str, str] | None = None) -> str:
     if labels:
         rendered = ",".join(f'{key}="{_escape(value_)}"' for key, value_ in sorted(labels.items()))
         return f"{_METRIC_PREFIX}_{name}{{{rendered}}} {_number(value)}"
@@ -228,9 +228,9 @@ def render_prometheus(snapshot: MetricsSnapshot) -> str:
     is what makes `rate()` legal on the former in a query the operator did not
     write themselves.
     """
-    lines: List[str] = []
+    lines: list[str] = []
 
-    def emit(name: str, kind: str, help_text: str, value: Any, labels: Optional[Dict[str, str]] = None) -> None:
+    def emit(name: str, kind: str, help_text: str, value: Any, labels: dict[str, str] | None = None) -> None:
         lines.append(f"# HELP {_METRIC_PREFIX}_{name} {help_text}")
         lines.append(f"# TYPE {_METRIC_PREFIX}_{name} {kind}")
         lines.append(_line(name, value, labels))
@@ -358,7 +358,7 @@ def render_prometheus(snapshot: MetricsSnapshot) -> str:
 # ---------------------------------------------------------------------- probes
 
 
-def liveness(snapshot: MetricsSnapshot) -> Tuple[bool, Dict[str, Any]]:
+def liveness(snapshot: MetricsSnapshot) -> tuple[bool, dict[str, Any]]:
     """
     Whether this process should keep running.
 
@@ -370,8 +370,8 @@ def liveness(snapshot: MetricsSnapshot) -> Tuple[bool, Dict[str, Any]]:
 
 
 def readiness(
-    snapshot: MetricsSnapshot, config: Optional[Settings] = None
-) -> Tuple[bool, Dict[str, Any]]:
+    snapshot: MetricsSnapshot, config: Settings | None = None
+) -> tuple[bool, dict[str, Any]]:
     """
     Whether this instance's answers can be trusted right now.
 
@@ -382,7 +382,7 @@ def readiness(
     staleness window (answers that look current and are not).
     """
     resolved = config or load_process_settings()
-    reasons: List[str] = []
+    reasons: list[str] = []
     if snapshot.database_error:
         reasons.append(f"database unavailable: {snapshot.database_error}")
     if snapshot.insecure_files:
