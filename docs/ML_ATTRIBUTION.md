@@ -149,8 +149,8 @@ different question of which inputs were unusual on their own.
 
 ## Note on tooling
 
-`ruff` and `mypy` are advisory in CI; the enforced merge gate is the pytest suite. The
-new files were written to the configured house style (120-column lines,
+`ruff` and `mypy` were advisory in CI when this feature landed; both are required merge
+gates now. The new files were written to the configured house style (120-column lines,
 `from __future__ import annotations` where the module carries it, fully typed
 signatures). `AGENTS.md` is left unchanged: by its own rule it is updated only at a major
 architectural milestone, and an additive, opt-in explainer feature that touches no gate,

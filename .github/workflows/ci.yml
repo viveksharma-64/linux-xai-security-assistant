@@ -2,14 +2,18 @@
 #
 # Gating model
 # ------------
-# The `test` job is the merge gate: it runs the full regression suite (fixed, not
-# trimmed -- see the Phase B notes) with coverage across every supported Python.
-# `lint` and `ruff` and `types` run alongside but are advisory (continue-on-error):
-# the build host used during Phase B could not reach PyPI to install ruff or mypy,
-# so those tools have not yet been baselined against the pre-existing tree and are
-# not allowed to block a merge on findings no one has triaged. They still run on
-# every push so the findings are visible and can be driven to zero, at which point
-# flipping them to required is a one-line change.
+# Every job here is a merge gate. `test` runs the full regression suite (fixed,
+# not trimmed -- see the Phase B notes) with coverage across every supported
+# Python; `lint` runs ruff and `types` runs mypy.
+#
+# `lint` and `types` were advisory (continue-on-error) through Phase B because the
+# build host could not reach PyPI to install either tool, so neither had been
+# baselined against the pre-existing tree and neither was allowed to block a merge
+# on findings no one had triaged. That baselining is now done -- both report zero
+# findings on `main` -- so continue-on-error is gone and a new finding fails the
+# run. Note that failing the run is necessary but not sufficient to block a merge:
+# the `ruff` and `mypy` contexts must also be listed as required status checks in
+# the branch-protection rules for `main`.
 #
 # The `ml` job is a second required gate that exists to make one guarantee the
 # `test` job cannot: that the scikit-learn-backed tests actually execute. Those
@@ -84,7 +88,7 @@ jobs:
         with:
           # A single interpreter is enough: this job gates on "the scikit-learn
           # path executed", not on cross-version behaviour, which the `test`
-          # matrix already covers. 3.12 matches the advisory lint/type jobs.
+          # matrix already covers. 3.12 matches the lint/type jobs.
           python-version: "3.12"
           cache: pip
       - name: Install (with scikit-learn)
@@ -147,9 +151,8 @@ jobs:
           if-no-files-found: ignore
 
   lint:
-    name: ruff (advisory)
+    name: ruff
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -160,9 +163,8 @@ jobs:
       - run: ruff check .
 
   types:
-    name: mypy (advisory)
+    name: mypy
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

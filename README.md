@@ -146,7 +146,8 @@ two systemd services — a supervised ingestion daemon and the read-only API:
   disk/queue/collector-silence alerts logged on transition, and layered
   `defaults < config-file < environment` configuration that fails closed on an
   unknown key or unparseable value.
-- **CI** (`.github/workflows/ci.yml`) — the test suite is the hard merge gate.
+- **CI** (`.github/workflows/ci.yml`) — the test suite, `ruff`, and `mypy` are all
+  required merge gates.
 
 Deployment, the threat model, and measured throughput/latency plus the soak
 result are documented in [deploy/README.md](deploy/README.md),
