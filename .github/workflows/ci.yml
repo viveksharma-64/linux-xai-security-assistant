@@ -53,7 +53,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        # Every interpreter this project *claims* to support, which is what makes
+        # the `Programming Language :: Python :: 3.x` classifiers in
+        # `pyproject.toml` a tested assertion rather than an aspiration. Keep the
+        # two lists identical in both directions: adding a classifier without a
+        # matrix entry ships an untested support claim, and dropping an entry
+        # without dropping the classifier is the same bug with the evidence
+        # removed. 3.14 is the development interpreter here, so its breakages are
+        # hit locally either way -- gating on it means they surface as a failed
+        # check on a branch instead of as a surprise on someone else's machine.
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}

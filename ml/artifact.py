@@ -152,7 +152,13 @@ def write_artifact(
     # Serialized to memory first so the checksum covers exactly the bytes that
     # land on disk, with no second serialization to disagree with.
     buffer = io.BytesIO()
-    np.savez(buffer, **arrays)
+    # `**arrays` collides with `savez`'s own `allow_pickle` keyword in numpy's
+    # stub, so a checker has to assume a caller-supplied mapping might carry that
+    # key with a non-bool value. This one cannot: `arrays` is built immediately
+    # above from `TREE_ARRAY_KEYS` and the two scaler fields, all ndarrays. Saving
+    # is not where the pickle risk lives either -- `load_artifact` is what enforces
+    # `allow_pickle=False`, and a source-level test asserts it.
+    np.savez(buffer, **arrays)  # type: ignore[arg-type]
     arrays_payload = buffer.getvalue()
 
     descriptor = {

@@ -32,9 +32,12 @@ upper bound) are not read, copied, or re-derived here; the verdict is taken
 verbatim, including its `reasons`.
 
 `storage/sqlite_store.py:write_ml_lifecycle_transition` independently refuses an
-`active` row without a gate verdict and refuses any eligibility claim on a
-drift-reachable state. That duplication is intentional: the invariant holds even
-for a writer that bypasses this module.
+`active` row without a gate verdict, refuses any eligibility claim on a
+drift-reachable state, and -- for any row claiming eligibility -- re-runs the gate
+over the counts recorded beside the verdict and refuses unless it reproduces that
+verdict exactly. That duplication is intentional: the invariant holds even for a
+writer that bypasses this module, including one that hands the store a verdict it
+assembled itself.
 
 Drift's reach is bounded
 ------------------------

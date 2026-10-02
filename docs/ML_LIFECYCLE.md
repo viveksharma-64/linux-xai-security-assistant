@@ -58,11 +58,20 @@ than one place on purpose:
   holdout-window counts, tested with `is True` so no truthy stand-in passes for
   the gate's boolean. `record_activation` re-runs the gate rather than trusting an
   earlier `eligible` row, and **raises** if it refuses.
-- **Drift cannot log its way to an activation.**
-  `storage/sqlite_store.py:write_ml_lifecycle_transition` independently refuses an
-  `active` row without a gate verdict, and refuses any eligibility claim on a
-  drift-reachable state. That duplication is intentional: the invariant holds for
-  a writer that bypasses `ml/lifecycle.py` entirely.
+- **Drift cannot log its way to an activation, and a claim is checked against its
+  own numbers.** `storage/sqlite_store.py:write_ml_lifecycle_transition`
+  independently refuses an `active` row without a gate verdict, refuses any
+  eligibility claim on a drift-reachable state, and — for any row claiming
+  eligibility — requires the verdict to say `activation_eligible: True`, requires
+  the counts it came from to be recorded beside it, and **re-runs
+  `normal_fpr_acceptance` over those counts**, refusing unless it reproduces the
+  recorded verdict exactly. A shape check would have accepted `{}`, or the real
+  gate output for counts that failed, next to a row asserting eligibility. That
+  duplication is intentional: the invariant holds for a writer that bypasses
+  `ml/lifecycle.py` entirely. It is not a second gate — whatever
+  `normal_fpr_acceptance` returns for those counts is what passes, because a
+  reimplemented Wilson bound in the storage layer would drift from the one the ML
+  layer gates on.
 - An **ineligible** verdict is recorded rather than raised. "This model was
   measured and did not qualify" is the more useful audit record, and it is the
   record that stops the same model being quietly re-proposed later.

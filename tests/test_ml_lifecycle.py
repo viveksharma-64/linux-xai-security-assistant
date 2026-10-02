@@ -225,6 +225,112 @@ def test_the_store_refuses_an_eligibility_claim_without_the_gate_verdict(tmp_pat
         )
 
 
+def test_the_store_refuses_a_verdict_that_itself_says_ineligible(tmp_path):
+    """
+    A row may not claim an eligibility its own attached verdict refused.
+
+    This is the shape-versus-content gap. A check that asked only for *a dict*
+    under `acceptance` accepts an empty one, and accepts the real gate output for
+    counts that failed -- so `activation_eligible=True` on the row could sit beside
+    a verdict reading `activation_eligible: False`, and the log would record a
+    gated activation the gate had refused. Attaching the verdict is only worth
+    anything if a reader can check the claim against it, so the writer is not
+    allowed to contradict it.
+    """
+    store = _store(tmp_path)
+    # Genuine gate output for counts that fail -- not a fabrication, which is what
+    # makes it the sharp case: the evidence is real, the claim about it is not.
+    refused = normal_fpr_acceptance(1, 60)
+    assert refused["activation_eligible"] is False
+    with pytest.raises(ValueError, match="may not carry a verdict that refused it"):
+        store.write_ml_lifecycle_transition(
+            "model-1", "eligible", reason="the gate said no; recording a yes",
+            evidence={"acceptance": refused, **FAILING_COUNTS},
+            activation_eligible=True,
+        )
+    # The empty dict is the other thing a shape check waved through.
+    with pytest.raises(ValueError, match="may not carry a verdict that refused it"):
+        store.write_ml_lifecycle_transition(
+            "model-1", "eligible", reason="the shape of a verdict, with no verdict in it",
+            evidence={"acceptance": {}, **PASSING_COUNTS},
+            activation_eligible=True,
+        )
+    # `is True`, not truthiness: the gate returns a bool, so a stand-in that merely
+    # evaluates true is a different claim and is refused as one.
+    with pytest.raises(ValueError, match="may not carry a verdict that refused it"):
+        store.write_ml_lifecycle_transition(
+            "model-1", "eligible", reason="truthy is not True",
+            evidence={"acceptance": {"activation_eligible": 1}, **PASSING_COUNTS},
+            activation_eligible=True,
+        )
+    assert store.read_ml_lifecycle() == []
+
+
+def test_the_store_recomputes_the_gate_over_the_recorded_counts(tmp_path):
+    """
+    The verdict is checked against its own numbers rather than taken on trust.
+
+    Requiring the verdict to *say* eligible is still only a statement; it becomes
+    evidence when the writer can re-derive it. `write_ml_lifecycle_transition` re-runs
+    `normal_fpr_acceptance` over the counts recorded beside the verdict and requires
+    an exact match, which is what makes the docstring's promise -- that an
+    eligibility claim always carries the numbers behind it -- a fact rather than a
+    convention a writer may ignore.
+
+    Deliberately not a second gate: whatever `normal_fpr_acceptance` returns for
+    those counts is what passes here. A reimplemented Wilson bound living in the
+    storage layer would drift from the one the ML layer gates on, and a check that
+    disagrees with the gate it enforces is worse than none.
+    """
+    store = _store(tmp_path)
+
+    # A passing model's verdict attached to a failing model's counts. Both halves
+    # are real gate output; the pairing is the lie, and only a writer that re-runs
+    # the gate over the recorded counts can see it.
+    with pytest.raises(ValueError, match="does not match the recorded counts"):
+        store.write_ml_lifecycle_transition(
+            "model-1", "active", reason="borrowed a verdict from a model that passed",
+            evidence={"acceptance": normal_fpr_acceptance(0, 60), **FAILING_COUNTS},
+            activation_eligible=True,
+        )
+
+    # Thresholds are part of the verdict, so equality is required rather than a
+    # check of the eligibility flag alone: a passing verdict carrying a widened
+    # ceiling would read, to anyone auditing the row later, as having been gated on
+    # 5% when it was not gated at all.
+    with pytest.raises(ValueError, match="does not match the recorded counts"):
+        store.write_ml_lifecycle_transition(
+            "model-1", "active", reason="same numbers, a ceiling moved under them",
+            evidence={
+                "acceptance": normal_fpr_acceptance(0, 60) | {"max_normal_fpr": 0.95},
+                **PASSING_COUNTS,
+            },
+            activation_eligible=True,
+        )
+
+    # And the counts have to be present at all: a recompute needs inputs, so a
+    # verdict arriving without them is refused rather than let through unchecked --
+    # otherwise omitting the numbers would be the way around the check.
+    with pytest.raises(ValueError, match="must record the false_positive_count and"):
+        store.write_ml_lifecycle_transition(
+            "model-1", "eligible", reason="a verdict with its numbers left off",
+            evidence={"acceptance": normal_fpr_acceptance(0, 60)},
+            activation_eligible=True,
+        )
+    assert store.read_ml_lifecycle() == []
+
+    # The honest row is unaffected, which is the other half of the claim: this
+    # rejects forgeries, not eligibility. `ml/lifecycle.py` already records the
+    # counts beside the verdict, so nothing in the real write path had to change.
+    row = store.write_ml_lifecycle_transition(
+        "model-1", "eligible", reason="activation gate satisfied",
+        evidence={"acceptance": normal_fpr_acceptance(0, 60), **PASSING_COUNTS},
+        activation_eligible=True, from_state="evaluated",
+    )
+    assert row["activation_eligible"] is True
+    assert row["evidence"]["acceptance"] == normal_fpr_acceptance(0, 60)
+
+
 def test_the_store_refuses_an_active_row_without_a_gate_verdict(tmp_path):
     store = _store(tmp_path)
     with pytest.raises(ValueError, match="an active ML lifecycle row requires the activation gate verdict"):

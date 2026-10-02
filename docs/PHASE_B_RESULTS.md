@@ -105,4 +105,4 @@ boundary as well.
 | Unattended, collector kills injected, no data loss | Soak above: 20 kills → 20 auto-recoveries → 4,248 == 4,248 |
 | Published throughput and latency | Benchmark table above; reproduction command included |
 | Authenticated API | `api/auth.py`, on-by-default fail-closed; see `docs/THREAT_MODEL.md` |
-| Green CI on a fixed (not trimmed) suite | `.github/workflows/ci.yml`; pytest is the hard gate across 3.11–3.13 |
+| Green CI on a fixed (not trimmed) suite | `.github/workflows/ci.yml`; pytest is the hard gate across 3.11–3.14 |
