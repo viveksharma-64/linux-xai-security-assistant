@@ -736,16 +736,21 @@ class SQLiteEventStore(EventStore):
 
         Two refusals keep this a record rather than a control surface:
 
-        * `activation_eligible=True` requires the caller to supply the activation
-          gate's own returned verdict under `evidence['acceptance']`, so an
-          eligibility claim in the audit log always carries the numbers behind it
-          (the same shape of check `create_ml_dataset` makes on `verified_normal`);
+        * `activation_eligible=True` requires the caller to record the activation
+          gate's own verdict under `evidence['acceptance']` *and* the counts it was
+          computed from, and the gate is re-run here over those counts and required
+          to reproduce that verdict exactly -- so an eligibility claim in the audit
+          log always carries numbers that actually support it, rather than merely
+          carrying a dict (the same kind of check `create_ml_dataset` makes on
+          `verified_normal`, one step further: content, not shape);
         * a `to_state` reachable from drift may never carry an eligibility verdict,
           and `active` may never be recorded without one -- so no drift assessment
           can log its way to an activation.
 
         Enforcing this here rather than only in `ml/lifecycle.py` means the check
-        holds for every writer, including a future one.
+        holds for every writer, including a future one. The state checks run before
+        the content check: "this state may never claim eligibility at all" is the
+        more fundamental refusal, and it is the more useful error to surface.
         """
         if to_state not in _ML_LIFECYCLE_STATES:
             raise ValueError(f"unknown ML lifecycle state: {to_state!r}")
@@ -754,12 +759,12 @@ class SQLiteEventStore(EventStore):
         if not reason:
             raise ValueError("ML lifecycle transitions require a reason")
         payload = dict(evidence or {})
-        if activation_eligible and not isinstance(payload.get("acceptance"), dict):
-            raise ValueError("an eligible ML lifecycle row must carry the activation gate verdict")
         if activation_eligible and to_state in _ML_DRIFT_LIFECYCLE_STATES:
             raise ValueError(f"{to_state} may not assert activation eligibility")
         if to_state == "active" and not activation_eligible:
             raise ValueError("an active ML lifecycle row requires the activation gate verdict")
+        if activation_eligible:
+            self._require_activation_gate_verdict(payload)
         created_at = float(created_at) if created_at is not None else time.time()
 
         with self._chain_lock:
@@ -771,6 +776,60 @@ class SQLiteEventStore(EventStore):
                 return self._decode_ml_lifecycle_row(
                     conn.execute("SELECT * FROM ml_model_lifecycle WHERE id = ?", (row_id,)).fetchone()
                 )
+
+    @staticmethod
+    def _require_activation_gate_verdict(evidence: dict[str, Any]) -> None:
+        """
+        Refuse an eligibility claim the recorded numbers do not support.
+
+        Shape is not evidence. A check that only asked for a dict under
+        `acceptance` accepts `{}`, and accepts a verdict that itself reads
+        `activation_eligible: False` sitting next to `activation_eligible=True` on
+        the row -- so the audit log could assert an eligibility its own attached
+        verdict had refused, which is precisely the claim the log exists to make
+        checkable. Three things are required instead: the verdict says eligible,
+        the counts it came from are recorded beside it, and re-running the gate
+        over those counts reproduces that verdict exactly.
+
+        Equality rather than a subset check, because a verdict is only meaningful
+        with its thresholds attached: a row recording a passing `activation_eligible`
+        beside an inflated `max_normal_fpr` would read as gated when it was not.
+        Every honest caller gets its dict from the gate itself, so equality costs
+        them nothing and is only ever felt by a hand-built one.
+
+        What this is not: a second gate. It asserts that the recorded verdict is
+        what `normal_fpr_acceptance` returns for the recorded counts -- whatever
+        that function decides is what passes here. That is deliberate. A reimplemented
+        Wilson bound in the storage layer would drift from the one the ML layer
+        actually gates on, and a check that disagrees with the gate it enforces is
+        worse than no check. The import is deferred for the same single-source
+        reason: `ml.evaluation` -> `ml.scoring` -> `storage.sqlite_store` is a
+        cycle, so calling the real gate from here means calling it late.
+        """
+        from ml.evaluation import normal_fpr_acceptance
+
+        acceptance = evidence.get("acceptance")
+        if not isinstance(acceptance, dict):
+            raise ValueError("an eligible ML lifecycle row must carry the activation gate verdict")
+        if acceptance.get("activation_eligible") is not True:
+            raise ValueError(
+                "an eligible ML lifecycle row may not carry a verdict that refused it: "
+                f"acceptance['activation_eligible'] is {acceptance.get('activation_eligible')!r}"
+            )
+        false_positives = evidence.get("false_positive_count")
+        normal_windows = evidence.get("normal_window_count")
+        if not isinstance(false_positives, int) or not isinstance(normal_windows, int):
+            raise ValueError(
+                "an eligible ML lifecycle row must record the false_positive_count and "
+                "normal_window_count its verdict was computed from"
+            )
+        recomputed = normal_fpr_acceptance(false_positives, normal_windows)
+        if recomputed != acceptance:
+            raise ValueError(
+                "the recorded activation gate verdict does not match the recorded counts: "
+                f"{false_positives} false positives in {normal_windows} normal windows yields "
+                f"{recomputed!r}"
+            )
 
     def _insert_ml_lifecycle(
         self,

@@ -22,9 +22,14 @@ class MLScorer:
         # and attribution off the default hot path -- it is advisory metadata an
         # operator turns on, never a scoring behaviour.
         self.attribute = attribute
-        self.metadata = store.read_ml_model(model_id)
-        if self.metadata is None:
+        metadata = store.read_ml_model(model_id)
+        if metadata is None:
             raise MLScoringError("ML model metadata was not found")
+        # Declared non-optional on purpose: the raise above *is* the invariant, so
+        # every later `self.metadata[...]` is unconditional rather than guarded.
+        # There is no such thing as a constructed scorer without its metadata, and
+        # saying so here is what lets a type checker agree.
+        self.metadata: dict[str, Any] = metadata
         if self.metadata["schema_version"] != SCHEMA_VERSION or self.metadata["schema_hash"] != schema_hash():
             raise MLScoringError("ML model feature schema is incompatible with this runtime")
         # ml/artifact.py owns the verify-then-parse ordering and refuses anything
