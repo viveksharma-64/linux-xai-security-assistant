@@ -179,7 +179,7 @@ ignore = ["E501"]
 # is a large tree that was not written against a type checker, so the value here
 # is catching regressions in the Phase B modules (the checked file list lives in
 # the CI workflow), not retrofitting annotations everywhere at once.
-python_version = "3.11"
+python_version = "3.12"
 ignore_missing_imports = true
 warn_redundant_casts = true
 warn_unused_ignores = false
