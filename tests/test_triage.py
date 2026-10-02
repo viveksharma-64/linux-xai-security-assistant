@@ -17,7 +17,11 @@ from fastapi.testclient import TestClient
 from api import app as app_module
 from api.app import create_app
 from observability.config import Settings
-from storage.sqlite_store import MAX_TRIAGE_ANNOTATION_LIMIT, SQLiteEventStore
+from storage.sqlite_store import (
+    MAX_TRIAGE_ANNOTATION_LIMIT,
+    MAX_TRIAGE_EXPORT_LIMIT,
+    SQLiteEventStore,
+)
 
 # A token long enough to satisfy MIN_TOKEN_LENGTH, for the default-deny checks.
 TOKEN = "0123456789abcdef-a-long-enough-token"
@@ -215,6 +219,64 @@ def test_an_export_that_cannot_be_complete_says_so(tmp_path, monkeypatch):
     # over the whole table, not from this list -- still tells the consumer so.
     assert [a["note"] for a in triage["annotations"]] == ["note 0", "note 1"]
     assert triage["annotation_count"] == 3
+
+
+def test_the_export_pages_findings_and_discloses_what_it_left_out(tmp_path):
+    """
+    The findings half of the export is bounded too, and declares it the same way.
+
+    Retention exempts the hash-chained tables, so the old unbounded
+    `read_detection_findings()` returned a document whose size was a function of
+    uptime -- a denial-of-service lever on a network-facing route. Bounding it
+    means a large deployment's export is no longer a single response, so the
+    invariant that has to survive is that an incomplete export is never
+    *silently* incomplete: `findings_total` and `findings_truncated` are what let
+    a consumer tell "that is all of them" from "that is the first page".
+
+    Paged by passing `limit` rather than by patching the module constant: unlike
+    `MAX_TRIAGE_ANNOTATION_LIMIT`, which the handler reads per request, the export
+    cap is baked into the route signature at `create_app` time, and `limit` is the
+    contract a real consumer walks anyway.
+    """
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
+    ids = [store.write_detection_finding(_finding(entity_key=f"e{index}")) for index in range(3)]
+    client = TestClient(create_app(store))
+
+    first = client.get("/api/triage/export?limit=2").json()
+    assert [f["id"] for f in first["findings"]] == ids[:2]
+    assert first["findings_total"] == 3
+    assert first["findings_returned"] == 2
+    assert first["findings_offset"] == 0
+    assert first["findings_limit"] == 2
+    assert first["findings_truncated"] is True
+    # The note carries the instruction, not just the flag, so an operator reading
+    # the document by eye learns it is partial and how to finish it.
+    assert "FINDINGS ARE PAGED" in first["note"]
+    assert "?offset=2" in first["note"]
+
+    second = client.get("/api/triage/export?limit=2&offset=2").json()
+    assert [f["id"] for f in second["findings"]] == ids[2:]
+    assert second["findings_total"] == 3
+    assert second["findings_truncated"] is False
+    assert "FINDINGS ARE PAGED" not in second["note"]
+
+    # Following offset to exhaustion reassembles the whole record exactly once --
+    # no gap and no duplicate, which is the property that makes the bound
+    # acceptable on an evidence export at all.
+    assert [f["id"] for f in first["findings"] + second["findings"]] == ids
+
+    # A deployment under the cap is unaffected: no limit, everything, no notice.
+    whole = client.get("/api/triage/export").json()
+    assert [f["id"] for f in whole["findings"]] == ids
+    assert whole["findings_truncated"] is False
+    assert whole["findings_limit"] == MAX_TRIAGE_EXPORT_LIMIT
+    assert "FINDINGS ARE PAGED" not in whole["note"]
+
+    # And the cap is a cap: asking past it is refused rather than honoured, so the
+    # ceiling cannot be argued away by a query string.
+    assert client.get(
+        f"/api/triage/export?limit={MAX_TRIAGE_EXPORT_LIMIT + 1}"
+    ).status_code == 422
 
 
 def test_triage_write_to_a_missing_finding_is_404(tmp_path):

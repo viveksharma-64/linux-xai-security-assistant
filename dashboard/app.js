@@ -367,7 +367,7 @@ async function selectFinding(id, { focusDetail = true } = {}) {
       getJson(`/api/detections/${id}`),
       getJson(`/api/explanations/${id}`).catch(() => null),
       getJson(`/api/assistant/${id}`).catch(() => null),
-      getJson("/api/policy-decisions"),
+      getJson(`/api/policy-decisions?finding_id=${id}`),
       getJson(`/api/triage/${id}`).catch(() => null),
     ]);
 
@@ -398,7 +398,9 @@ async function selectFinding(id, { focusDetail = true } = {}) {
     }
     replaceChildren(detail, ...blocks);
 
-    const policy = policyDecisions.find((item) => item.finding_id === id);
+    // The server already filtered to this finding, ordered oldest-first -- the
+    // same row the previous client-side `.find()` over the whole table picked.
+    const policy = policyDecisions[0];
     if (policy) {
       replaceChildren($("#policy-content"), el("div", { class: "detail-content" },
         el("h3", { text: policy.decision }),

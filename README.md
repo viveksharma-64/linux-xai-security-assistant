@@ -247,13 +247,19 @@ chains.
   route is destructive: there is no `PUT`/`DELETE`/`PATCH`. `actor` is a
   self-reported claim, labelled as such — the token proves the writer is
   authorized, not who they are.
-- **Faithful export** — `GET /api/triage/export` emits a complete JSON document
-  (`schema: linux-xai-security/triage-export/v1`) with every finding, its
-  evidence, its full append-only annotation history, and the verdicts of the three
-  hash chains that cover the exported record (findings, policy, triage). The
-  ML-lifecycle chain is deliberately not folded in: it says nothing about the
-  integrity of these findings, and adding it would silently change a released
-  export schema. Suppressed findings are included and marked, never omitted.
+- **Faithful export** — `GET /api/triage/export` emits a JSON document
+  (`schema: linux-xai-security/triage-export/v1`) with every finding in the
+  requested page, its evidence, its full append-only annotation history, and the
+  verdicts of the three hash chains that cover the exported record (findings,
+  policy, triage). The ML-lifecycle chain is deliberately not folded in: it says
+  nothing about the integrity of these findings, and adding it would silently
+  change a released export schema. Suppressed findings are included and marked,
+  never omitted. Findings are paged (5000 per response by default and at most),
+  because the chains are exempt from retention and an unbounded export grows with
+  uptime; `findings_total` and `findings_truncated` say what a page omitted, so
+  an export that cannot be complete reports that instead of looking complete.
+  Follow `?offset=` until `findings_truncated` is false to assemble the whole
+  record.
 - **Integrity alarm** — `GET /api/integrity` returns the `verify_chain` verdict
   for the findings, policy, triage, and ML-lifecycle chains. The console raises an
   unmissable banner **only** when a chain fails to verify, and stays silent when
@@ -500,14 +506,35 @@ GET /api/detections/{id}
 GET /api/explanations/{id}
 GET /api/assistant/{id}
 GET /api/policies
-GET /api/policy-decisions
+GET /api/policy-decisions            # paginated; ?finding_id= narrows to one finding
 GET /api/integrity                   # verify_chain verdicts: findings, policy, triage, ml_lifecycle
 GET /api/efficacy/operational        # precision/counts from dispositions (not the ML gate)
 GET /api/models                      # model provenance + recorded lifecycle state (never artifact_path)
 GET /api/models/{id}                 # provenance, transition history, gate verdict, latest drift, chain
 GET /api/triage/{id}                 # append-only history + effective state
-GET /api/triage/export               # faithful record; suppressed findings included and marked
+GET /api/triage/export               # faithful record, paged; suppressed findings included and marked
 ```
+
+Every route over a table that grows on its own — events, findings, policy
+decisions — is bounded. That is a denial-of-service control rather than an
+ergonomic one: the hash-chained tables are deliberately exempt from retention, so
+an unbounded read of one returns a response whose size grows with uptime. The
+body of a paged route stays a JSON array — the historical shape — with page
+metadata in `X-Total-Count`, `X-Limit`, and `X-Offset`. `/api/models` is the
+remaining unpaged list route; it is left so because the model registry grows once
+per retrain rather than with telemetry, and it is on the list to page.
+
+`/openapi.json`, `/docs`, and `/redoc` are **gated like any other route**: the
+schema names every route, parameter, and response field of the evidence feed, so
+it is withheld from an anonymous caller. Fetch it with a token:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/openapi.json
+```
+
+A browser address bar sends no such header, so `/docs` renders its shell but
+cannot load the schema; scripted client generation with a token is the supported
+path.
 
 The only non-`GET` routes are the append-only triage writes, each `POST` only
 and token-gated (default-deny). None is destructive — there is no

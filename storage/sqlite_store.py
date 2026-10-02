@@ -47,6 +47,17 @@ _TRIAGE_DISPOSITIONS = frozenset({"true-positive", "false-positive", "benign"})
 # this -- see the truncation flag on /api/triage/export.
 MAX_TRIAGE_ANNOTATION_LIMIT = 5000
 
+# Hard ceiling on how many findings one /api/triage/export response may carry.
+# The export is the only reader that wants the whole findings table, and it is
+# network-facing, so without a ceiling its response size is a function of how
+# long the deployment has been running -- the chains are deliberately exempt from
+# retention, so findings are never pruned. Set equal to the annotation ceiling
+# above because that one already bounded the same document; a deployment under
+# this many findings exports exactly what it exported before. Paired with
+# `count_detection_findings` so an export that cannot be complete says so
+# instead of looking complete.
+MAX_TRIAGE_EXPORT_LIMIT = 5000
+
 # The append-only ML lifecycle vocabulary, kept in step with the CHECK constraint
 # on ml_model_lifecycle (migration 10) and with ml/lifecycle.py. `active` is in
 # the list because the log must be able to *record* an activation; it is not a
@@ -1151,10 +1162,31 @@ class SQLiteEventStore(EventStore):
                 )
                 return finding_id
 
-    def read_detection_findings(self) -> list[dict[str, Any]]:
+    def read_detection_findings(self, *, limit: int | None = None, offset: int = 0) -> list[dict[str, Any]]:
+        """
+        Findings in chain order (oldest first), optionally a bounded slice.
+
+        `limit=None` reads the whole table and is the default, because in-process
+        consumers (the explainer, the migration tests) legitimately need all of
+        it. Network-facing readers must pass a `limit`: an unbounded read becomes
+        an unbounded response, which is a denial-of-service lever against the API
+        process rather than a feature. Pair a bounded call with
+        `count_detection_findings` so the caller can disclose what it omitted
+        instead of appearing complete.
+        """
+        clause = ""
+        values: list[Any] = []
+        if limit is not None:
+            clause = " LIMIT ? OFFSET ?"
+            values = [max(1, int(limit)), max(0, int(offset))]
+        elif offset:
+            # SQLite rejects OFFSET without LIMIT; -1 is its documented "no limit".
+            clause = " LIMIT -1 OFFSET ?"
+            values = [max(0, int(offset))]
         with self._transaction() as conn:
             rows = conn.execute(
-                "SELECT * FROM detection_findings ORDER BY window_start ASC, id ASC"
+                "SELECT * FROM detection_findings ORDER BY window_start ASC, id ASC" + clause,
+                tuple(values),
             ).fetchall()
             findings = []
             for row in rows:
@@ -1164,6 +1196,19 @@ class SQLiteEventStore(EventStore):
                     finding["suppressed"] = bool(finding["suppressed"])
                 findings.append(finding)
             return findings
+
+    def count_detection_findings(self) -> int:
+        """
+        How many findings exist, as a SQL aggregate.
+
+        So a caller taking a bounded slice of `read_detection_findings` can say
+        how much it did *not* return without reading the rest of the table --
+        the same reason `count_findings_by_severity` is an aggregate rather than
+        a fold over the rows.
+        """
+        with self._transaction() as conn:
+            row = conn.execute("SELECT COUNT(*) AS c FROM detection_findings").fetchone()
+            return int(row["c"])
 
     def count_findings_by_severity(self) -> dict[str, int]:
         """
@@ -1294,19 +1339,75 @@ class SQLiteEventStore(EventStore):
                 )
                 return decision_id
 
+    def read_policy_decisions_page(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        finding_id: int | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """
+        A bounded slice of policy_decisions plus the total it was taken from.
+
+        The `(rows, total)` shape mirrors `read_detection_findings_page`: the
+        total counts the filter matches *before* paging, so a network caller can
+        report how much it did not return rather than appear complete. Order is
+        unchanged from `read_policy_decisions` (`timestamp ASC, id ASC`, which is
+        chain order) so a page is a window onto the same sequence, not a
+        differently-sorted one.
+
+        `finding_id` exists so the one consumer that wants a single finding's
+        decision -- the dashboard detail pane -- can ask for it instead of
+        fetching the table and scanning client-side. There is no index on
+        `finding_id`, so the filter scans; that is still strictly less work than
+        the unfiltered full read it replaces, and the result set is bounded
+        either way. Add an index behind a migration if decision volume ever
+        makes the scan matter.
+        """
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        where = ""
+        filters: tuple[Any, ...] = ()
+        if finding_id is not None:
+            where = " WHERE finding_id = ?"
+            filters = (int(finding_id),)
+        with self._transaction() as conn:
+            total = int(
+                conn.execute(f"SELECT COUNT(*) AS c FROM policy_decisions{where}", filters).fetchone()["c"]
+            )
+            rows = conn.execute(
+                f"SELECT * FROM policy_decisions{where} ORDER BY timestamp ASC, id ASC LIMIT ? OFFSET ?",
+                (*filters, limit, offset),
+            ).fetchall()
+            return [self._decode_policy_decision(row) for row in rows], total
+
     def read_policy_decisions(self) -> list[dict[str, Any]]:
+        """
+        Every policy decision in chain order.
+
+        Unbounded by design, for in-process consumers and chain verification.
+        Network-facing readers must use `read_policy_decisions_page`.
+        """
         with self._transaction() as conn:
             rows = conn.execute(
                 "SELECT * FROM policy_decisions ORDER BY timestamp ASC, id ASC"
             ).fetchall()
-            decisions = []
-            for row in rows:
-                decision = dict(row)
-                decision["required_approval"] = bool(decision["required_approval"])
-                decision["dry_run"] = bool(decision["dry_run"])
-                decision["limitations"] = json.loads(decision.pop("limitations_json"))
-                decisions.append(decision)
-            return decisions
+            return [self._decode_policy_decision(row) for row in rows]
+
+    @staticmethod
+    def _decode_policy_decision(row: Any) -> dict[str, Any]:
+        """
+        Decode one stored policy_decisions row into its API shape.
+
+        Shared by the bounded and unbounded readers so a page can never decode
+        differently from a full read -- the integer-to-bool and JSON column
+        handling lives in exactly one place.
+        """
+        decision = dict(row)
+        decision["required_approval"] = bool(decision["required_approval"])
+        decision["dry_run"] = bool(decision["dry_run"])
+        decision["limitations"] = json.loads(decision.pop("limitations_json"))
+        return decision
 
     def verify_findings_chain(self) -> dict[str, Any]:
         """

@@ -16,7 +16,11 @@ from observability import alerts as alerting
 from observability import metrics as metrics_module
 from observability.config import Settings
 from observability.config import settings as load_process_settings
-from storage.sqlite_store import MAX_TRIAGE_ANNOTATION_LIMIT, SQLiteEventStore
+from storage.sqlite_store import (
+    MAX_TRIAGE_ANNOTATION_LIMIT,
+    MAX_TRIAGE_EXPORT_LIMIT,
+    SQLiteEventStore,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_POLICY_PATH = ROOT / "policy" / "default_policy.yaml"
@@ -185,9 +189,13 @@ class FindingResponse(StrictModel):
     chain_hash: str | None = None
     # Effective triage state (Phase D, migration 9), folded read-only from the
     # append-only annotation layer -- never a mutation of the finding row above.
-    # Defaulted so the readers that do not enrich (single lookup falls back to a
-    # targeted fold; `/api/status` counts do not need it) still serialize, and so
-    # a pre-triage client sees benign defaults. `triage_suppressed` is the
+    # Both readers of this model do enrich, by different means: the paged list
+    # computes all four in SQL (`read_detection_findings_page`), and the single
+    # lookup folds the annotation log in Python and indexes it by id. The
+    # defaults are for the readers that do *not* -- plain `read_detection_findings`
+    # returns the stored columns only -- so an unenriched row still validates
+    # instead of 500-ing, and an un-annotated finding reads as benign rather than
+    # requiring a caller to spell out four zero values. `triage_suppressed` is the
     # *effective* suppression (config `suppressed` OR the latest analyst suppress
     # not since lifted); the immutable `suppressed` column is left truthful above.
     triage_disposition: str | None = None
@@ -577,20 +585,37 @@ def create_app(
     @app.middleware("http")
     async def require_token(request: Request, call_next):
         """
-        Gate every telemetry-bearing path on a valid token.
+        Gate every path on a valid token unless it is explicitly opened.
 
         Implemented as middleware rather than a per-route dependency so that a
         route added later is protected by default. Forgetting a dependency on one
         new endpoint would silently expose it; there is nothing to forget here.
 
-        The static dashboard is excluded because it is markup and JavaScript with
-        no telemetry in it -- the data it renders comes from `/api/*`, which is
-        gated. The browser supplies the token from there.
+        The rule is **default-deny**, and that is load-bearing rather than
+        stylistic. It was previously an allowlist of gated prefixes (`/metrics`
+        and `/api/*`), which left anything outside those prefixes open -- and
+        FastAPI mounts three such routes itself (`/openapi.json`, `/docs`,
+        `/redoc`). The schema names every route, parameter, and response field of
+        the evidence feed, so it was exactly the reconnaissance document the gate
+        exists to withhold, served to anyone who asked. Denying by default means a
+        route *this file does not know about* is still covered. Do not turn this
+        back into a list of what to gate; add to the open set below instead, and
+        only for something that discloses nothing.
+
+        Open, deliberately:
+
+        * `unprotected_paths()` -- static, DB-free liveness and health summary,
+          which a process manager must reach before a credential exists.
+        * `/` -- a redirect to the dashboard, carrying no telemetry. It stays open
+          so an operator landing on the host gets the page where they enter their
+          token, rather than a 401 with nowhere to go.
+        * `/dashboard/*` -- markup and JavaScript with no telemetry in it. The
+          data it renders comes from `/api/*`, which is gated; the browser
+          supplies the token from there.
         """
         path = request.url.path
         authenticator: TokenAuthenticator = app.state.authenticator
-        gated = path == "/metrics" or path.startswith("/api/")
-        if not gated or path in open_paths:
+        if path in open_paths or path == "/" or path == "/dashboard" or path.startswith("/dashboard/"):
             return await call_next(request)
         if authenticator.required and not authenticator.configured:
             return JSONResponse(
@@ -875,8 +900,43 @@ def create_app(
         return _read_policies()
 
     @app.get("/api/policy-decisions", response_model=list[PolicyDecisionResponse])
-    def policy_decisions() -> list[PolicyDecisionResponse]:
-        return event_store.read_policy_decisions()
+    def policy_decisions(
+        response: Response,
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        finding_id: int | None = Query(default=None, ge=1),
+    ) -> list[PolicyDecisionResponse]:
+        """
+        A page of policy decisions in chain order, newest-last.
+
+        Bounded because it used to return the whole `policy_decisions` table in
+        one response. Decisions accumulate once per acted-on finding and are
+        never pruned -- retention deliberately exempts the hash-chained tables --
+        so the unbounded read grew without limit and made response size a
+        function of uptime. That is a denial-of-service lever against the API
+        process, not a feature.
+
+        Paging follows the `/api/detections` contract exactly: the body stays a
+        JSON array, so existing consumers keep parsing it unchanged, and the page
+        metadata rides in `X-Total-Count` / `X-Limit` / `X-Offset`. Order is
+        unchanged (`timestamp ASC`), so a page is a window onto the same sequence
+        callers already saw rather than a re-sorted one.
+
+        `finding_id` narrows to one finding's decision. It exists because the
+        dashboard's detail pane wanted exactly that and previously got it by
+        fetching the entire table and scanning client-side -- which a `limit`
+        alone would have broken, since the oldest 100 decisions are the ones
+        least likely to contain a recently-viewed finding.
+        """
+        decisions, total = event_store.read_policy_decisions_page(
+            limit=limit,
+            offset=offset,
+            finding_id=finding_id,
+        )
+        response.headers["X-Total-Count"] = str(total)
+        response.headers["X-Limit"] = str(limit)
+        response.headers["X-Offset"] = str(offset)
+        return decisions
 
     # --------------------------------------------------------------------- #
     # Triage write-back (Phase D). Append-only, authenticated by the same
@@ -966,28 +1026,59 @@ def create_app(
         )
 
     @app.get("/api/triage/export")
-    def triage_export() -> dict[str, Any]:
+    def triage_export(
+        limit: int = Query(default=MAX_TRIAGE_EXPORT_LIMIT, ge=1, le=MAX_TRIAGE_EXPORT_LIMIT),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, Any]:
         """
-        A faithful, complete export of the evidence record and its triage trail.
+        A faithful export of the evidence record and its triage trail.
 
-        Every finding is included -- suppressed ones too, marked as such under
-        `triage.effective_suppressed`. Suppression is a presentation/alerting
-        annotation; it never removes a finding from this document. The three chain
-        verdicts are embedded so a downstream consumer can confirm the export was
-        taken from an intact record. Annotations are grouped in one pass to avoid
-        a per-finding query.
+        Every finding in the requested range is included -- suppressed ones too,
+        marked as such under `triage.effective_suppressed`. Suppression is a
+        presentation/alerting annotation; it never removes a finding from this
+        document. The three chain verdicts are embedded so a downstream consumer
+        can confirm the export was taken from an intact record. Annotations are
+        grouped in one pass to avoid a per-finding query.
 
-        The annotation history is read under the store's hard limit, which is
-        oldest-first, so a record with more annotations than that loses its
-        *newest* ones. An export that cannot be complete says so in
-        `annotations_truncated` rather than looking complete: each finding's
+        Why this is paged at all
+        ------------------------
+        It used to read the entire `detection_findings` table into one response.
+        Retention deliberately exempts the hash-chained tables, so findings are
+        never pruned and that response grew with uptime without bound -- a
+        denial-of-service lever against the API process. `limit` therefore caps a
+        single response at `MAX_TRIAGE_EXPORT_LIMIT`, and `offset` walks the rest
+        in chain order. The cap equals the annotation cap that already bounded
+        this same document, so a deployment holding fewer findings than that
+        exports byte-identical content apart from the new metadata keys below.
+
+        It is not possible to both bound this endpoint and keep returning an
+        unbounded document, so what is preserved is the invariant that matters:
+        nothing is ever *silently* omitted. `findings_total` is a SQL count over
+        the whole table, and `findings_truncated` says whether more remains past
+        this page -- the same contract `annotations_truncated` already provided
+        for annotation history, which is why a consumer assembling a complete
+        archive can do so by following `offset` until it clears.
+
+        The annotation read is unchanged and remains global and oldest-first
+        rather than scoped to this page, so on a record with more than
+        `annotation_limit` annotations a late page may show findings whose
+        annotations were crowded out by earlier findings'. Each finding's
         `triage.annotation_count` is computed over the whole table and stays
-        authoritative, so a consumer can tell which findings lost history.
+        authoritative, so a consumer can always tell which findings lost history.
 
         Declared before `/api/triage/{finding_id}` so the static path wins the
         route match; otherwise "export" would be parsed as a finding id.
+
+        Deliberately has no `response_model`, unlike every other read route. The
+        contract here is "every stored column of a finding, faithfully", written
+        with a `**finding` splat; a `StrictModel` forbids extras, so the next
+        migration that adds a column would turn this endpoint into a 500 instead
+        of exporting the new field. Fidelity to the record wins over a documented
+        schema on this one route.
         """
-        findings = event_store.read_detection_findings()
+        findings_total = event_store.count_detection_findings()
+        findings = event_store.read_detection_findings(limit=limit, offset=offset)
+        findings_truncated = (offset + len(findings)) < findings_total
         states = event_store.read_latest_triage_state()
         all_annotations = event_store.read_triage_annotations(
             limit=MAX_TRIAGE_ANNOTATION_LIMIT
@@ -1024,10 +1115,19 @@ def create_app(
                 "triage": event_store.verify_triage_chain(),
             },
             "note": (
-                "Faithful complete evidence record. Suppressed findings are "
+                "Faithful evidence record. Suppressed findings are "
                 "included and marked (triage.effective_suppressed); suppression is "
                 "a presentation annotation only and never removes a finding from "
                 "the record or this export. 'actor' is a self-reported claim."
+                + (
+                    " FINDINGS ARE PAGED: this document carries "
+                    f"{len(exported)} of {findings_total} findings starting at "
+                    f"offset {offset}. Request the next page with "
+                    f"?offset={offset + len(exported)} and repeat until "
+                    "findings_truncated is false to assemble the complete record."
+                    if findings_truncated
+                    else ""
+                )
                 + (
                     " ANNOTATION HISTORY IS TRUNCATED: the oldest "
                     f"{MAX_TRIAGE_ANNOTATION_LIMIT} annotations are included and "
@@ -1037,6 +1137,11 @@ def create_app(
                     else ""
                 )
             ),
+            "findings_total": findings_total,
+            "findings_returned": len(exported),
+            "findings_offset": offset,
+            "findings_limit": limit,
+            "findings_truncated": findings_truncated,
             "annotations_truncated": annotations_truncated,
             "annotation_limit": MAX_TRIAGE_ANNOTATION_LIMIT,
             "findings": exported,

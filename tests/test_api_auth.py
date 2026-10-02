@@ -97,6 +97,54 @@ def test_the_static_dashboard_is_not_gated(store):
     assert client.get("/dashboard/").status_code == 200
 
 
+def test_the_schema_and_its_docs_are_gated(store):
+    # Regression. The gate used to be an allowlist of gated prefixes (/metrics
+    # and /api/*), which left everything outside them open -- and FastAPI mounts
+    # these three itself, so they were never considered. The schema names every
+    # route, parameter, and response field of the evidence feed: it is precisely
+    # the reconnaissance document the gate exists to withhold, and it was served
+    # to anyone who asked. The gate is now default-deny.
+    client = TestClient(create_app(store, authed_config()))
+    for path in ("/openapi.json", "/docs", "/redoc", "/docs/oauth2-redirect"):
+        assert client.get(path).status_code == 401, path
+    # Still available to an authenticated operator -- the fix gates the schema,
+    # it does not remove it, so scripted client generation keeps working with a
+    # token. (A browser address bar sends no header, so /docs renders but cannot
+    # fetch the schema; `curl -H` is the supported path.)
+    assert client.get("/openapi.json", headers={"X-API-Key": TOKEN}).status_code == 200
+
+
+def test_no_other_route_answers_without_a_token(store):
+    """
+    The open set is exactly what the threat model documents, and nothing else.
+
+    Asserted as set equality rather than a list of expected 401s so that a route
+    opened later -- by being added outside a gated prefix, which is how
+    /openapi.json escaped -- shows up here as a set difference instead of going
+    unnoticed. This is the property the default-deny middleware exists to hold;
+    `/docs/oauth2-redirect` above is the concrete case an explicit gate-list
+    missed.
+    """
+    app = create_app(store, authed_config())
+    client = TestClient(app)
+    # Parameterised paths are skipped: they need a real finding id to answer
+    # anything but 404/422, and the gate runs before routing either way. The
+    # /dashboard mount carries no `methods` and is covered by the test above.
+    paths = sorted(
+        route.path
+        for route in app.routes
+        if "GET" in (getattr(route, "methods", None) or ()) and "{" not in route.path
+    )
+    answered = {
+        path
+        for path in paths
+        # follow_redirects=False so "/" is judged on its own status, not on the
+        # openness of the /dashboard/ it redirects to.
+        if client.get(path, follow_redirects=False).status_code != 401
+    }
+    assert answered == {"/", "/api/health", "/api/health/live"}
+
+
 def test_auth_required_but_unconfigured_fails_closed_with_503(store):
     # The dangerous alternative is serving the evidence feed unauthenticated; an
     # operator who forgot the token file gets an outage they fix in a minute.
