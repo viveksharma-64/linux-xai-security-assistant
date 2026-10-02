@@ -124,6 +124,81 @@ def test_event_detection_explanation_and_policy_retrieval(tmp_path):
     assert len(decision["chain_hash"]) == 64  # policy chain is surfaced too
 
 
+def _decision(finding_id=1, policy_id="p", timestamp=1000.0, **overrides):
+    decision = {
+        "finding_id": finding_id,
+        "policy_id": policy_id,
+        "decision": "advisory_only",
+        "reason": "dry-run, approval required",
+        "risk_score": 0.7,
+        "severity": "HIGH",
+        "required_approval": True,
+        "proposed_action": "notify_operator",
+        # A list, as PolicyEngine emits and PolicyDecisionResponse declares --
+        # the store-level helper in test_evidence_chain.py uses a dict because it
+        # never round-trips through the response model.
+        "limitations": ["Dry-run mode: no action was taken."],
+        "timestamp": timestamp,
+        "dry_run": True,
+        "advisory_rejection": None,
+    }
+    decision.update(overrides)
+    return decision
+
+
+def test_policy_decisions_are_paged_and_can_be_narrowed_to_one_finding(tmp_path):
+    """
+    `/api/policy-decisions` is bounded, and says how much it did not return.
+
+    It used to `SELECT *` the whole table. Decisions accumulate once per acted-on
+    finding and retention deliberately exempts the hash-chained tables, so that
+    response grew with uptime without bound -- a denial-of-service lever against
+    the API process rather than a feature.
+
+    The paging contract is `/api/detections`': the body stays a JSON array so
+    existing consumers parse it unchanged, and the page metadata rides in headers.
+    Order is unchanged (`timestamp ASC`), so a page is a window onto the sequence
+    callers already saw.
+    """
+    store = SQLiteEventStore(str(tmp_path / "events.db"))
+    for index in range(3):
+        store.write_policy_decision(
+            _decision(finding_id=1 + index // 2, policy_id=f"p{index}", timestamp=1000.0 + index)
+        )
+    client = TestClient(create_app(store))
+
+    first = client.get("/api/policy-decisions?limit=2")
+    assert [d["policy_id"] for d in first.json()] == ["p0", "p1"]
+    assert first.headers["X-Total-Count"] == "3"
+    assert first.headers["X-Limit"] == "2"
+    assert first.headers["X-Offset"] == "0"
+
+    second = client.get("/api/policy-decisions?limit=2&offset=2")
+    assert [d["policy_id"] for d in second.json()] == ["p2"]
+    assert second.headers["X-Total-Count"] == "3"
+    assert second.headers["X-Offset"] == "2"
+
+    # Unchanged for any deployment under one page: same array, same order.
+    whole = client.get("/api/policy-decisions")
+    assert [d["policy_id"] for d in whole.json()] == ["p0", "p1", "p2"]
+    assert whole.headers["X-Total-Count"] == "3"
+    assert whole.headers["X-Limit"] == "100"
+
+    # `finding_id` narrows server-side. This exists because the dashboard detail
+    # pane wanted one finding's decision and got it by fetching the entire table
+    # and scanning client-side -- which a bare `limit` would have broken, since
+    # the oldest 100 decisions are the ones least likely to hold a recently
+    # viewed finding. The total reflects the filter, not the table.
+    narrowed = client.get("/api/policy-decisions?finding_id=2")
+    assert [d["policy_id"] for d in narrowed.json()] == ["p2"]
+    assert [d["finding_id"] for d in narrowed.json()] == [2]
+    assert narrowed.headers["X-Total-Count"] == "1"
+
+    # The ceiling is a ceiling: asking past it is refused, not honoured.
+    assert client.get("/api/policy-decisions?limit=501").status_code == 422
+    store.close()
+
+
 def test_telemetry_status_is_derived_from_stored_events_not_a_static_list(tmp_path):
     """
     A supported source that nothing collects must not read as healthy.

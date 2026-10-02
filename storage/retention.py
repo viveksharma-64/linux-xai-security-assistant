@@ -33,8 +33,20 @@ not delete from the append-only hash-chained tables (`detection_findings`,
 `policy_decisions`, and the triage and ML-lifecycle logs). Those chains verify by
 recomputing from a contiguous `chain_seq` starting at 0, so pruning their oldest
 rows would be indistinguishable from tampering and would leave `/api/integrity`
-reporting a break forever. Findings are rare compared to events, and the byte cap
-still bounds total growth, so the chains are bounded indirectly rather than cut.
+reporting a break forever.
+
+The chains are therefore **unbounded**, and the byte cap does not bound them:
+`_enforce_size_cap` reclaims space only by deleting events, so once the events
+are gone it has nothing left to delete and reports
+`retention_size_cap_ineffective` rather than touching a chain. In practice
+findings are rare compared to events, so the file is dominated by event volume
+and the cap is effective in the deployments this is built for -- but that is a
+property of the workload, not a guarantee of the design. A deployment that
+generates findings steadily for long enough will exceed its cap and stay over it.
+Readers of these tables must bound themselves accordingly: that is why
+`/api/policy-decisions` and `/api/triage/export` page rather than returning a
+whole table. Cutting a chain is not the remedy; archiving a verified prefix and
+restarting the chain would be, and no such mechanism exists yet.
 
 Why vacuum is scheduled separately
 ----------------------------------
