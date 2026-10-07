@@ -412,6 +412,23 @@ class ChainVerdictResponse(StrictModel):
     reason: str | None = None
 
 
+class TrainingWindowVerificationResponse(StrictModel):
+    """
+    A set of independent digest recomputations -- deliberately not a chain verdict.
+
+    `ml_training_windows.immutable_hash` is recorded per row and covers that row
+    only, so a break is attributable to specific ids rather than to a position in a
+    sequence, and a deleted row is invisible here by construction. That is why this
+    reports `mismatched_ids` instead of `break_seq`, and why it must not be read as
+    a fifth hash chain: it proves the surviving rows are unedited, not that the set
+    is complete.
+    """
+
+    ok: bool
+    checked: int
+    mismatched_ids: list[int]
+
+
 class IntegrityResponse(StrictModel):
     findings: ChainVerdictResponse
     policy: ChainVerdictResponse
@@ -422,6 +439,14 @@ class IntegrityResponse(StrictModel):
     # hash of each drift assessment, so a break here can mean an edited
     # assessment as well as an edited lifecycle row.
     ml_lifecycle: ChainVerdictResponse
+    # The training data behind the model currently influencing findings. Scoped to
+    # the active model's own `training_window_ids` rather than to the whole table:
+    # verification is a digest per row, so an unscoped form is a full scan, and this
+    # endpoint is on a request path. The scope is also the stronger claim -- "the
+    # data behind what is scoring right now is unedited" -- and on a default install,
+    # with no active model, it is a vacuous ok over zero rows, which is the honest
+    # answer when detection is running deterministically.
+    active_model_training_windows: TrainingWindowVerificationResponse
     # A single overall verdict for the dashboard's banner: false if any chain is
     # broken. The per-chain detail carries the break location and reason.
     ok: bool
@@ -507,6 +532,10 @@ class ModelDetailResponse(StrictModel):
     latest_drift: DriftSummaryResponse | None = None
     drift_assessment_count: int = 0
     chain: ChainVerdictResponse
+    # Whether this model's own training windows still match their recorded digests.
+    # Beside `chain` because the two answer different questions: the chain says the
+    # lifecycle decisions were not rewritten, this says the data behind them was not.
+    training_windows: TrainingWindowVerificationResponse
 
 
 class OperationalEfficacyCounts(StrictModel):
@@ -1163,23 +1192,44 @@ def create_app(
     @app.get("/api/integrity", response_model=IntegrityResponse)
     def integrity() -> IntegrityResponse:
         """
-        The tamper-evidence verdict for all four append-only chains.
+        The tamper-evidence verdict for all four append-only chains, plus the active
+        model's training-data verification.
 
         Recomputes each chain from on-disk columns and reports `{ok, checked,
         break_seq, reason}` per chain plus an overall `ok`. A false anywhere means
         a row was mutated, reordered, deleted, or inserted -- the dashboard raises
         an unmissable banner on that. This mutates nothing.
+
+        The fifth term is a verification, not a chain: it recomputes each training
+        window's own `immutable_hash` and names the rows that fail. It is folded into
+        the same overall `ok` because a chain proving which decisions were made says
+        nothing about whether the data they were made on still matches its digest.
         """
         findings = event_store.verify_findings_chain()
         policy = event_store.verify_policy_chain()
         triage = event_store.verify_triage_chain()
         ml_lifecycle = event_store.verify_ml_lifecycle_chain()
+        # `read_ml_models` reports a window *count*, not the ids, so the active
+        # model's row is re-read for its provenance list. Both reads are cheap;
+        # `ml_models` holds one row per trained model, not per window.
+        active = next((record for record in event_store.read_ml_models() if record["active"]), None)
+        provenance = event_store.read_ml_model(active["id"]) if active else None
+        training_windows = event_store.verify_ml_training_windows(
+            window_ids=list(provenance["training_window_ids"]) if provenance else []
+        )
         return IntegrityResponse(
             findings=ChainVerdictResponse(**findings),
             policy=ChainVerdictResponse(**policy),
             triage=ChainVerdictResponse(**triage),
             ml_lifecycle=ChainVerdictResponse(**ml_lifecycle),
-            ok=bool(findings["ok"] and policy["ok"] and triage["ok"] and ml_lifecycle["ok"]),
+            active_model_training_windows=TrainingWindowVerificationResponse(**training_windows),
+            ok=bool(
+                findings["ok"]
+                and policy["ok"]
+                and triage["ok"]
+                and ml_lifecycle["ok"]
+                and training_windows["ok"]
+            ),
         )
 
     @app.get("/api/models", response_model=list[ModelSummaryResponse])
@@ -1219,8 +1269,9 @@ def create_app(
         """
         One model's provenance, lifecycle history, gate verdict, and latest drift.
 
-        Backed by `ml/lifecycle.py:lifecycle_report` (history + chain verdict + the
-        recorded gate acceptance) and `ml/drift.py:drift_summary`. The activation gate
+        Backed by `ml/lifecycle.py:lifecycle_report` (history, chain verdict,
+        training-window verification, and the recorded gate acceptance) and
+        `ml/drift.py:drift_summary`. The activation gate
         is not re-run: `activation_eligible` and each transition's `acceptance` block
         are surfaced verbatim from the recorded rows. `artifact_path` is deliberately
         not exposed -- the checksum identifies the model without leaking host layout.
@@ -1265,6 +1316,7 @@ def create_app(
             latest_drift=latest_drift,
             drift_assessment_count=len(drift_rows),
             chain=ChainVerdictResponse(**report["chain"]),
+            training_windows=TrainingWindowVerificationResponse(**report["training_windows"]),
         )
 
     @app.get("/api/efficacy/operational", response_model=OperationalEfficacyResponse)

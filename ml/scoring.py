@@ -73,6 +73,26 @@ class MLScorer:
         self.training_windows = store.read_ml_training_windows_by_ids(self.metadata["training_window_ids"])
         if len(self.training_windows) != len(self.metadata["training_window_ids"]):
             raise MLScoringError("ML training-window provenance is incomplete")
+        # The windows are present -- but present is not intact. These rows are the
+        # scorer's attribution baseline (the per-feature training min/max/mean built
+        # just below), so an edited one silently relabels which feature looks
+        # unusual. Verified here, at construction, for the same reason activation is:
+        # a model whose provenance does not verify should have no scoring path at
+        # all, rather than one producing explanations drawn from altered data.
+        #
+        # Scoped to this model's own `training_window_ids`, so the cost is its
+        # provenance list and not the corpus table. The reason string names
+        # *tampering* specifically because the detector catches `MLScoringError` and
+        # degrades to deterministic scoring; "provenance is incomplete" and "a row
+        # was edited" call for different operator responses, and a generic message
+        # would make them indistinguishable in the degradation reason.
+        verification = store.verify_ml_training_windows(window_ids=self.metadata["training_window_ids"])
+        if not verification["ok"]:
+            raise MLScoringError(
+                "ML training-window provenance is tampered: "
+                f"{len(verification['mismatched_ids'])} of {verification['checked']} windows "
+                "fail hash verification"
+            )
         # Per-feature training min/max/mean depend only on the fixed training
         # windows, never on the scored event, so they are identical on every
         # score() call. Memoise them on first use: the first score() still runs

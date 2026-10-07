@@ -25,6 +25,7 @@ Fixtures build training windows directly through the store rather than through
 *distributions* and window extraction gives control only over the events.
 """
 
+import json
 import sqlite3
 from math import gcd
 
@@ -128,6 +129,23 @@ def _comparison(store, name, base, count=40, span=None):
         value = base + (index if span is None else index % span)
         _window(store, dataset_id, 500000.0 + index * 60.0, _features(event_count=value))
     return dataset_id
+
+
+def _raw_update(store, statement, parameters=()):
+    """
+    Edit rows behind the store's back.
+
+    Every write path refuses to produce the states these tests need -- an
+    unattested dataset, a window whose content no longer matches its hash -- which
+    is the point. Tamper-evidence is only testable from outside the thing that
+    maintains it.
+    """
+    connection = sqlite3.connect(store.db_path)
+    try:
+        connection.execute(statement, parameters)
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def _table_counts(path):
@@ -413,12 +431,114 @@ def test_unverified_comparison_windows_are_refused(tmp_path):
     tainted = [{**window, "verified_normal": False} for window in windows]
 
     class _UnverifiedSource:
+        """
+        A comparison corpus that attests itself and whose hashes verify, yet whose
+        windows carry `verified_normal: False`.
+
+        The dataset-level attestation and the hash verdict are deliberately clean so
+        this test isolates the per-window backstop: if the refusal came from the
+        dataset row or a digest mismatch instead, the assertion below would still
+        pass for the wrong reason.
+        """
+
+        def read_ml_dataset(self, requested):
+            assert requested == dataset_id
+            return {"id": requested, "verification": {"verified_normal": True}}
+
+        def verify_ml_training_windows(self, requested):
+            assert requested == dataset_id
+            return {"ok": True, "checked": len(tainted), "mismatched_ids": []}
+
         def read_ml_training_windows(self, requested):
             assert requested == dataset_id
             return tainted
 
     reasons = _reasons(store, model_id, dataset_id, comparison_store=_UnverifiedSource())
     assert "comparison dataset contains unverified windows" in reasons
+
+
+def test_an_unattested_comparison_dataset_is_refused(tmp_path):
+    """
+    The dataset's *own* attestation, which is where `verified_normal` actually
+    lives and the only place the check can fire for rows this project wrote.
+
+    The per-window check above is a backstop for foreign corpora: the column is
+    CHECK-constrained to 0/1, `write_ml_training_window` refuses anything but
+    `True`, and the decoder returns `bool(1)` -- so for store-written rows it can
+    never trip. Reading the `ml_datasets` row is what turns "the comparison corpus
+    must be verified-normal" from a docstring claim into a refusal. A missing row
+    counts too: windows pointing at a dataset that no longer exists have no
+    attestation behind them at all.
+    """
+    store = _store(tmp_path)
+    model_id = _model(store, _reference(store))
+    dataset_id = _comparison(store, "shifted", 500.0)
+    _raw_update(
+        store,
+        "UPDATE ml_datasets SET verification_json = ? WHERE id = ?",
+        (json.dumps({"operator": "test"}), dataset_id),
+    )
+    assert "comparison dataset is not attested verified-normal" in _reasons(store, model_id, dataset_id)
+
+    # Not a dict at all. The comparison store is a file an operator hands over, so
+    # the attestation has to be shape-checked and not merely key-checked: a `.get`
+    # on `null` would raise out of a function whose entire contract is to refuse
+    # with reasons, turning an unreadable corpus into a traceback instead of a
+    # verdict. An attestation that cannot be read is an attestation that is absent.
+    for malformed in ("null", "[]", '"verified"'):
+        _raw_update(
+            store,
+            "UPDATE ml_datasets SET verification_json = ? WHERE id = ?",
+            (malformed, dataset_id),
+        )
+        assert "comparison dataset is not attested verified-normal" in _reasons(store, model_id, dataset_id)
+
+    _raw_update(store, "DELETE FROM ml_datasets WHERE id = ?", (dataset_id,))
+    assert "comparison dataset metadata was not found" in _reasons(store, model_id, dataset_id)
+
+
+def test_tampered_reference_windows_are_refused(tmp_path):
+    """
+    Drift is a comparison of two stored samples, so an edit to either one is an
+    edit to the result. The reference side is the model's own training data, and it
+    is verified by `training_window_ids` rather than by dataset -- a model is bound
+    to specific windows, not to whatever a sibling corpus happens to hold.
+
+    The reason is asserted as the *only* reason, which is what proves the scoping:
+    an over-broad verification would also trip on rows this model never saw.
+    """
+    store = _store(tmp_path)
+    training_ids = _reference(store)
+    model_id = _model(store, training_ids)
+    dataset_id = _comparison(store, "shifted", 500.0)
+    _raw_update(
+        store,
+        "UPDATE ml_training_windows SET features_json = ? WHERE id = ?",
+        (json.dumps(_features(event_count=99.0), sort_keys=True), training_ids[0]),
+    )
+    assert _reasons(store, model_id, dataset_id) == [
+        "model training windows fail hash verification (tampered rows: 1)"
+    ]
+
+
+def test_tampered_comparison_windows_are_refused(tmp_path):
+    """
+    The other side, and the other scope: a whole dataset rather than an id list.
+
+    `window_end` is edited rather than a feature value because it is the subtler
+    tamper -- it moves a window in time without changing a single number the
+    statistics read, so nothing but the digest would notice. This refusal is
+    `insufficient_data`, not `no_drift_detected`: a tampered sample means no
+    conclusion is available, and the two statuses must never be confusable.
+    """
+    store = _store(tmp_path)
+    model_id = _model(store, _reference(store))
+    dataset_id = _comparison(store, "shifted", 500.0)
+    last_id = store.read_ml_training_windows(dataset_id)[-1]["id"]
+    _raw_update(store, "UPDATE ml_training_windows SET window_end = window_end + 1 WHERE id = ?", (last_id,))
+    assert _reasons(store, model_id, dataset_id) == [
+        "comparison dataset windows fail hash verification (tampered rows: 1)"
+    ]
 
 
 def test_comparison_dataset_reusing_training_windows_is_refused(tmp_path):

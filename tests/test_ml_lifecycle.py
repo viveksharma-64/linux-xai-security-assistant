@@ -41,6 +41,7 @@ The log's value rests on three properties, and each one gets tests here:
 No scikit-learn needed: the gate takes counts, and the lifecycle takes metadata.
 """
 
+import json
 import sqlite3
 
 import pytest
@@ -903,3 +904,209 @@ def test_the_actor_is_recorded_as_a_claim_and_chained(tmp_path):
     finally:
         connection.close()
     assert store.verify_ml_lifecycle_chain()["ok"] is False
+
+
+# --- Training-window hash verification ----------------------------------------
+# `ml_training_windows.immutable_hash` has been recorded since migration 7 and,
+# until now, recomputed nowhere -- which made it a stored string rather than
+# tamper-evidence. `verify_ml_training_windows` closes that, and these tests pin
+# the part that is easy to get wrong: the digest covers *normalised* values, so
+# the recompute from REAL/INTEGER columns has to agree with the write from Python
+# floats and bools. The round-trip test is the one that catches a drift between
+# the two; the mutation tests are what the verification is for.
+
+
+def _dataset(store, dataset_id="verified-normal-1", verification=None):
+    store.create_ml_dataset({
+        "id": dataset_id,
+        "name": "normal-corpus",
+        "schema_version": SCHEMA_VERSION,
+        "schema_hash": schema_hash(),
+        "environment": {"host": "test-host"},
+        "verification": verification or {"verified_normal": True, "operator": "test"},
+        "created_at": 1000.0,
+    })
+    return dataset_id
+
+
+def _training_window(store, dataset_id, start=1000, **overrides):
+    """
+    One window, with `start` deliberately an *int* by default.
+
+    `window_start`/`window_end` are REAL columns, so an int here is read back as a
+    float. That asymmetry is the digest's main hazard and the default exercises it
+    on every test below rather than only in the one that names it.
+    """
+    return store.write_ml_training_window({
+        "dataset_id": dataset_id,
+        "window_start": start,
+        "window_end": start + 300,
+        "event_ids": [start, start + 1],
+        # Mixed int/float/zero values on purpose: feature extraction emits counts
+        # as ints and rates as floats, and `json.dumps(1)` vs `json.dumps(1.0)`
+        # differ, so the containers have to survive a loads/dumps round-trip.
+        "features": {"process_count": 7, "privileged_ratio": 0.25, "idle": 0.0},
+        "schema_version": SCHEMA_VERSION,
+        "schema_hash": schema_hash(),
+        "collector_context": {"sources": ["audit", "proc"], "nested": {"b": 2, "a": 1}},
+        "verified_normal": True,
+        "verification": {"verified_normal": True, "operator": "test"},
+        "created_at": float(start),
+    } | overrides)
+
+
+def _raw_update(store, statement, parameters=()):
+    """Tamper behind the store's back, the way these tests' threat model assumes."""
+    connection = sqlite3.connect(store.db_path)
+    try:
+        connection.execute(statement, parameters)
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_training_window_hash_verifies_on_round_trip(tmp_path):
+    """
+    An untouched window verifies -- the property everything below depends on.
+
+    This fails for any digest that hashes the caller's values instead of the
+    stored ones: `window_start=1000` hashes as `1000` but reads back `1000.0`, and
+    `verified_normal=True` hashes as `true` but reads back `1`. A verifier that
+    disagreed with the writer here would report every honest row as tampered,
+    which is worse than no verification at all because it would be ignored.
+    """
+    store = _store(tmp_path)
+    dataset = _dataset(store)
+    ids = [_training_window(store, dataset, start=start) for start in (1000, 2000, 3000)]
+    assert len(set(ids)) == 3
+
+    verdict = store.verify_ml_training_windows()
+    assert verdict == {"ok": True, "checked": 3, "mismatched_ids": []}
+
+    # A float-valued start must verify identically -- the normalisation has to be
+    # idempotent, not merely consistent in the int case.
+    _training_window(store, dataset, start=4000.0)
+    assert store.verify_ml_training_windows() == {"ok": True, "checked": 4, "mismatched_ids": []}
+
+    # Nothing to verify is `ok`, not a failure: a default install has no corpus,
+    # and an empty table is not a tampered one.
+    assert store.verify_ml_training_windows("no-such-dataset") == {"ok": True, "checked": 0, "mismatched_ids": []}
+
+
+def test_mutated_features_are_detected(tmp_path):
+    """
+    Editing the feature values a model was fitted on is caught.
+
+    This is the tamper that matters most: features are the only part of a window
+    that reaches a model, so silently rewriting them changes what "normal" means
+    without touching the model, the gate, or the lifecycle chain. The row stays
+    individually well-formed -- it is only the recomputed digest that disagrees.
+    """
+    store = _store(tmp_path)
+    dataset = _dataset(store)
+    kept = _training_window(store, dataset, start=1000)
+    edited = _training_window(store, dataset, start=2000)
+
+    _raw_update(
+        store,
+        "UPDATE ml_training_windows SET features_json = ? WHERE id = ?",
+        (json.dumps({"process_count": 7, "privileged_ratio": 0.95, "idle": 0.0}, sort_keys=True), edited),
+    )
+    verdict = store.verify_ml_training_windows()
+    assert verdict["ok"] is False
+    # Attributable to the row, not just to the table: unlike a hash chain, each
+    # digest stands alone, so the verdict names which windows to distrust.
+    assert verdict["mismatched_ids"] == [edited]
+    assert verdict["checked"] == 2
+    assert kept not in verdict["mismatched_ids"]
+
+    # Content that no longer parses is a mismatch, not an exception out of the
+    # verifier -- the worst row must not take the verdict on the rest with it.
+    _raw_update(store, "UPDATE ml_training_windows SET features_json = 'not json' WHERE id = ?", (kept,))
+    assert store.verify_ml_training_windows()["mismatched_ids"] == [kept, edited]
+
+
+def test_mutated_verified_normal_is_detected(tmp_path):
+    """
+    Flipping the attestation column is caught -- the bool-versus-int path.
+
+    The writer is handed Python `True` and the column stores `1`, so the digest
+    must normalise both sides to the same thing. The tempting shortcut is to hash
+    a hardcoded `True`, since the writer refuses anything else; that would make
+    exactly this UPDATE invisible. `bool()` on both sides is what keeps the
+    attestation covered.
+    """
+    store = _store(tmp_path)
+    dataset = _dataset(store)
+    window = _training_window(store, dataset)
+    assert store.verify_ml_training_windows()["ok"] is True
+
+    _raw_update(store, "UPDATE ml_training_windows SET verified_normal = 0 WHERE id = ?", (window,))
+    assert store.verify_ml_training_windows()["mismatched_ids"] == [window]
+    # The decoded read still presents a perfectly plausible record; the digest is
+    # the only thing that knows the attestation was withdrawn after the fact.
+    assert store.read_ml_training_windows(dataset)[0]["verified_normal"] is False
+
+
+def test_the_timestamp_and_attestation_columns_are_all_covered(tmp_path):
+    """
+    Every field the digest claims to cover, mutated one at a time.
+
+    Written as a sweep rather than one test per column because the risk is a field
+    quietly dropped from the material dict, and a sweep fails the moment one is.
+    `created_at` is deliberately absent: it is excluded from the digest by design
+    (a write timestamp is not part of the window's content), and the final
+    assertion pins that exclusion so it stays a decision rather than an oversight.
+    """
+    store = _store(tmp_path)
+    dataset = _dataset(store)
+    covered = {
+        "window_start": "1.5",
+        "window_end": "9.5",
+        "event_ids_json": "'[99]'",
+        "schema_version": "'0.0.1-not-real'",
+        "schema_hash": "'" + "f" * 64 + "'",
+        "collector_context_json": "'{\"sources\":[]}'",
+        "verification_json": "'{\"verified_normal\":true,\"operator\":\"someone else\"}'",
+    }
+    for column, value in covered.items():
+        window = _training_window(store, _dataset(store, f"dataset-{column}"))
+        _raw_update(store, f"UPDATE ml_training_windows SET {column} = {value} WHERE id = ?", (window,))
+        assert store.verify_ml_training_windows(f"dataset-{column}")["mismatched_ids"] == [window], column
+
+    # `dataset_id` is covered too, but moving a window between datasets needs a
+    # real target row, so it is exercised separately rather than in the sweep.
+    elsewhere = _dataset(store, "dataset-elsewhere")
+    moved = _training_window(store, dataset)
+    _raw_update(store, "UPDATE ml_training_windows SET dataset_id = ? WHERE id = ?", (elsewhere, moved))
+    assert store.verify_ml_training_windows(elsewhere)["mismatched_ids"] == [moved]
+
+    # And `created_at` is not: it still verifies after being rewritten.
+    untouched = _training_window(store, _dataset(store, "dataset-created-at"))
+    _raw_update(store, "UPDATE ml_training_windows SET created_at = 0.0 WHERE id = ?", (untouched,))
+    assert store.verify_ml_training_windows("dataset-created-at")["ok"] is True
+
+
+def test_verify_scopes_to_one_dataset_when_asked(tmp_path):
+    """
+    The scoped form checks one dataset and ignores the rest of the table.
+
+    Not an optimisation detail: the unscoped form is a full scan, and the callers
+    that run on a request path pass a dataset id precisely so a growing corpus
+    elsewhere cannot make a single model's verification slow. A scoped call must
+    therefore report `checked` for its own dataset only -- and must still refuse
+    to launder a break in the dataset it was asked about.
+    """
+    store = _store(tmp_path)
+    clean = _dataset(store, "dataset-clean")
+    dirty = _dataset(store, "dataset-dirty")
+    _training_window(store, clean, start=1000)
+    _training_window(store, clean, start=2000)
+    broken = _training_window(store, dirty, start=3000)
+    _raw_update(store, "UPDATE ml_training_windows SET window_end = 0.0 WHERE id = ?", (broken,))
+
+    assert store.verify_ml_training_windows("dataset-clean") == {"ok": True, "checked": 2, "mismatched_ids": []}
+    assert store.verify_ml_training_windows("dataset-dirty") == {"ok": False, "checked": 1, "mismatched_ids": [broken]}
+    # The unscoped form sees both, and is false because one of them is.
+    everything = store.verify_ml_training_windows()
+    assert everything == {"ok": False, "checked": 3, "mismatched_ids": [broken]}

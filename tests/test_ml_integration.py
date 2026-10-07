@@ -1,4 +1,6 @@
+import json
 import math
+import sqlite3
 from inspect import signature
 from pathlib import Path
 
@@ -354,6 +356,53 @@ def test_deactivation_takes_effect_for_scorers_constructed_after_it(tmp_path):
     assert scorer.score(_normal_windows()[0])["model_active"] is True  # the snapshot, not the row
     with pytest.raises(MLScoringError, match="not active"):
         MLScorer(store, metadata["id"])
+
+
+def test_scorer_refuses_tampered_training_provenance(tmp_path):
+    """
+    Present provenance is not intact provenance.
+
+    The windows this model was fitted on are also its attribution baseline -- the
+    per-feature training min/max/mean the payload's `contributing_features` is
+    measured against -- so an edited row does not merely dirty the audit trail, it
+    silently relabels which feature looks unusual. An active model whose training
+    data no longer matches its recorded digests therefore gets no scoring path at
+    all, the same posture as an inactive one.
+
+    The message is asserted, not just the raise: a scorer failure degrades detection
+    to the deterministic formula, and an operator reading that reason has to be able
+    to tell "a row was edited" from "a row is missing". Those call for different
+    responses.
+    """
+    store, _, metadata = _activated(tmp_path)
+    assert MLScorer(store, metadata["id"]).score(_normal_windows()[0])["available"] is True
+
+    window_id = metadata["training_window_ids"][0]
+    connection = sqlite3.connect(store.db_path)
+    try:
+        # Edited behind the store's back, because every write path refuses to
+        # produce this state -- which is the property being tested.
+        connection.execute(
+            "UPDATE ml_training_windows SET features_json = ? WHERE id = ?",
+            (json.dumps({name: 0.0 for name in FEATURE_NAMES}, sort_keys=True), window_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    # Still readable, still the right count, still schema-compatible: nothing but the
+    # digest can tell that this model's baseline was moved.
+    assert len(store.read_ml_training_windows_by_ids(metadata["training_window_ids"])) == len(
+        metadata["training_window_ids"]
+    )
+    with pytest.raises(MLScoringError, match="provenance is tampered") as refusal:
+        MLScorer(store, metadata["id"])
+    assert "1 of" in str(refusal.value)
+    # The refusal is not a side effect of the activation check, and `allow_inactive`
+    # is no way around it: evaluating a model on edited training data would produce a
+    # threshold measured against the edit.
+    with pytest.raises(MLScoringError, match="provenance is tampered"):
+        MLScorer(store, metadata["id"], allow_inactive=True)
 
 
 # --- calibration: contamination, the training distribution, and provenance ---

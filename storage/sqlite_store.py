@@ -6,7 +6,7 @@ import sqlite3
 import stat
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
@@ -619,6 +619,123 @@ class SQLiteEventStore(EventStore):
             )
         return str(dataset["id"])
 
+    def read_ml_dataset(self, dataset_id: str) -> dict[str, Any] | None:
+        """
+        One dataset's immutable metadata, or None if no such row exists.
+
+        Present so a consumer can check a dataset's *own* attestation rather than
+        inferring it from its windows. `verified_normal` is recorded once, on the
+        dataset, and `create_ml_dataset` refuses a row without it -- so an absent
+        row and an unattested row are both answers a caller should be able to act
+        on, which is why this returns None instead of raising.
+        """
+        with self._transaction() as conn:
+            row = conn.execute("SELECT * FROM ml_datasets WHERE id = ?", (dataset_id,)).fetchone()
+        if row is None:
+            return None
+        record = dict(row)
+        for key in ("environment_json", "verification_json"):
+            record[key.removesuffix("_json")] = json.loads(record.pop(key))
+        return record
+
+    @staticmethod
+    def _training_window_digest(window: Mapping[str, Any]) -> str:
+        """
+        The one definition of a training window's `immutable_hash`.
+
+        Both the writer and `verify_ml_training_windows` call this, so the recorded
+        digest and the recomputed one cannot drift -- the same single-source argument
+        the lifecycle chain's `ML_LIFECYCLE_CHAIN_COLUMNS` makes.
+
+        It hashes *normalised* values rather than whatever the caller handed in,
+        because the verifier can only see what the columns hold. `window_start` is
+        REAL, so an int `1000` passed here is read back as `1000.0`, and
+        `json.dumps` writes those as `1000` and `1000.0` -- different bytes, a false
+        tamper report. `verified_normal` is the same hazard in the other direction:
+        the writer is handed Python `True` and the column stores `1`, and only
+        `bool()` on both sides makes `"true"` either way. It is normalised rather
+        than hardcoded to `True` on purpose -- a hardcoded literal would make
+        flipping that column to 0 undetectable, which is precisely a tamper worth
+        detecting. The four container fields need no normalisation: they are stored
+        as `json.dumps(..., sort_keys=True)`, and a loads/dumps round-trip of that
+        is byte-identical.
+        """
+        material = {
+            "dataset_id": str(window["dataset_id"]),
+            "window_start": float(window["window_start"]),
+            "window_end": float(window["window_end"]),
+            "event_ids": window["event_ids"],
+            "features": window["features"],
+            "schema_version": str(window["schema_version"]),
+            "schema_hash": str(window["schema_hash"]),
+            "collector_context": window["collector_context"],
+            "verified_normal": bool(window["verified_normal"]),
+            "verification": window["verification"],
+        }
+        return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    def verify_ml_training_windows(self, dataset_id: str | None = None, *, window_ids: Sequence[int] | None = None) -> dict[str, Any]:
+        """
+        Recompute every training window's `immutable_hash` from its stored columns.
+
+        A recorded hash is only tamper-evidence if something recomputes it. This is
+        that something: it reads the raw columns -- not the decoded records, whose
+        `bool()` and `json.loads` conversions are exactly what a digest has to see
+        through -- rebuilds the material dict, and reports
+        `{ok, checked, mismatched_ids}` in the shape the chain verdicts use.
+
+        Unlike the lifecycle log this is a *set* of independent digests, not a
+        chain, so a break is attributable to specific rows rather than to a
+        sequence position, and deleting a row is invisible here by construction.
+        Callers that know their scope should say so: `dataset_id` for a corpus,
+        `window_ids` for one model's own training provenance (`ml_models` records
+        ids, not a dataset). Both narrow the same scan and may be combined. The
+        unscoped form is a full table scan and belongs in an operator tool or a
+        bounded endpoint rather than on a hot path.
+
+        Undecodable JSON counts as a mismatch rather than raising: content that is
+        no longer parseable is a tampered row, and a verifier that crashes on the
+        worst input reports nothing about the rest of the table.
+        """
+        columns = "id, dataset_id, window_start, window_end, event_ids_json, features_json, schema_version, schema_hash, collector_context_json, verified_normal, verification_json, immutable_hash"
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if dataset_id is not None:
+            clauses.append("dataset_id = ?")
+            parameters.append(dataset_id)
+        if window_ids is not None:
+            # An empty id list scopes to nothing, which is the honest reading: a
+            # model with no training provenance has no windows to verify. Spelled
+            # out because `IN ()` is a syntax error, not an empty match.
+            if not window_ids:
+                return {"ok": True, "checked": 0, "mismatched_ids": []}
+            clauses.append(f"id IN ({', '.join('?' for _ in window_ids)})")
+            parameters.extend(int(window_id) for window_id in window_ids)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._transaction() as conn:
+            rows = conn.execute(f"SELECT {columns} FROM ml_training_windows{where} ORDER BY id", parameters).fetchall()
+        mismatched: list[int] = []
+        for row in rows:
+            try:
+                material = {
+                    "dataset_id": row["dataset_id"],
+                    "window_start": row["window_start"],
+                    "window_end": row["window_end"],
+                    "event_ids": json.loads(row["event_ids_json"]),
+                    "features": json.loads(row["features_json"]),
+                    "schema_version": row["schema_version"],
+                    "schema_hash": row["schema_hash"],
+                    "collector_context": json.loads(row["collector_context_json"]),
+                    "verified_normal": row["verified_normal"],
+                    "verification": json.loads(row["verification_json"]),
+                }
+                recomputed = self._training_window_digest(material)
+            except (TypeError, ValueError):
+                recomputed = None
+            if recomputed != row["immutable_hash"]:
+                mismatched.append(int(row["id"]))
+        return {"ok": not mismatched, "checked": len(rows), "mismatched_ids": mismatched}
+
     def write_ml_training_window(self, window: dict[str, Any]) -> int:
         """Append a verified-normal feature window; rows intentionally have no update API."""
         required = ("dataset_id", "window_start", "window_end", "event_ids", "features", "schema_version", "schema_hash", "collector_context", "verified_normal", "verification", "created_at")
@@ -627,8 +744,7 @@ class SQLiteEventStore(EventStore):
             raise ValueError(f"ML training window missing fields: {', '.join(missing)}")
         if window["verified_normal"] is not True or not window["verification"].get("verified_normal"):
             raise ValueError("training windows require explicit verified_normal=True")
-        material = {key: window[key] for key in required if key != "created_at"}
-        immutable_hash = hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        immutable_hash = self._training_window_digest(window)
         with self._transaction() as conn:
             dataset = conn.execute("SELECT schema_version, schema_hash FROM ml_datasets WHERE id = ?", (window["dataset_id"],)).fetchone()
             if dataset is None:

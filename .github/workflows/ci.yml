@@ -19,7 +19,7 @@
 # `test` job cannot: that the scikit-learn-backed tests actually execute. Those
 # tests skip themselves when scikit-learn is absent (`ml.training.SKLEARN_AVAILABLE`
 # is False), and a skip is green -- so if scikit-learn ever failed to install, the
-# `test` job would stay green while 41 tests silently vanished. scikit-learn is a
+# `test` job would stay green while 42 tests silently vanished. scikit-learn is a
 # declared runtime dependency, so `pip install -e '.[dev]'` already pulls it into
 # the `test` job too; the `ml` job asserts it imported and then refuses to pass if
 # any test in the scikit-learn-gated files skips. It touches only the CI config --
@@ -129,8 +129,8 @@ jobs:
         # a model may be activated go untested behind a green check.
         #
         # These four files are currently *every* scikit-learn-gated test in the
-        # suite: without scikit-learn the whole suite skips 41 tests and these four
-        # files account for all 41. If a fifth file ever gains a SKLEARN_AVAILABLE
+        # suite: without scikit-learn the whole suite skips 42 tests and these four
+        # files account for all 42. If a fifth file ever gains a SKLEARN_AVAILABLE
         # skip, add it here -- the `test` job will not notice it vanishing.
         run: |
           pytest tests/test_ml_artifact.py tests/test_ml_attribution.py tests/test_ml_integration.py \

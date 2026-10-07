@@ -1,3 +1,5 @@
+import json
+import sqlite3
 import time
 from pathlib import Path
 
@@ -7,7 +9,8 @@ from api.app import create_app
 from assistant.service import AssistantService
 from detection.detector import DetectionEngine
 from explainability.explainer import FindingExplainer
-from ml.feature_schema import SCHEMA_VERSION, schema_hash
+from ml.evaluation import MIN_NORMAL_HOLDOUT_WINDOWS
+from ml.feature_schema import FEATURE_NAMES, SCHEMA_VERSION, schema_hash
 from observability.config import Settings
 from pipeline.event_stream import Event
 from policy.engine import PolicyEngine
@@ -383,6 +386,133 @@ def test_integrity_reports_all_four_chains_intact(tmp_path):
     assert body["triage"]["ok"] is True and body["triage"]["checked"] == 0
     assert body["ml_lifecycle"]["ok"] is True and body["ml_lifecycle"]["checked"] == 0
     assert body["findings"]["break_seq"] is None
+    # The fifth term, vacuous on a default install: no active model means no
+    # training data is influencing findings, so there is nothing to verify. Reported
+    # as an ok over zero rows rather than omitted, so the dashboard shows a verdict
+    # rather than a gap.
+    assert body["active_model_training_windows"] == {"ok": True, "checked": 0, "mismatched_ids": []}
+
+
+def _activated_model_with_windows(store, count=3):
+    """
+    An active model whose `training_window_ids` point at windows that really exist.
+
+    `_seed_model` names ids `[1, 2, 3]` and writes no rows, which is fine for the
+    chain assertions but cannot exercise a digest: verification recomputes the hashes
+    of rows it finds, so an empty scope is vacuously ok. These tests need real rows.
+
+    The gate counts are **supplied, not measured** -- 0 false positives over
+    `MIN_NORMAL_HOLDOUT_WINDOWS` windows -- for the same reason as
+    `tests/test_ml_integration.py:_activated`: reaching `active` is the point here,
+    not demonstrating that this model would qualify on a host.
+    """
+    from ml.lifecycle import record_activation, record_activation_gate, record_evaluated, record_trained
+
+    store.create_ml_dataset({
+        "id": "verified-normal-api",
+        "name": "api-normal",
+        "schema_version": SCHEMA_VERSION,
+        "schema_hash": schema_hash(),
+        "environment": {"host": "test-host"},
+        "verification": {"verified_normal": True, "operator": "test"},
+        "created_at": 1000.0,
+    })
+    window_ids = [
+        store.write_ml_training_window({
+            "dataset_id": "verified-normal-api",
+            "window_start": 1000.0 + index * 60.0,
+            "window_end": 1060.0 + index * 60.0,
+            "event_ids": [index],
+            "features": {name: float(index) for name in FEATURE_NAMES},
+            "schema_version": SCHEMA_VERSION,
+            "schema_hash": schema_hash(),
+            "collector_context": {"source": "test"},
+            "verified_normal": True,
+            "verification": {"verified_normal": True, "operator": "test"},
+            "created_at": 1000.0 + index * 60.0,
+        })
+        for index in range(count)
+    ]
+    metadata = {
+        "id": "model-active",
+        "version": "1",
+        "algorithm": "IsolationForest",
+        "hyperparameters": {"n_estimators": 100},
+        "artifact_path": "/nonexistent/model.model.json",
+        "artifact_checksum": "b" * 64,
+        "artifact_format": "iforest-native.v1",
+        "schema_version": SCHEMA_VERSION,
+        "schema_hash": schema_hash(),
+        "training_window_ids": window_ids,
+        "runtime": {"python": "3.11"},
+        "evaluation": {},
+        "active": False,
+        "created_at": 3000.0,
+    }
+    store.write_ml_model({key: value for key, value in metadata.items() if key != "artifact_format"})
+    counts = {"false_positive_count": 0, "normal_window_count": MIN_NORMAL_HOLDOUT_WINDOWS}
+    record_trained(store, metadata)
+    record_evaluated(store, "model-active", {
+        "normal_window_count": MIN_NORMAL_HOLDOUT_WINDOWS,
+        "normal_false_positive_count": 0,
+        "normal_false_positive_rate": 0.0,
+        "labels_available": False,
+        "confusion_matrix": None,
+    })
+    record_activation_gate(store, "model-active", **counts)
+    record_activation(store, "model-active", **counts)
+    return window_ids
+
+
+def test_integrity_endpoint_reports_training_window_verification(tmp_path):
+    """
+    A recorded hash is only tamper-evidence if something recomputes it, and for
+    `ml_training_windows.immutable_hash` this endpoint is one of the things that
+    does. A broken digest has to reach the overall `ok` -- an operator who trusts the
+    banner must not be told everything is fine because only the *chains* were checked.
+
+    Scoped to the active model deliberately: this is the training data behind what is
+    scoring right now, and verification costs a digest per row, so the unscoped form
+    does not belong on a request path.
+    """
+    store, _ = _setup(tmp_path)
+    window_ids = _activated_model_with_windows(store)
+    client = TestClient(create_app(store))
+
+    body = client.get("/api/integrity").json()
+    assert body["ok"] is True
+    assert body["active_model_training_windows"] == {
+        "ok": True,
+        "checked": len(window_ids),
+        "mismatched_ids": [],
+    }
+
+    connection = sqlite3.connect(store.db_path)
+    try:
+        connection.execute(
+            "UPDATE ml_training_windows SET features_json = ? WHERE id = ?",
+            (json.dumps({name: 42.0 for name in FEATURE_NAMES}, sort_keys=True), window_ids[1]),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    body = client.get("/api/integrity").json()
+    assert body["active_model_training_windows"] == {
+        "ok": False,
+        "checked": len(window_ids),
+        "mismatched_ids": [window_ids[1]],
+    }
+    # Every chain still verifies -- the edit was to a window, not to a log -- which
+    # is exactly why the fifth term had to be added to the conjunction.
+    assert all(body[chain]["ok"] is True for chain in ("findings", "policy", "triage", "ml_lifecycle"))
+    assert body["ok"] is False
+
+    # The same verdict on the model's own page, scoped to its provenance, so an
+    # operator following the banner reaches the rows rather than a dead end.
+    detail = client.get("/api/models/model-active").json()
+    assert detail["training_windows"]["mismatched_ids"] == [window_ids[1]]
+    assert detail["chain"]["ok"] is True
 
 
 def _seed_model(store, model_id="model-1"):
@@ -465,6 +595,13 @@ def test_models_endpoint_lists_and_details_an_eligible_model(tmp_path):
     # Full transition history, tamper-evident: trained -> evaluated -> eligible.
     assert [t["to_state"] for t in detail["transitions"]] == ["trained", "evaluated", "eligible"]
     assert detail["chain"]["ok"] is True
+    # The documented limit of the training-window verdict, pinned: `_seed_model` names
+    # ids [1, 2, 3] and writes no such rows, and verification recomputes the digests of
+    # rows it *finds*, so a scope naming nothing is vacuously ok. That is the honest
+    # answer to "are these windows unedited" -- and it is also why this must not be read
+    # as a completeness claim; deletion is caught by the scorer's separate length check
+    # (`ml/scoring.py`: "provenance is incomplete"), not here.
+    assert detail["training_windows"] == {"ok": True, "checked": 0, "mismatched_ids": []}
     assert detail["latest_drift"] is None
     assert detail["drift_assessment_count"] == 0
     # Hardening: the detail payload never leaks host filesystem layout.

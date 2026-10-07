@@ -356,8 +356,48 @@ def assess_drift(
     reference_windows = store.read_ml_training_windows_by_ids(training_ids)
     if len(reference_windows) != len(training_ids):
         reasons.append("model training-window provenance is incomplete")
+    # The reference sample is the model's own training data. Its rows carry an
+    # `immutable_hash`, so "are these the windows the model was fitted on" is a
+    # question with an answer rather than an assumption. A drift result computed
+    # against edited reference windows would be a measurement of the edit.
+    reference_verification = store.verify_ml_training_windows(window_ids=training_ids)
+    if not reference_verification["ok"]:
+        reasons.append(
+            "model training windows fail hash verification (tampered rows: "
+            f"{len(reference_verification['mismatched_ids'])})"
+        )
 
-    comparison_windows = (comparison_store or store).read_ml_training_windows(comparison_dataset_id)
+    comparison_source = comparison_store or store
+    # F8: the comparison dataset's *own* attestation. The per-window check below
+    # cannot fire for store-written rows -- `verified_normal` is CHECK-constrained
+    # to 0/1, the writer only ever passes 1, and the decoder returns `bool(1)` --
+    # so without this, "the comparison dataset must be verified-normal" was a
+    # docstring claim with nothing behind it. The dataset row is where the
+    # attestation actually lives, and a missing row means windows were written
+    # against a dataset that no longer exists.
+    comparison_dataset = comparison_source.read_ml_dataset(comparison_dataset_id)
+    if comparison_dataset is None:
+        reasons.append("comparison dataset metadata was not found")
+    else:
+        # Shape-checked, not just key-checked. `create_ml_dataset` guarantees a
+        # mapping here, but the comparison store is a file an operator hands over
+        # -- a `verification_json` holding `null` or a list is reachable, and
+        # `.get` on it would raise out of a function whose contract is to refuse
+        # with reasons. An unreadable attestation is an absent one.
+        attestation = comparison_dataset["verification"]
+        if not (isinstance(attestation, Mapping) and attestation.get("verified_normal")):
+            reasons.append("comparison dataset is not attested verified-normal")
+
+    comparison_windows = comparison_source.read_ml_training_windows(comparison_dataset_id)
+    comparison_verification = comparison_source.verify_ml_training_windows(comparison_dataset_id)
+    if not comparison_verification["ok"]:
+        reasons.append(
+            "comparison dataset windows fail hash verification (tampered rows: "
+            f"{len(comparison_verification['mismatched_ids'])})"
+        )
+    # Kept as a backstop even though the decoder makes it unreachable for rows
+    # this project wrote: a dataset store is a file an operator can hand over, and
+    # a 0 written by some other tool should still refuse rather than be trusted.
     if any(not window["verified_normal"] for window in comparison_windows):
         reasons.append("comparison dataset contains unverified windows")
     if any(window["schema_hash"] != metadata["schema_hash"] for window in comparison_windows):

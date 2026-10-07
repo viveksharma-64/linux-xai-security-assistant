@@ -173,7 +173,67 @@ lifecycle links, as in the other chains.
 
 `GET /api/integrity` now reports **four** chains — findings, policy, triage, and
 `ml_lifecycle` — and the console's integrity banner raises on any of the four. It
-stays silent when all four verify.
+stays silent when all four verify. Its top-level `ok` carries a **fifth term**
+that is deliberately *not* a chain — the active model's training-window
+verification, below — so `ok` can be false while all four chain verdicts are
+true. The dashboard banner still keys off the four chains only; the fifth term is
+read from the payload (`active_model_training_windows`) and from
+`GET /api/models/{id}`.
+
+### Training-window integrity: the same rule, one layer down
+
+`ml_training_windows.immutable_hash` has been `TEXT NOT NULL UNIQUE` since
+migration 10, written per row over the window's identity, its 34 feature values,
+its event ids, its schema identity, its collector context, and its verified-normal
+attestation. Until now **nothing recomputed it** — which, by the rule stated
+above, made it a record rather than evidence: the counterexample sitting in the
+same schema as the thing the rule was written about.
+`SQLiteEventStore.verify_ml_training_windows()` closes that, and the rule now has
+one more example instead of one standing exception.
+
+- **One definition, so the two sides cannot drift.** The write path and the verify
+  path both call `_training_window_digest(window)`; neither keeps its own copy of
+  the material dict. The hazard that removes is specific and would have been
+  silent: the digest is taken over Python values, so a recompute that read the
+  columns back naively would hash `verified_normal = 1` and `window_start = 1000.0`
+  where the writer hashed `True` and `1000`, and *every* row in the database would
+  "fail" verification. The helper normalizes (`bool(...)`, `float(...)`) on both
+  sides, and a round-trip test pins it. `created_at` is excluded from the material
+  on purpose — a window's content is what is being attested, not when it landed —
+  and a test pins that exclusion so it cannot be added back by accident.
+- **It reports ids, not a break position, because it is a set and not a chain.**
+  Each row's hash covers that row alone, so a mismatch is *attributable* —
+  `{"ok", "checked", "mismatched_ids"}` — but a **deleted** row is invisible here
+  by construction: nothing links row *n* to row *n+1*. Completeness is a separate
+  check that already existed. `MLScorer.__init__` refuses when
+  `read_ml_training_windows_by_ids` returns fewer rows than the model's provenance
+  names ("provenance is incomplete"), and that message is deliberately distinct
+  from the tampering one — a missing row and an edited row are different incidents
+  calling for different operator responses, and a generic message would make them
+  indistinguishable in a degradation reason.
+- **Scoped; never an unbounded scan on a request path.** A digest per row is cheap
+  but not free. The two forms used are `window_ids=` (one model's own provenance)
+  and `dataset_id=` (one corpus). An empty scope verifies **vacuously ok** — the
+  honest answer to "are these windows unedited" when the scope names none — and
+  that is the default-install answer at `/api/integrity`, where no active model
+  means no training data is influencing any finding.
+- **Undecodable JSON counts as a mismatch, not an exception.** A row whose
+  `features_json` no longer parses is precisely the tamper this exists to catch;
+  raising would convert a verification result into a crash in the caller.
+
+Where it is recomputed:
+
+| Site | Scope | On failure |
+|---|---|---|
+| `MLScorer.__init__` | the model's `training_window_ids` | `MLScoringError` naming **tampered** provenance, so the scorer never constructs. Enforced even under `allow_inactive=True`: evaluating a model against edited training data would measure a threshold against the edit. |
+| `ml/drift.py:assess_drift` | reference = the model's ids; comparison = the foreign dataset | `status = insufficient_data` with a named reason — never `no_drift_detected`. |
+| `ml/lifecycle.py:lifecycle_report` | the model's ids | a `training_windows` verdict beside `chain`. |
+| `GET /api/integrity` | the **active** model's ids | `active_model_training_windows.ok = false`, and the top-level `ok` with it. |
+| `GET /api/models/{id}` | that model's ids | `training_windows.ok = false`, beside a `chain` verdict that is still true. |
+
+The API field is `active_model_training_windows` rather than a fourth chain name
+because it is not one: it proves the rows that are present are unedited, and
+claims nothing about rows that are not.
 
 ## The artifact: `iforest-native.v1`
 
@@ -252,8 +312,10 @@ reported as one, labelled, with its limitations.
 
 `status = insufficient_data` with explicit `reasons` — never `no_drift_detected`
 — when any of these holds: the model or its training-window provenance is
-missing, the schemas disagree, the comparison dataset contains unverified
-windows, the comparison dataset **reuses the model's own training windows**
+missing, the schemas disagree, the comparison dataset's own `ml_datasets` row is
+absent or does not attest it verified-normal, the comparison dataset contains
+unverified windows, **either side's windows fail hash verification**, the
+comparison dataset **reuses the model's own training windows**
 (comparing a sample against itself is guaranteed to find nothing, which would
 look like reassurance), fewer than 10 reference windows, fewer than 30 comparison
 windows, or — the arithmetic one — the **smallest attainable** two-sided p-value
@@ -262,6 +324,17 @@ in the data could ever be called drift. Reporting "no drift" from a test that
 cannot reject anything would be a lie of omission, so it is refused by name.
 `scripts/ml_drift_check.py` exits **2** on a refusal so a scheduled run surfaces
 it rather than logging "checked" and moving on.
+
+Two of those are worth separating, because they fail differently. The
+**dataset-level attestation** is read from the comparison corpus's `ml_datasets`
+row; the per-window `verified_normal` check beside it can never fire for rows the
+store wrote (the writer only ever passes `1`), so without the dataset check an
+unattested corpus would have sailed through on a backstop that cannot trip. The
+backstop is kept anyway, for a hand-built or foreign-written row. The **hash
+verification** is scoped on each side — reference by the model's own window ids,
+comparison by its dataset id — so a tampered row in some unrelated corpus cannot
+refuse a check it has nothing to do with.
+
 
 ### What drift cannot do
 
@@ -467,13 +540,20 @@ state; they re-compute no gate, write no row, and touch no threshold, artifact,
 GET /api/models       # newest-first list: id, algorithm/version, recorded state,
                       #   activation_eligible, latest drift status
 GET /api/models/{id}  # provenance, full transition history, gate verdict, latest
-                      #   drift summary, and the lifecycle chain verdict
+                      #   drift summary, the lifecycle chain verdict, and the
+                      #   training-window verification for that model's own rows
 ```
 
 - **The gate verdict is surfaced verbatim.** `activation_eligible` and the gate's
   `acceptance` evidence are read out of the recorded lifecycle rows — never
   recomputed. The gate stays the only door; this surface is a window onto the
   witness log, not a control on it.
+- **Two verdicts, about two different things.** `chain` says the *decisions* about
+  this model were not rewritten. `training_windows` says the *data those decisions
+  were made on* was not edited — a set of recomputed digests, reporting
+  `mismatched_ids`, scoped to this model's own provenance. They fail
+  independently: an edited training row leaves every lifecycle hash valid, which
+  is exactly why the second verdict exists.
 - **`artifact_checksum`, never `artifact_path`.** The checksum is the identifying
   evidence the lifecycle log already commits to; the raw path is withheld so the
   read surface does not leak host filesystem layout.
@@ -489,7 +569,8 @@ GET /api/models/{id}  # provenance, full transition history, gate verdict, lates
 |---|---|---|
 | Artifact → scorer | Two files on disk that used to be arbitrary pickled objects | Checksum verified before parse; JSON + `allow_pickle=False`; no code path at all. Numbers only. |
 | Descriptor → array filename | A filename read out of a not-yet-authenticated document | Bare basename resolved in the descriptor's own directory; traversal is refused before the checksum is known. |
-| Drift inputs → drift result | Model metadata, training windows, a foreign corpus database | Read-only throughout; cannot mutate a model, threshold, or activation state; schema/verification/overlap mismatches are refusals. |
+| Drift inputs → drift result | Model metadata, training windows, a foreign corpus database | Read-only throughout; cannot mutate a model, threshold, or activation state; schema/attestation/hash-verification/overlap mismatches are refusals. |
+| Training windows → scorer baseline | Rows that are readable, correctly shaped, and still wrong | `immutable_hash` recomputed per row from one shared digest definition. An edit is attributable to ids; `MLScorer.__init__` refuses to construct, naming tampering specifically. Deletion is covered separately by the provenance-length check, because a per-row hash cannot see a missing row. |
 | Lifecycle log → activation | An append that would like to be a promotion | **One door, with the gate across it.** `active = 1` is writable only by `activate_ml_model`, which requires a freshly recomputed gate verdict *and* a latest recorded state of `eligible`; `active` is unreachable from drift; an unguarded setter does not exist. The one-directional exception is `retired`/`drifted`, which stand a model *down*. |
 | Activation state → scoring | A model that never passed the gate, or one stood down | `ml/scoring.py` refuses to construct a scorer unless `active` is `True`, before it reads the artifact; the detector independently drops any payload not reporting `model_active: True`. Enforced at construction, so a mid-run deactivation applies to scorers built after it. |
 | `actor` | A self-reported name (auth has no principal) | Labelled honestly as a claim — and chained, so the claim cannot be altered after the fact. |

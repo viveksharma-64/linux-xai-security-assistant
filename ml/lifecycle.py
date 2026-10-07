@@ -343,14 +343,25 @@ def current_state(store: SQLiteEventStore, model_id: str) -> dict[str, Any] | No
 
 def lifecycle_report(store: SQLiteEventStore, model_id: str) -> dict[str, Any]:
     """
-    One model's history plus the chain verification that says whether to trust it.
+    One model's history plus the verifications that say whether to trust it.
 
-    The verification result is included rather than left to the caller because a
+    The verification results are included rather than left to the caller because a
     history is only evidence if its chain verifies; reporting the rows without it
     invites treating an unverified log as an audit record.
+
+    `training_windows` is the same argument applied one layer down. The lifecycle
+    chain proves the *decisions* about a model were not rewritten; it says nothing
+    about the data those decisions were made on. It is a set of independent digests
+    rather than a chain, so it reports mismatched row ids instead of a break
+    position -- see `verify_ml_training_windows`. Scoped to this model's own
+    `training_window_ids`: an unknown model, or one whose provenance list is empty,
+    verifies vacuously, which is the honest answer to "are these windows intact"
+    when there are none.
     """
     history = store.read_ml_lifecycle(model_id)
     latest = current_state(store, model_id)
+    metadata = store.read_ml_model(model_id)
+    training_window_ids = list(metadata["training_window_ids"]) if metadata else []
     return {
         "model_id": model_id,
         "state": latest["to_state"] if latest else None,
@@ -359,6 +370,7 @@ def lifecycle_report(store: SQLiteEventStore, model_id: str) -> dict[str, Any]:
         "transitions": history,
         "drift_assessments": store.read_ml_drift_assessments(model_id),
         "chain": store.verify_ml_lifecycle_chain(),
+        "training_windows": store.verify_ml_training_windows(window_ids=training_window_ids),
         "generated_at": time.time(),
     }
 
