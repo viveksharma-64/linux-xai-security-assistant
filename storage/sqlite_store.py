@@ -671,16 +671,43 @@ class SQLiteEventStore(EventStore):
         return records
 
     def write_ml_model(self, model: dict[str, Any]) -> str:
+        """
+        Insert one model provenance row. The row is always inactive.
+
+        `active` stays a required field, and the only value it may hold is false.
+        It is not dropped from the signature because a caller should still have to
+        say what it intends; it is simply no longer able to intend activation.
+
+        This refuses rather than gates. The plan for this change was to let an
+        `active` INSERT through on the same terms as `activate_ml_model` -- a gate
+        verdict plus the counts to re-derive it -- but that door cannot be given the
+        same lock. `activate_ml_model` requires three things, and the third is that
+        the model's *latest recorded lifecycle state* already be `eligible`. At
+        INSERT the model has no lifecycle history at all: no `trained` row, no
+        `evaluated` row, no `eligible` row. So a gated INSERT would be gated to a
+        strictly weaker standard than the door beside it, and would produce the one
+        state the lifecycle log exists to make impossible -- a model influencing
+        findings with an empty history. A second door with a weaker lock is not
+        defence in depth; it is the way in.
+
+        Refusing costs nothing: no caller in the tree passes `active=True`, and the
+        legitimate sequence is three calls that each leave a record --
+        `write_ml_model` (inactive), evaluate, then `activate_ml_model`.
+        """
         required = ("id", "version", "algorithm", "hyperparameters", "artifact_path", "artifact_checksum", "schema_version", "schema_hash", "training_window_ids", "runtime", "evaluation", "active", "created_at")
         missing = [key for key in required if key not in model]
         if missing:
             raise ValueError(f"ML model missing fields: {', '.join(missing)}")
+        if model["active"]:
+            raise ValueError(
+                "refusing to insert an active ML model: a new row cannot have the "
+                "recorded lifecycle history activation requires; use activate_ml_model "
+                "after the model has been evaluated and found eligible"
+            )
         with self._transaction() as conn:
-            if model["active"]:
-                conn.execute("UPDATE ml_models SET active = 0 WHERE active = 1")
             conn.execute(
                 "INSERT INTO ml_models (id, version, algorithm, hyperparameters_json, artifact_path, artifact_checksum, schema_version, schema_hash, training_window_ids_json, runtime_json, evaluation_json, active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (model["id"], model["version"], model["algorithm"], json.dumps(model["hyperparameters"], sort_keys=True), model["artifact_path"], model["artifact_checksum"], model["schema_version"], model["schema_hash"], json.dumps(model["training_window_ids"], sort_keys=True), json.dumps(model["runtime"], sort_keys=True), json.dumps(model["evaluation"], sort_keys=True), int(bool(model["active"])), float(model["created_at"])),
+                (model["id"], model["version"], model["algorithm"], json.dumps(model["hyperparameters"], sort_keys=True), model["artifact_path"], model["artifact_checksum"], model["schema_version"], model["schema_hash"], json.dumps(model["training_window_ids"], sort_keys=True), json.dumps(model["runtime"], sort_keys=True), json.dumps(model["evaluation"], sort_keys=True), 0, float(model["created_at"])),
             )
         return str(model["id"])
 
@@ -724,19 +751,20 @@ class SQLiteEventStore(EventStore):
         actor: str | None = None,
     ) -> dict[str, Any]:
         """
-        The only path that sets `ml_models.active` to 1 on an existing model, and the
-        only one with the gate across it. `write_ml_model` can still set the flag when
-        a row is first written, which is a separate door this does not close.
+        The only path that ever sets `ml_models.active` to 1. Not "the only path on
+        an existing model" -- the only path at all: `write_ml_model` now refuses an
+        active INSERT, so there is no second door.
 
         This replaces an earlier invariant reading "there is deliberately no store
         method to activate an existing model". That rule was absence-as-guarantee,
         and it made the activation gate **unreachable**: `active` could only be set
         at INSERT by `write_ml_model`, and a model cannot be evaluated before its
-        row exists -- so the only route to `active = 1` that an evaluated model
-        could take ran through `train_isolation_forest(activate=True)`, which takes
-        no measurement and consults no gate. An unsatisfiable-in-principle gate
-        protects nothing. What this adds is enforcement rather than absence -- one
-        gated writer, behind three conditions.
+        row exists -- so the one reachable route to `active = 1` ran through
+        `train_isolation_forest(activate=True)`, which took no measurement and
+        consulted no gate. An unsatisfiable-in-principle gate protects nothing. Both
+        halves of that are now gone: the training parameter is deleted and the
+        INSERT refuses. The guarantee is enforcement rather than absence -- one
+        writer, behind three conditions.
 
         1. **The gate must grant eligibility**, re-run here over the raw counts.
            Raw counts rather than a caller-supplied verdict, for the same reason

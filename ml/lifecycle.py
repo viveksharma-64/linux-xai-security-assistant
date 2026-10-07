@@ -15,12 +15,25 @@ The log records; the gate decides
 The lifecycle log is one-way, with one deliberate exception in each direction.
 Writing a row does not change a threshold and does not make a scorer load. No
 append can make a model active: `record_activation` does not flip the flag
-itself, it calls `storage/sqlite_store.py:activate_ml_model`, the gated writer
-of `active = 1`, which refuses unless the gate grants eligibility *and*
+itself, it calls `storage/sqlite_store.py:activate_ml_model`, which is the only
+writer of `active = 1` and which refuses unless the gate grants eligibility *and*
 the model's latest recorded state is already `eligible`. In the other direction,
 appending `retired` or `drifted` *does* stand a model down, in the same
 transaction as the row -- because the failure mode of a retirement that leaves a
 model scoring is strictly worse than the failure mode of one that does not.
+
+So the log is still not a control surface for activation: it cannot grant
+eligibility, and the gate's verdict is not something a caller can supply. What
+changed from the earlier design is where the guarantee lives. It used to be
+absence -- no store method existed to activate an existing model -- and absence
+made the gate unreachable, since `active` could then only be set at INSERT,
+before any evaluation could have happened. The guarantee is now enforcement: one
+door, with the gate across it. The INSERT route is closed from the other side to
+keep it one door and not two: `train_isolation_forest` no longer takes an
+`activate` flag, and `write_ml_model` refuses an active row outright rather than
+gating it, because a model has no lifecycle history at the moment its row is
+inserted and so could never meet the `eligible`-latest-state precondition that
+`activate_ml_model` imposes.
 
 The gate is the only door
 -------------------------

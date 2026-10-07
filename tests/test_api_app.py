@@ -385,10 +385,14 @@ def test_integrity_reports_all_four_chains_intact(tmp_path):
     assert body["findings"]["break_seq"] is None
 
 
-def _seed_model(store, model_id="model-1", *, active=False):
+def _seed_model(store, model_id="model-1"):
     # Provenance row (migration 10). The artifact is never opened -- the transparency
     # surface reads recorded columns, not the file -- so a nonexistent path is fine and
     # deliberately never surfaced by the API. Mirrors tests/test_ml_drift.py:_model.
+    #
+    # No `active=` parameter: `write_ml_model` refuses an active row outright, so
+    # one here could only ever be False. A test that needs an active model walks
+    # it through the gate with `ml/lifecycle.py:record_activation`.
     store.write_ml_model({
         "id": model_id,
         "version": "1",
@@ -401,7 +405,7 @@ def _seed_model(store, model_id="model-1", *, active=False):
         "training_window_ids": [1, 2, 3],
         "runtime": {"python": "3.11"},
         "evaluation": {},
-        "active": active,
+        "active": False,
         "created_at": 2000.0,
     })
     return {

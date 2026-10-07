@@ -350,11 +350,18 @@ inactive. Full detail in [docs/ML_LIFECYCLE.md](docs/ML_LIFECYCLE.md).
   scheduled run cannot log "checked" and move on.
 - **An append-only log of how a model got where it is.** `ml/lifecycle.py` records
   `trained → evaluated → (eligible | ineligible) → active → (drifted | retired)`,
-  hash-chained in the same one fold as the evidence chains. The log **records; it
-  does not decide**: no append can activate a model, `activation_eligible` comes
-  only from a fresh call to the acceptance gate, and drift can append exactly two
-  states — `drift_assessed` and `retraining_required`. Drift raises the question; a
-  human answers it by training a new model and putting it through the same gate.
+  hash-chained in the same one fold as the evidence chains. The log **records; the
+  gate decides**: activation goes through one door, `storage/sqlite_store.py:activate_ml_model`,
+  which is the only writer of `ml_models.active = 1` and which refuses unless the
+  acceptance gate grants eligibility over the raw counts *and* the model's latest
+  recorded state is already `eligible`; training has no `activate` parameter and
+  an active model row cannot be inserted at all, so that door is the only one;
+  `activation_eligible` comes only from a
+  fresh call to that gate; and drift can append exactly two states —
+  `drift_assessed` and `retraining_required`. Drift raises the question; a human
+  answers it by training a new model and putting it through the same gate. The one
+  thing an append *does* cause points the safe way: `retired` and `drifted` stand a
+  model down in the same transaction.
 - **The gate shuts something.** `ml/scoring.py` refuses to construct a scorer for a
   model that is not active, before it reads the artifact, so an ungated model has
   no scoring path at all — not one whose output a caller is trusted to discard. An
@@ -655,6 +662,18 @@ operator-reviewed normal holdouts satisfy all of the following:
 No threshold changes, activation, or baseline contamination are allowed merely
 to make a model pass. Drift assessment and the lifecycle log feed this gate's
 paperwork; they are never a way around it.
+
+Those three conditions are enforced in code, not only in policy, at both ends of
+the gate. `storage/sqlite_store.py:activate_ml_model` is the only writer of
+`ml_models.active = 1`: it re-computes the verdict from the recorded counts and
+refuses unless the model's latest lifecycle state is already `eligible`. Nothing
+else can reach that flag — training takes no `activate` parameter, because a
+held-out false-positive rate cannot exist at the moment training returns, and
+inserting a model row with `active` set is **refused** rather than gated, because
+a brand-new row has no lifecycle history and so could never meet the condition
+the real door imposes. And `ml/scoring.py` refuses to construct a scorer for a
+model that is not active, so an unapproved model has no scoring path at all — not
+one whose output a caller is trusted to discard.
 
 ## Tests
 

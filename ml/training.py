@@ -68,9 +68,24 @@ def add_verified_normal_window(
 
 def train_isolation_forest(
     store: SQLiteEventStore, dataset_id: str, artifact_directory: str, *, n_estimators: int = 200,
-    contamination: float = 0.05, random_state: int = 42, activate: bool = False,
+    contamination: float = 0.05, random_state: int = 42,
 ) -> dict[str, Any]:
-    """Train only from an explicit all-verified-normal, schema-compatible dataset."""
+    """
+    Train only from an explicit all-verified-normal, schema-compatible dataset.
+
+    Training cannot activate, and there is no parameter asking it to. This used to
+    take `activate: bool = False`, which was the one reachable route to an active
+    model that consulted no gate. It is deleted rather than gated because no honest
+    caller could ever satisfy a gated version: the activation gate measures a false
+    positive rate on *held-out* verified-normal windows, and that measurement
+    cannot exist at the moment training returns -- the model whose errors are being
+    counted is the value being constructed. That is the whole reason training and
+    activation are separate steps.
+
+    So the row this writes is always inactive. `storage/sqlite_store.py:activate_ml_model`
+    is the only door to `active = 1`, and reaching it means evaluating this model
+    and recording the verdict first.
+    """
     if not SKLEARN_AVAILABLE:
         raise MLTrainingError("scikit-learn is required for Isolation Forest training but is not installed")
     windows = store.read_ml_training_windows(dataset_id)
@@ -131,7 +146,10 @@ def train_isolation_forest(
             "calibration_status": "requires_independent_verified_normal_holdouts",
             "activation_eligible": False,
         },
-        "active": bool(activate), "created_at": time.time(),
+        # Always inactive. Not `bool(activate)` -- see the docstring: a model cannot
+        # have been evaluated at the moment it is trained, so an active row here
+        # could only ever be an ungated one.
+        "active": False, "created_at": time.time(),
     }
     store.write_ml_model(metadata)
     # The artifact format and the array file's own digest are reported but not

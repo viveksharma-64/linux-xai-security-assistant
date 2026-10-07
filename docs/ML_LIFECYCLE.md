@@ -53,7 +53,7 @@ than one place on purpose:
 - **One door to `active`, with the gate across it.** No append flips
   `ml_models.active`, changes a threshold, or makes a scorer load.
   `record_activation` does not set the flag itself; it calls
-  `storage/sqlite_store.py:activate_ml_model`, the gated writer of `active = 1`,
+  `storage/sqlite_store.py:activate_ml_model`, the **only** writer of `active = 1`,
   which refuses unless the gate grants eligibility over the raw counts *and* the
   model's own latest recorded state is already `eligible` — so a retired model
   cannot be re-activated by re-asserting its old numbers. The flag and the row
@@ -68,6 +68,17 @@ than one place on purpose:
   absence — an *unguarded* setter still does not exist, and
   `tests/test_ml_lifecycle.py` asserts that it does not.
 
+  The write-time route is closed from the other side, so this stays one door
+  rather than two. `train_isolation_forest` no longer accepts an `activate` flag
+  — the gate measures a false-positive rate on held-out windows, and that
+  measurement cannot exist at the instant training returns — and
+  `write_ml_model` **refuses** an active row rather than gating one. Refusal
+  rather than a gate because the two doors cannot be given the same lock: at
+  INSERT a model has no lifecycle history, so it can never satisfy
+  `activate_ml_model`'s requirement that its latest recorded state already be
+  `eligible`. A gated INSERT would therefore be gated to a weaker standard than
+  the door beside it, and would produce the one thing this log exists to prevent
+  — a model influencing findings with an empty history.
 - **One exception, and it points the safe way.** Appending `retired` or `drifted`
   *does* stand a model down, clearing `ml_models.active` in the same transaction
   as the row. The failure mode of a retirement that leaves a model scoring is
@@ -318,7 +329,7 @@ GET /api/models/{id}  # provenance, full transition history, gate verdict, lates
 | Artifact → scorer | Two files on disk that used to be arbitrary pickled objects | Checksum verified before parse; JSON + `allow_pickle=False`; no code path at all. Numbers only. |
 | Descriptor → array filename | A filename read out of a not-yet-authenticated document | Bare basename resolved in the descriptor's own directory; traversal is refused before the checksum is known. |
 | Drift inputs → drift result | Model metadata, training windows, a foreign corpus database | Read-only throughout; cannot mutate a model, threshold, or activation state; schema/verification/overlap mismatches are refusals. |
-| Lifecycle log → activation | An append that would like to be a promotion | **One gated door.** `active = 1` on an existing model is writable only by `activate_ml_model`, which requires a freshly recomputed gate verdict *and* a latest recorded state of `eligible`; `active` is unreachable from drift; an unguarded setter does not exist. `write_ml_model` can still set the flag when a row is first written. The one-directional exception is `retired`/`drifted`, which stand a model *down*. |
+| Lifecycle log → activation | An append that would like to be a promotion | **One door, with the gate across it.** `active = 1` is writable only by `activate_ml_model`, which requires a freshly recomputed gate verdict *and* a latest recorded state of `eligible`; `active` is unreachable from drift; an unguarded setter does not exist. The one-directional exception is `retired`/`drifted`, which stand a model *down*. |
 | Activation state → scoring | A model that never passed the gate, or one stood down | `ml/scoring.py` refuses to construct a scorer unless `active` is `True`, before it reads the artifact; the detector independently drops any payload not reporting `model_active: True`. Enforced at construction, so a mid-run deactivation applies to scorers built after it. |
 | `actor` | A self-reported name (auth has no principal) | Labelled honestly as a claim — and chained, so the claim cannot be altered after the fact. |
 

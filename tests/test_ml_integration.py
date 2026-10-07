@@ -1,3 +1,4 @@
+from inspect import signature
 from pathlib import Path
 
 import pytest
@@ -139,6 +140,35 @@ def test_training_persists_immutable_provenance_and_checksum(tmp_path):
     assert persisted["active"] is False
     assert persisted["schema_hash"] == schema_hash()
     assert Path(persisted["artifact_path"]).exists()
+
+
+def test_training_cannot_activate(tmp_path):
+    """
+    Training has no activation parameter, and the row it writes is inactive.
+
+    `train_isolation_forest` used to take `activate: bool = False`, which was the
+    one route to `active = 1` that consulted no gate. It was deleted rather than
+    gated because no honest caller could satisfy a gated version: the gate
+    measures a false-positive rate on *held-out* windows, and that measurement
+    cannot exist at the moment training returns -- the model whose errors would be
+    counted is the value being constructed.
+
+    The signature check runs before the fixture on purpose. It needs no
+    scikit-learn, so in an environment without it this still fails rather than
+    skipping if the parameter is ever reintroduced.
+    """
+    assert "activate" not in signature(train_isolation_forest).parameters
+    store, _, metadata = _trained(tmp_path)
+    assert metadata["active"] is False
+    assert store.read_ml_model(metadata["id"])["active"] is False
+    # Nothing is active, and the log is empty: training is not a lifecycle event
+    # on its own -- `record_trained` is a separate, explicit call.
+    assert [model for model in store.read_ml_models() if model["active"]] == []
+    assert store.read_ml_lifecycle(metadata["id"]) == []
+    # And the gate-facing fields say so, so a reader of the row does not have to
+    # infer "unevaluated" from the absence of something.
+    assert metadata["evaluation"]["status"] == "not_evaluated"
+    assert metadata["evaluation"]["activation_eligible"] is False
 
 
 def test_schema_checked_scoring_is_deterministic_and_detects_corruption(tmp_path):
