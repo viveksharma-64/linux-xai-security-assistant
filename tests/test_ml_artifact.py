@@ -111,6 +111,12 @@ def _write(tmp_path, export=None, model_id="toy-model", **overrides):
         "calibration": {"method": "toy", "normal_windows": 3},
         "decision_min": -0.3,
         "decision_max": 0.2,
+        # Required by `write_artifact` and validated there: non-decreasing and
+        # bracketed by the two bounds above. Spelled out rather than computed so a
+        # test that overrides the bounds has to think about this field too.
+        "training_decision_percentiles": {
+            "p1": -0.3, "p5": -0.2, "p25": -0.1, "p50": 0.0, "p75": 0.05, "p95": 0.15, "p99": 0.2,
+        },
     }
     fields.update(overrides)
     return write_artifact(str(tmp_path), model_id, export if export is not None else _toy_export(), **fields)

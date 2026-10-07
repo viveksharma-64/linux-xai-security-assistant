@@ -355,6 +355,107 @@ chained `eligible` row and hands those to `activate_ml_model`, which re-runs the
 gate over them — so there is no flag through which an operator could type a
 favourable count, and no single command that takes raw data to an active model.
 
+### Contamination against the gate
+
+The trainer's default is `contamination=0.01`, and the number is chosen against
+this gate rather than against a convention. Contamination *is* the Isolation
+Forest decision threshold: a forest fitted to treat `c` of its training data as
+outlying flags roughly `c` of in-distribution normal windows, while the gate
+permits 5% only as a 95% Wilson *upper bound* — which at n=60 means zero observed
+false positives (§ *The gate*: 0/60 → 4.31%, 1/60 → 7.13%). The former 0.05
+default therefore aimed the model at exactly the ceiling it had to clear: 60
+independent draws at p=0.05 land on zero failures about 4.6% of the time, so a
+refusal was the expected outcome of every training run. At 0.01 the same
+arithmetic gives about 55%. The gate did not move; the model stopped being
+pointed at it.
+
+Measured on the test corpus, with the holdout drawn interior to the training grid
+(unseen windows that are nonetheless in range in every feature):
+
+| `--contamination` | training windows | false positives / 60 | verdict | deliberate outlier flagged |
+|---|---|---|---|---|
+| 0.05 | 35 | 5 | ineligible | yes |
+| 0.05 | 70 | 3 | ineligible | yes |
+| 0.05 | 140 | 4 | ineligible | yes |
+| 0.01 (default) | 35 | **0** | **eligible** | **yes** |
+| 0.01 | 70 | 2 | ineligible | yes |
+| 0.01 | 140 | 0 | eligible | **no** |
+| 0.001 | 35 | 0 | eligible | yes |
+| 0.001 | 70 | 0 | eligible | yes |
+| 0.001 | 140 | 0 | eligible | **no** |
+
+Two readings, and the second matters more. The default makes the gate reachable,
+not passable — the 70-window row at 0.01 is still refused, which is the gate
+working rather than a setting to tune away. And the last column is the thing the
+gate cannot see at all. Eligibility is a false-positive budget and nothing else,
+so driving contamination down while growing the training set eventually earns an
+eligible verdict by producing a model that flags nothing
+at all. The gate is a necessary condition, not a sufficient one; efficacy against
+a labelled attack corpus remains a separate question, and
+`labels_available: False` in the evaluation report says so in the row itself.
+
+Where a given model's boundary actually landed in its own training distribution
+is recorded rather than inferred: `write_artifact` stores
+`training_decision_percentiles` (p1/p5/p25/p50/p75/p95/p99 of the training
+`decision_function` scores) in the descriptor. For a forest fitted at the 0.01
+default, `p1` sits on 0.0 to float error — that is the `contamination`/threshold
+coupling made legible instead of left as a docstring claim.
+
+`tests/test_ml_workflow_cli.py` pins the two configurations that matter — the
+eligible one, which must still flag the outlier, and the single-false-positive one
+that must be refused — so a scikit-learn upgrade that moves these numbers fails a
+test rather than drifting unobserved.
+
+### Calibrating the threshold: `--calibrate-threshold`
+
+Contamination sets the boundary at fit time from the *training* distribution. The
+principled alternative is to set it from held-out normal data: pick the threshold
+whose measured false-positive rate on a verified-normal holdout is as close as
+possible to a target without exceeding it. That is what `--calibrate-threshold`
+does, and it is **off by default** for the reason below.
+
+```bash
+python3 scripts/ml_train_and_evaluate.py --db models.db \
+    --model-id iforest-... \
+    --holdout-db corpus/normal.db --holdout-dataset verified-normal-... \
+    --artifact-dir models/ --calibrate-threshold 0.05 --operator "$(id -un)"
+```
+
+It refuses to be combined with `--training-dataset`, `--record`, or `--activate`
+— usage errors, exit 1, distinct from the gate's exit 2. The holdout refusals are
+the same ones the training path applies: wrong `role`, schema mismatch, empty
+dataset, or windows byte-identical to the parent's training data.
+
+What it produces is a **second model**, never an edit. Artifacts are immutable
+and checksum-pinned in both directions, so moving a threshold means minting:
+`rethreshold_model` writes a new artifact carrying the parent's forest, scaler,
+training window ids, `decision_min`/`decision_max`, and
+`training_decision_percentiles` verbatim, differing in exactly `threshold`,
+`threshold_provenance`, and `calibration`. The new row is inactive, its
+`hyperparameters.derived_from` names the parent, and its only lifecycle row is
+`trained`. There is no `evaluated` row and no gate verdict, so `activate_ml_model`
+— which demands an `eligible` latest state — has nothing here to act on.
+
+**The honest limit, which is why this is scaffolding and not the recommendation.**
+A threshold fitted to a holdout and a false-positive rate measured on that same
+holdout are one number computed twice. Calibrating at a 5% target and then gating
+on the same windows would have the gate recite the target rather than test it, so
+the resulting FPR is optimistic by construction. The clean form needs two disjoint
+splits — one to calibrate, one to gate — which the normal corpus cannot yet
+support at 60 windows per split ([`NORMAL_CORPUS_PROGRAM.md`](NORMAL_CORPUS_PROGRAM.md)).
+The provenance string says so in the artifact itself
+(`holdout_quantile(n=..., target_fpr=..., quantile=...); in_sample -- ...`),
+`calibration.in_sample` is `true`, and the CLI prints the caveat to the operator
+rather than leaving it in a docstring.
+
+And calibrating is not the same as improving. Measured in
+`tests/test_ml_workflow_cli.py`: on a 60-window holdout an uncalibrated parent at
+the 0.01 default flags **zero** windows and is eligible; calibrating that same
+model *to* a 5% target **raises** the threshold until it flags three, and at n=60
+even one false positive bounds to 7.13% — outside the budget. Targeting 5% when
+the gate's effective allowance is zero moves the model away from the gate, not
+toward it.
+
 ## Reading the recorded state: `/api/models`
 
 The console can now show an analyst *whether the model behind a score is fit for

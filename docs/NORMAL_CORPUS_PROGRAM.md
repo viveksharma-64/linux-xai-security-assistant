@@ -241,7 +241,8 @@ above; they are candidates, not pre-approved data.
    `--role holdout`, or if their schema hashes disagree — which is the payoff for
    recording the role at promotion time. Run it today and it refuses: these
    captures are not promoted yet, and four windows is not sixty. See
-   [`ML_LIFECYCLE.md`](ML_LIFECYCLE.md) for the exit codes.
+   [`ML_LIFECYCLE.md`](ML_LIFECYCLE.md) for the exit codes and for how the
+   trainer's default contamination is chosen against the gate.
 5. Activation happens **only** if that measured assessment returns
    `activation_eligible=True` — against the unchanged 5% / 95%-Wilson / 60-window
    bar — and only through a **second, separate** invocation

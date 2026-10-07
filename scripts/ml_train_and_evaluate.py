@@ -17,7 +17,8 @@ Four boundaries are load-bearing:
   combining it with a training run is refused outright -- so no single command can
   take raw data to an active model, and whoever activates has had to read the
   verdict first.
-* **It writes nothing unless asked.** Without ``--record`` it runs every
+* **It writes nothing unless asked.** Without ``--record`` (or
+  ``--calibrate-threshold``, which is its own explicit write) it runs every
   up-front refusal, reports what the run would attempt and whether it could
   possibly clear the gate, and exits having trained nothing. Training writes an
   artifact and an ``ml_models`` row, so a dry run that trained would not be a dry
@@ -45,10 +46,11 @@ working, not the tool failing.
 before reaching for it. Contamination *is* the Isolation Forest decision
 threshold, so a forest fitted to treat 5% of its training data as outlying flags
 roughly 5% of normal windows -- while the gate allows 5% only as a 95% upper
-bound, which at 60 windows means zero. Lowering it raises the bar for calling a
-window anomalous; lowering it *while growing the training set* eventually buys
-eligibility with a model too permissive to flag anything, which is the one
-failure a false-positive budget cannot see.
+bound, which at 60 windows means zero. The trainer defaults to 0.01 for exactly
+that reason. Lowering it further raises the bar for calling a window anomalous;
+lowering it *while growing the training set* eventually buys eligibility with a
+model too permissive to flag anything, which is the one failure a false-positive
+budget cannot see. See ``docs/ML_LIFECYCLE.md`` for the measured sweep.
 
     # what is here?
     python3 scripts/ml_train_and_evaluate.py --db models.db --list-models
@@ -68,6 +70,12 @@ failure a false-positive budget cannot see.
     # only if that printed `eligible`, and only as its own invocation:
     python3 scripts/ml_train_and_evaluate.py --db models.db --activate \\
         --model-id iforest-... --operator alice
+
+    # derive a model whose threshold was fitted to a holdout rather than chosen
+    # by `contamination` -- see the warning this prints before using the result:
+    python3 scripts/ml_train_and_evaluate.py --db models.db --model-id iforest-... \\
+        --holdout-db corpus/normal.db --holdout-dataset verified-normal-... \\
+        --artifact-dir models/ --calibrate-threshold 0.01 --operator alice
 
 Exit status: 0 nothing refused the run, 2 the gate or a precondition refused it,
 1 the run could not be completed (bad arguments, missing data, training error).
@@ -93,6 +101,7 @@ from ml.drift import _window_fingerprint  # noqa: E402
 from ml.evaluation import (  # noqa: E402
     MIN_NORMAL_HOLDOUT_WINDOWS,
     MLEvaluationError,
+    calibrate_threshold,
     evaluate_threshold_from_windows,
     normal_fpr_acceptance,
 )
@@ -105,7 +114,7 @@ from ml.lifecycle import (  # noqa: E402
     record_trained,
 )
 from ml.scoring import MLScorer, MLScoringError  # noqa: E402
-from ml.training import MLTrainingError, train_isolation_forest  # noqa: E402
+from ml.training import MLTrainingError, rethreshold_model, train_isolation_forest  # noqa: E402
 from storage.sqlite_store import SQLiteEventStore  # noqa: E402
 
 # The attestation a dataset must carry to be measured against. Same literal
@@ -417,6 +426,131 @@ def _activate(store: SQLiteEventStore, model_id: str, *, operator: str) -> int:
     return 0 if chain["ok"] else 1
 
 
+def _calibrate(
+    store: SQLiteEventStore,
+    corpus: ReadOnlyCorpus,
+    model_id: str,
+    holdout_dataset: str,
+    *,
+    target_fpr: float,
+    artifact_dir: str,
+    operator: str,
+    as_json: bool,
+) -> int:
+    """
+    Fit a threshold to a holdout and mint a derived model carrying it.
+
+    The trained threshold is wherever `contamination` put it, which is a
+    hyperparameter choice rather than a measurement. This is the other way to get
+    one: score verified-normal windows and take the boundary that flags at most
+    `target_fpr` of them. `ml/evaluation.py:calibrate_threshold` computes it and
+    `ml/training.py:rethreshold_model` writes a *second* artifact and model row
+    carrying it, because artifacts are immutable and checksum-pinned.
+
+    What this deliberately does not do is measure the result. Calibrating on the
+    holdout the gate would then measure is in-sample: the gate's false-positive
+    rate would come out at the target by construction, which is not evidence of
+    anything. So this mode is refused in combination with `--record` and
+    `--activate`, writes only a `trained` lifecycle row for the derived model, and
+    appends no `evaluated` row and no gate verdict. An honest verdict for the
+    derived model needs a second, disjoint holdout, and the exit text says so.
+
+    The holdout checks are the holdout half of `_preflight`, restated rather than
+    shared because there is no training dataset in this mode -- the comparison the
+    overlap check makes is against the *parent model's* recorded training windows,
+    which is the nearest equivalent and reads from `--db` rather than the corpus.
+    """
+    row = store.read_ml_model(model_id)
+    if row is None:
+        print(f"unknown model {model_id!r} in --db", file=sys.stderr)
+        return 1
+
+    refusals: list[str] = []
+    dataset = corpus.read_ml_dataset(holdout_dataset)
+    holdout_windows = corpus.read_ml_training_windows(holdout_dataset)
+    role = "unknown"
+    schema_ok = False
+    if dataset is None:
+        refusals.append(f"holdout dataset {holdout_dataset!r} does not exist in the holdout database")
+    else:
+        role = _role_of(dataset["environment"], dataset["verification"])
+        if role != HOLDOUT_ROLE:
+            refusals.append(
+                f"holdout dataset {holdout_dataset!r} has role {role!r}, not {HOLDOUT_ROLE!r}: "
+                "a threshold fitted to data the model may have trained on is not calibration"
+            )
+        schema_ok = dataset["schema_hash"] == schema_hash() and dataset["schema_version"] == SCHEMA_VERSION
+        if not schema_ok:
+            refusals.append(
+                f"holdout dataset {holdout_dataset!r} was built under feature schema "
+                f"{dataset['schema_version']}/{dataset['schema_hash'][:12]}, not this runtime's "
+                f"{SCHEMA_VERSION}/{schema_hash()[:12]}"
+            )
+    if not holdout_windows:
+        refusals.append(f"holdout dataset {holdout_dataset!r} has no windows to calibrate against")
+    elif schema_ok:
+        # Against the parent's own training windows: a threshold fitted to data
+        # the forest was fitted on is calibrated to memorised scores, and the
+        # resulting boundary would be tighter than any unseen data justifies.
+        training_fingerprints = {
+            _window_fingerprint(window)
+            for window in store.read_ml_training_windows_by_ids(list(row["training_window_ids"]))
+        }
+        reused = [
+            window["id"] for window in holdout_windows
+            if _window_fingerprint(window) in training_fingerprints
+        ]
+        if reused:
+            refusals.append(
+                f"{len(reused)} calibration window(s) are byte-identical to windows "
+                f"{model_id} was trained on (ids {reused[:10]}{'...' if len(reused) > 10 else ''})"
+            )
+    if refusals:
+        print("refusing to calibrate:")
+        for refusal in refusals:
+            print(f"  - {refusal}")
+        return 2
+
+    try:
+        scorer = MLScorer(store, model_id, allow_inactive=True)
+        calibration = calibrate_threshold(scorer, holdout_windows, target_fpr=target_fpr)
+    except (MLScoringError, MLEvaluationError) as error:
+        print(f"calibration refused: {error}", file=sys.stderr)
+        return 1
+    try:
+        derived = rethreshold_model(store, model_id, artifact_dir, calibration=calibration)
+    except MLTrainingError as error:
+        print(f"calibration refused: {error}", file=sys.stderr)
+        return 1
+    trained = record_trained(store, derived, actor=operator)
+
+    if as_json:
+        print(json.dumps(
+            {"model": derived["id"], "derived_from": model_id, "calibration": calibration},
+            indent=2, sort_keys=True, default=str,
+        ))
+    else:
+        print(f"parent model:     {model_id} (threshold {float(row['hyperparameters'].get('threshold', 0.0))!r})")
+        print(f"derived model:    {derived['id']} (threshold {calibration['threshold']!r})")
+        print(f"artifact:         {derived['artifact_path']} ({derived['artifact_format']})")
+        print(
+            f"calibrated on:    {calibration['normal_window_count']} verified-normal windows "
+            f"from {holdout_dataset}, flagging {calibration['false_positive_count']} "
+            f"({calibration['quantile']:.2%}) at target {calibration['target_fpr']:.2%}"
+        )
+    print(f"lifecycle appended: {trained['to_state']} (chain_seq {trained['chain_seq']})")
+    print(
+        "\nthis number is in-sample. The threshold was fitted to the same windows a gate run "
+        f"would measure it on, so a gate verdict from {holdout_dataset} would report the target "
+        "back rather than test it. No evaluation or gate row was written for "
+        f"{derived['id']}, and it cannot get an honest one from this dataset -- measure it "
+        "against a second, disjoint verified-normal holdout."
+    )
+    chain = store.verify_ml_lifecycle_chain()
+    print(f"lifecycle chain: {'ok' if chain['ok'] else chain['reason']} ({chain['checked']} links)")
+    return 0 if chain["ok"] else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _Parser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--db", help="database holding the models, training windows, and lifecycle log")
@@ -438,7 +572,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--record", action="store_true", help="train, measure, and append the verdict to the lifecycle log")
     parser.add_argument("--activate", action="store_true", help="activate an already-eligible model (separate invocation)")
-    parser.add_argument("--model-id", help="model to act on, with --activate")
+    parser.add_argument("--model-id", help="model to act on, with --activate or --calibrate-threshold")
+    parser.add_argument(
+        "--calibrate-threshold", type=float, metavar="TARGET_FPR",
+        help=(
+            "fit --model-id's threshold to --holdout-dataset at this target false-positive "
+            "rate and write a derived model carrying it (separate invocation). Off by default "
+            "and deliberately: the result is in-sample, so the derived model gets no gate "
+            "verdict from the dataset that calibrated it."
+        ),
+    )
     parser.add_argument("--operator", help="operator responsible for the run (self-reported, chained)")
     parser.add_argument("--list-models", action="store_true", help="list models in --db and exit")
     parser.add_argument("--list-datasets", action="store_true", help="list datasets in --holdout-db or --db and exit")
@@ -461,9 +604,9 @@ def main(argv: list[str] | None = None) -> int:
         # The separation is enforced here, not merely documented: one invocation
         # cannot both produce a model and activate it, so the verdict is always
         # read by a human between the two.
-        if args.training_dataset or args.holdout_dataset:
+        if args.training_dataset or args.holdout_dataset or args.calibrate_threshold is not None:
             parser.error(
-                "--activate cannot be combined with a training run: activation "
+                "--activate cannot be combined with a training or calibration run: activation "
                 "is a separate invocation by design, so that no single command takes raw data "
                 "to an active model. Record the verdict first, read it, then activate."
             )
@@ -471,6 +614,36 @@ def main(argv: list[str] | None = None) -> int:
             if not getattr(args, required):
                 parser.error(f"--{required.replace('_', '-')} is required with --activate")
         return _activate(SQLiteEventStore(args.db), args.model_id, operator=args.operator)
+
+    if args.calibrate_threshold is not None:
+        # Kept apart from `--record` for the reason `_calibrate` documents: a gate
+        # verdict measured on the holdout that set the threshold is the target
+        # restated, and allowing one command to produce both would put that number
+        # into the lifecycle log as though it were evidence.
+        if args.record or args.training_dataset:
+            parser.error(
+                "--calibrate-threshold cannot be combined with a training run or --record: a "
+                "threshold fitted to a holdout and a gate verdict measured on that same holdout "
+                "are the same number computed twice. Calibrate as its own invocation, then "
+                "measure the derived model against a second, disjoint holdout."
+            )
+        for required in ("db", "model_id", "holdout_dataset", "operator"):
+            if not getattr(args, required):
+                parser.error(f"--{required.replace('_', '-')} is required with --calibrate-threshold")
+        if not 0.0 < args.calibrate_threshold < 1.0:
+            parser.error(
+                f"--calibrate-threshold must be a false-positive rate in (0, 1), not {args.calibrate_threshold}"
+            )
+        try:
+            corpus = ReadOnlyCorpus(args.holdout_db or args.db)
+        except (FileNotFoundError, sqlite3.Error) as error:
+            print(f"error reading the holdout corpus: {error}", file=sys.stderr)
+            return 1
+        return _calibrate(
+            SQLiteEventStore(args.db), corpus, args.model_id, args.holdout_dataset,
+            target_fpr=args.calibrate_threshold, artifact_dir=args.artifact_dir,
+            operator=args.operator, as_json=args.json,
+        )
 
     for required in ("db", "training_dataset", "holdout_dataset"):
         if not getattr(args, required):

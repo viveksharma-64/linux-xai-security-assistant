@@ -10,11 +10,13 @@ loading it the way an operator invokes it, by path.
 
 import importlib.util
 import json
+import math
 import sqlite3
 from pathlib import Path
 
 import pytest
 
+from ml.artifact import load_artifact
 from ml.evaluation import MIN_NORMAL_HOLDOUT_WINDOWS, evaluate_threshold_from_windows
 from ml.feature_schema import extract_features
 from ml.lifecycle import record_activation_gate, record_evaluated, record_trained
@@ -184,13 +186,13 @@ def test_records_the_full_trained_evaluated_gated_sequence(tmp_path):
     """
     The whole workflow, ending in a verdict the measurement actually earned.
 
-    `--contamination 0.01` is passed explicitly rather than relying on the default,
+    `--contamination 0.01` is passed explicitly even though it is the default,
     because the verdict below depends on it and a test should pin what it depends
     on. Contamination *is* the decision threshold here: a forest fitted to treat
     `c` of normal data as outlying flags about `c` of normal windows, and the
     gate's budget is 5% at a one-sided 95% upper bound -- which at sixty windows
-    means zero false positives. The 0.05 default aims the model straight at that
-    ceiling and almost always misses. If a scikit-learn upgrade moves these
+    means zero false positives. The old 0.05 default aimed the model straight at
+    that ceiling and almost always missed. If a scikit-learn upgrade moves these
     numbers, the `false_positive_count == 0` assertion is what will notice.
     """
     store, training = _training_store(tmp_path)
@@ -474,3 +476,114 @@ def test_score_features_matches_score_on_the_same_window(tmp_path):
     for index in (0, 5, 9):
         events = _window(index)
         assert scorer.score(events) == scorer.score_features(extract_features(events))
+
+
+def test_calibrate_threshold_is_refused_alongside_a_training_or_activation_run(tmp_path):
+    """
+    Calibrating and gating in one command is refused, because it would be circular.
+
+    A threshold fitted to a holdout and a false-positive rate measured on that
+    same holdout are one number computed twice: the gate would hand the target
+    back. Letting a single invocation do both would put that number into the
+    chained lifecycle log wearing the shape of evidence. The refusal is a usage
+    error -- `_Parser.error`, exit 1 -- rather than a verdict, keeping exit 2 for
+    "the measurement said no".
+    """
+    store, training = _training_store(tmp_path)
+    holdout_db, holdout = _holdout_db(tmp_path, _normal_holdout(3))
+    base = [
+        "--db", str(tmp_path / "ml.db"), "--model-id", "iforest-whatever",
+        "--holdout-db", holdout_db, "--holdout-dataset", holdout,
+        "--artifact-dir", str(tmp_path / "models"), "--operator", "alice",
+    ]
+
+    with pytest.raises(SystemExit) as refused:
+        workflow.main([*base, "--calibrate-threshold", "0.05", "--record"])
+    assert "--calibrate-threshold cannot be combined" in str(refused.value.code)
+
+    # The other half of the same mistake: a run that trains *and* calibrates fits
+    # the threshold to the model it just produced, which is the same circle.
+    with pytest.raises(SystemExit) as refused:
+        workflow.main([*base, "--calibrate-threshold", "0.05", "--training-dataset", training])
+    assert "--calibrate-threshold cannot be combined" in str(refused.value.code)
+
+    # And from the --activate side, which is checked first and refuses just as hard.
+    with pytest.raises(SystemExit) as refused:
+        workflow.main([*base, "--calibrate-threshold", "0.05", "--activate"])
+    assert "separate invocation" in str(refused.value.code)
+
+    # A target outside (0, 1) is the same class of error, and is caught before any
+    # model is loaded rather than surfacing as an exception out of the quantile.
+    with pytest.raises(SystemExit) as refused:
+        workflow.main([*base, "--calibrate-threshold", "0"])
+    assert "--calibrate-threshold must be a false-positive rate in (0, 1)" in str(refused.value.code)
+
+    # None of the four wrote anything.
+    assert workflow._list_models(str(tmp_path / "ml.db")) == []
+    assert store.read_ml_lifecycle() == []
+    assert not (tmp_path / "models").exists()
+
+
+def test_calibration_derives_an_inactive_model_carrying_only_a_trained_row(tmp_path, capsys):
+    """
+    The end-to-end calibrate run, and the reason it is off by default.
+
+    What it produces is a *second* model -- artifacts are immutable and
+    checksum-pinned, so moving a threshold means minting, never editing -- whose
+    only lifecycle row is `trained`. No `evaluated` row and no gate verdict,
+    because the only holdout it has is the one that set the threshold, and
+    `activate_ml_model` demands an `eligible` latest state it therefore cannot
+    reach from here.
+
+    The last block is the part worth reading: calibrating *to* a 5% target made
+    this model strictly worse at the gate than the uncalibrated parent, which
+    flags none of the same sixty windows. "Calibrated" is not a synonym for
+    "better", and an in-sample target is a number the gate would recite rather
+    than test.
+    """
+    store, training = _training_store(tmp_path)
+    holdout_db, holdout = _holdout_db(tmp_path, _normal_holdout())
+    db = str(tmp_path / "ml.db")
+    parent = train_isolation_forest(store, training, str(tmp_path / "models"))
+
+    code = workflow.main([
+        "--db", db, "--model-id", parent["id"],
+        "--holdout-db", holdout_db, "--holdout-dataset", holdout,
+        "--artifact-dir", str(tmp_path / "models"),
+        "--calibrate-threshold", "0.05", "--operator", "alice",
+    ])
+    assert code == 0
+    output = capsys.readouterr().out
+
+    models = workflow._list_models(db)
+    assert len(models) == 2 and [model["active"] for model in models] == [0, 0]
+    derived_id = next(model["id"] for model in models if model["id"] != parent["id"])
+
+    assert [row["to_state"] for row in store.read_ml_lifecycle(derived_id)] == ["trained"]
+    assert store.read_ml_lifecycle(parent["id"]) == []
+    assert store.verify_ml_lifecycle_chain()["ok"] is True
+
+    row = store.read_ml_model(derived_id)
+    descriptor = load_artifact(row["artifact_path"], row["artifact_checksum"])["descriptor"]
+    assert descriptor["threshold"] != 0.0
+    assert descriptor["threshold_provenance"].startswith("holdout_quantile(")
+    assert descriptor["calibration"]["derived_from"] == parent["id"]
+    assert descriptor["calibration"]["in_sample"] is True
+    assert row["hyperparameters"]["derived_from"] == parent["id"]
+    # The parent artifact is untouched: calibration mints, it never rewrites.
+    assert load_artifact(parent["artifact_path"], parent["artifact_checksum"])["descriptor"]["threshold"] == 0.0
+
+    # The caveat reaches the operator, not just the docstring.
+    assert "in-sample" in output and "disjoint" in output
+
+    holdout_windows = workflow.ReadOnlyCorpus(holdout_db).read_ml_training_windows(holdout)
+    before = evaluate_threshold_from_windows(MLScorer(store, parent["id"], allow_inactive=True), holdout_windows)
+    after = evaluate_threshold_from_windows(MLScorer(store, derived_id, allow_inactive=True), holdout_windows)
+    assert before["normal_false_positive_count"] == 0
+    assert before["acceptance"]["activation_eligible"] is True
+    # Upper-bounded by the budget the calibration was given, and at least one --
+    # the same `floor(target * n)` arithmetic `calibrate_threshold` uses. At n=60
+    # even a single false positive bounds to 7.13%, outside the gate's 5%.
+    budget = math.floor(0.05 * MIN_NORMAL_HOLDOUT_WINDOWS)
+    assert 1 <= after["normal_false_positive_count"] <= budget
+    assert after["acceptance"]["activation_eligible"] is False

@@ -411,6 +411,51 @@ command exits 2 and records an `ineligible` row naming the shortfall. A refusal
 that is *recorded* is the point: the chained log then holds evidence that somebody
 measured, which pre-refusing without a row would not.
 
+**`--contamination` is the lever on whether the gate can be cleared at all.**
+Contamination *is* the Isolation Forest decision threshold, so a forest fitted to
+treat `c` of its training data as outlying flags roughly `c` of in-distribution
+normal windows — while the gate's budget is 5% at a one-sided 95% Wilson bound,
+which at n=60 means **zero** false positives are permitted (0/60 → 4.31%, 1/60 →
+7.13%). The default is **0.01** for exactly that reason: the former 0.05 default
+aimed the model at the ceiling it had to clear, and 60 independent draws at
+p=0.05 land on zero failures only about 4.6% of the time, where 0.01 gives about
+55%. Measured on the test corpus, over a holdout drawn *interior* to the training
+grid:
+
+| `--contamination` | training windows | false positives / 60 | gate | deliberate outlier flagged |
+|---|---|---|---|---|
+| 0.05 (the former default) | 35 / 70 / 140 | 5 / 3 / 4 | ineligible in all three | yes |
+| 0.01 (default) | 35 | **0** | **eligible** | yes |
+| 0.01 | 70 / 140 | 2 / 0 | ineligible / eligible | yes / **no** |
+| 0.001 | 35 / 70 / 140 | 0 / 0 / 0 | eligible | yes / yes / **no** |
+
+Two things follow. The lower default makes the gate *reachable*, not passable —
+the 70-window row is still refused, and that is the gate doing its job rather
+than a setting to tune away; and lowering contamination while *growing* the
+training set eventually buys eligibility by making the model too permissive to
+flag anything, which is the failure the gate cannot see. The configuration worth
+keeping is the one that is eligible *and* still catches the outlier. The flag's
+own `--help` says this, and its default is read off `train_isolation_forest`'s
+signature so the help cannot misreport it. Where the boundary actually landed in
+the training score distribution is recorded per model as
+`training_decision_percentiles` in the artifact descriptor.
+
+**`--calibrate-threshold` fits the boundary to held-out normal data instead, and
+is off by default because of an honest limit.** It is a separate invocation —
+refused alongside `--training-dataset`, `--record`, or `--activate` — and it
+*mints a second model* rather than editing one, since artifacts are immutable and
+checksum-pinned in both directions. The derived model is inactive and carries a
+single `trained` row: no gate verdict, because a threshold fitted to a holdout
+and a false-positive rate measured on that same holdout are one number computed
+twice, and the gate would recite the target rather than test it. The clean form
+needs a calibration split and a disjoint gate split, which the normal corpus
+cannot yet supply; until then the provenance string, the descriptor's
+`in_sample: true`, and the CLI's own output all say so. It is also not a free
+improvement: measured in the tests, calibrating an eligible model *to* a 5%
+target raises its threshold until it fails the gate, because at n=60 the gate's
+effective allowance is zero. See
+[docs/ML_LIFECYCLE.md](docs/ML_LIFECYCLE.md) for the full treatment.
+
 **Seeing the recorded state.** `GET /api/models` and `GET
 /api/models/{id}` render what the lifecycle log already holds — a model's
 provenance, its transition history, the activation-gate verdict, and its latest
