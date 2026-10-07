@@ -64,7 +64,7 @@ a new model and putting it through the same gate.
 """
 
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ml.evaluation import normal_fpr_acceptance
@@ -147,6 +147,7 @@ def record_activation_gate(
     *,
     false_positive_count: int,
     normal_window_count: int,
+    holdout_window_ids: Sequence[Any] | None = None,
     actor: str | None = None,
 ) -> dict[str, Any]:
     """
@@ -157,10 +158,27 @@ def record_activation_gate(
     `normal_fpr_acceptance` returned for these numbers. `is True` rather than a
     truthiness test, so no truthy stand-in can pass for the gate's boolean.
 
+    `holdout_window_ids` is optional and, when given, names the windows the counts
+    were measured over -- so the chained row commits to *which* sixty windows
+    cleared the gate, not merely that sixty of something did. Without it the row
+    records a bare count that no later reader can audit or reproduce. It must agree
+    with `normal_window_count` and contain no repeats; a disagreement is refused
+    rather than reconciled, because the two numbers disagreeing means the caller
+    does not know what it measured.
+
     An ineligible verdict is recorded, not raised. "This model was measured and
     did not qualify" is the more useful audit record, and it is the record that
     stops the same model being quietly re-proposed later.
     """
+    window_ids = None if holdout_window_ids is None else list(holdout_window_ids)
+    if window_ids is not None:
+        if len(set(window_ids)) != len(window_ids):
+            raise ValueError("holdout_window_ids repeats a window; the gate's sample would be inflated")
+        if len(window_ids) != int(normal_window_count):
+            raise ValueError(
+                f"holdout_window_ids names {len(window_ids)} windows but normal_window_count "
+                f"is {int(normal_window_count)}"
+            )
     acceptance = normal_fpr_acceptance(int(false_positive_count), int(normal_window_count))
     eligible = acceptance["activation_eligible"] is True
     return store.write_ml_lifecycle_transition(
@@ -175,6 +193,7 @@ def record_activation_gate(
             "acceptance": acceptance,
             "false_positive_count": int(false_positive_count),
             "normal_window_count": int(normal_window_count),
+            "holdout_window_ids": window_ids,
         },
         from_state="evaluated",
         activation_eligible=eligible,

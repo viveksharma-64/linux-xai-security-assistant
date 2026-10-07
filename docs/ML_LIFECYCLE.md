@@ -295,6 +295,66 @@ python3 scripts/ml_drift_check.py \
 recording, the script re-verifies the lifecycle chain and exits non-zero if it
 does not verify.
 
+## Running a train → evaluate → gate workflow
+
+`scripts/ml_train_and_evaluate.py` is the one command that walks the first three
+states. It mirrors `ml_drift_check.py`'s posture deliberately — same `--list-*`
+discovery, same read-only comparison corpus, same `--record`/`--operator`
+requirement, same chain re-verification at the end.
+
+```bash
+# What is here to work with (both read-only, nothing written):
+python3 scripts/ml_train_and_evaluate.py --db models.db --list-models
+python3 scripts/ml_train_and_evaluate.py --holdout-db corpus/normal.db --list-datasets
+
+# Dry run: preflight the comparison and print the best case the holdout could
+# support. Trains nothing, writes nothing, leaves no artifact.
+python3 scripts/ml_train_and_evaluate.py --db models.db \
+    --training-dataset verified-normal-... \
+    --holdout-db corpus/normal.db --holdout-dataset verified-normal-...
+
+# The real run: train, score the holdout, and record all three transitions.
+python3 scripts/ml_train_and_evaluate.py --db models.db \
+    --training-dataset verified-normal-... \
+    --holdout-db corpus/normal.db --holdout-dataset verified-normal-... \
+    --artifact-dir models/ --contamination 0.01 --record --operator "$(id -un)"
+
+# Activation is a separate invocation, on purpose.
+python3 scripts/ml_train_and_evaluate.py --db models.db \
+    --activate --model-id iforest-... --operator "$(id -un)"
+```
+
+What it appends, in order: `trained` (artifact checksum and provenance),
+`evaluated` (the measured per-window scores and false-positive count), and then
+`eligible` or `ineligible` carrying the gate's own `acceptance` dict with its
+reasons. The gate row also carries `holdout_window_ids`, so the chained log
+commits to *which* windows were measured and not merely how many —
+`normal_window_count` is derived as `len(set(ids))` rather than supplied
+independently of them.
+
+Four conditions are refused **before** training, because they mean the
+measurement would not be a measurement:
+
+| Refusal | Why |
+|---|---|
+| training and holdout name the same dataset | measuring a model against its own training data answers nothing about generalization |
+| the holdout reuses training windows byte-for-byte | detected with the same `_window_fingerprint` the drift check uses; a subset reuse is as fatal as a whole one |
+| the holdout dataset's `role` is not `holdout` | the corpus program records the split; ignoring it would silently undo it |
+| the two datasets' schema hashes disagree | the feature vectors are not comparable, so neither are the scores |
+
+Exit codes are the interface a scheduled run reads: **0** eligible, **2** the gate
+refused (either a preflight refusal or an `ineligible` verdict), **1** the
+invocation was wrong or the run errored. Usage errors deliberately do not use
+argparse's default status of 2, so "you asked wrong" can never be mistaken for
+"the model was refused".
+
+**Activation is not reachable from here.** `--activate` cannot be combined with
+`--training-dataset` or `--holdout-dataset`; it is rejected as a usage error. It
+re-reads `normal_window_count` and `false_positive_count` out of the model's own
+chained `eligible` row and hands those to `activate_ml_model`, which re-runs the
+gate over them — so there is no flag through which an operator could type a
+favourable count, and no single command that takes raw data to an active model.
+
 ## Reading the recorded state: `/api/models`
 
 The console can now show an analyst *whether the model behind a score is fit for

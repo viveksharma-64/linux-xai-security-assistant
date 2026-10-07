@@ -367,6 +367,20 @@ inactive. Full detail in [docs/ML_LIFECYCLE.md](docs/ML_LIFECYCLE.md).
   no scoring path at all — not one whose output a caller is trusted to discard. An
   inactive model therefore yields a finding byte-identical to one scored with no
   model configured, provenance hash included.
+- **One command to train, measure, and ask the gate — and a different one to
+  activate.** `scripts/ml_train_and_evaluate.py` runs `train → record_trained →
+  score a held-out verified-normal corpus → record_evaluated →
+  record_activation_gate`, so the chained log carries the measurement, and the
+  window ids it was taken over, before any verdict cites them. It refuses *before*
+  training when the comparison is not one: the same dataset named for both roles, a
+  holdout that reuses training windows byte-for-byte, a holdout not marked
+  `role: holdout`, or disagreeing schema hashes. `--record` is off by default, the
+  holdout corpus is opened `mode=ro`, `--operator` is required to write anything,
+  and the exit codes separate the two kinds of "no": **2** means the gate refused,
+  **1** means the invocation was wrong. Activation is a *separate* invocation
+  (`--activate --model-id ...`) that re-reads the counts out of the model's own
+  `eligible` row — there is no flag to type a count into, and no single command
+  goes from raw data to an active model.
 
 Run a drift check (read-only unless you pass `--record`):
 
@@ -374,6 +388,28 @@ Run a drift check (read-only unless you pass `--record`):
 python3 scripts/ml_drift_check.py --db events.db --model-id iforest-... \
     --comparison-db corpus/normal.db --comparison-dataset verified-normal-...
 ```
+
+Train, measure, and ask the activation gate (also read-only unless `--record`):
+
+```bash
+python3 scripts/ml_train_and_evaluate.py --db models.db \
+    --training-dataset verified-normal-... \
+    --holdout-db corpus/normal.db --holdout-dataset verified-normal-... \
+    --artifact-dir models/ --contamination 0.01 --record --operator alice
+```
+
+```bash
+python3 scripts/ml_train_and_evaluate.py --db models.db \
+    --activate --model-id iforest-... --operator alice
+```
+
+**Expect this to refuse against the corpus as it stands, and read the refusal as
+the gate working.** The seed captures are not promoted into `ml_datasets` at all
+yet, and even once they are they amount to at most 4 holdout windows against a
+floor of 60 ([docs/NORMAL_CORPUS_PROGRAM.md](docs/NORMAL_CORPUS_PROGRAM.md)). The
+command exits 2 and records an `ineligible` row naming the shortfall. A refusal
+that is *recorded* is the point: the chained log then holds evidence that somebody
+measured, which pre-refusing without a row would not.
 
 **Seeing the recorded state.** `GET /api/models` and `GET
 /api/models/{id}` render what the lifecycle log already holds — a model's
@@ -779,7 +815,7 @@ removed to make a run look clean.
 | `observability/` | Layered config, Prometheus-style metrics, and disk/queue/silence alerting |
 | `api/`, `dashboard/` | Authenticated analyst API and interface: read-only over the immutable evidence record, with append-only, default-deny triage writes |
 | `deploy/` | systemd units, example config, and the deployment guide |
-| `scripts/` | Environment check, ingestion benchmark, and collector-kill soak harness |
+| `scripts/` | Environment check, ingestion benchmark, collector-kill soak harness, and the ML corpus/train/drift tools |
 | `tests/` | Focused unit and integration regression tests |
 | `requirements.txt` | Python dependencies for API, policy, ML, and tests |
 

@@ -1,6 +1,7 @@
 """Schema-checked optional Isolation Forest inference over canonical windows."""
 
-from typing import Any, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -108,8 +109,46 @@ class MLScorer:
         return diagnostics
 
     def score(self, events: Sequence[Event]) -> dict[str, Any]:
-        features = extract_features(events)
-        vector = np.asarray([[features[name] for name in FEATURE_NAMES]], dtype=float)
+        """Extract features from a canonical window and score them. The hot path."""
+        return self.score_features(extract_features(events))
+
+    def score_features(self, features: Mapping[str, float]) -> dict[str, Any]:
+        """
+        Score an already-extracted feature mapping, for callers holding one.
+
+        This is the body of `score()` with feature extraction lifted out, so a
+        caller holding *stored* features -- an `ml_training_windows` row, which
+        persists the 34 values computed when the window was collected -- can score
+        them without reconstructing the events they came from. Evaluation is that
+        caller: a holdout dataset is rows of features, and rebuilding `Event`
+        objects from them is not possible. `score()` is the only caller that
+        extracts, and both produce the identical payload.
+
+        Soundness rests on a check made elsewhere, so name it here: reusing a stored
+        vector is only equivalent to re-extracting it if the schema that produced it
+        is the schema running now. `__init__` refuses a model whose `schema_hash`
+        differs from this runtime's, and `storage/sqlite_store.py:write_ml_training_window`
+        refuses to store a window under a different one -- together, that is what
+        makes the two interchangeable. If the feature set is ever changed without
+        bumping `schema_hash`, this path silently scores stale vectors; the hash
+        bump is load-bearing, not bookkeeping.
+        """
+        missing = [name for name in FEATURE_NAMES if name not in features]
+        unexpected = sorted(set(features) - set(FEATURE_NAMES))
+        if missing or unexpected:
+            # Fail closed rather than defaulting an absent feature to zero: a
+            # partial vector scores as a *plausible* window, and a wrong score is
+            # worse than a refusal.
+            raise MLScoringError(
+                "feature mapping does not match the active feature schema "
+                f"(missing: {missing}; unexpected: {unexpected})"
+            )
+        # Re-keyed into FEATURE_NAMES order with values passed through untouched. A
+        # mapping decoded from stored JSON carries no order guarantee, and
+        # `feature_values` below is part of the payload; coercing the values instead
+        # would change `score()`'s output, which must stay identical.
+        values: dict[str, float] = {name: features[name] for name in FEATURE_NAMES}
+        vector = np.asarray([[values[name] for name in FEATURE_NAMES]], dtype=float)
         # The native forest folds the scaler into decision_function, so the two can
         # no longer be applied out of order or independently of each other.
         raw = float(self.model.decision_function(vector)[0])
@@ -117,13 +156,13 @@ class MLScorer:
         normalized = 1.0 - ((raw - lower) / (upper - lower)) if upper > lower else 0.0
         normalized = float(min(1.0, max(0.0, normalized)))
         scaled = self.model.transform(vector)[0]
-        diagnostics = self._feature_diagnostics(features, scaled)
+        diagnostics = self._feature_diagnostics(values, scaled)
         deviations = sorted(diagnostics, key=lambda item: item["absolute_zscore"], reverse=True)[:5]
         result = {
             "available": True, "model_id": self.metadata["id"], "model_version": self.metadata["version"],
             "schema_version": SCHEMA_VERSION, "schema_hash": schema_hash(), "raw_score": raw,
             "normalized_score": normalized, "threshold": float(self.artifact["threshold"]),
-            "is_anomaly": raw <= float(self.artifact["threshold"]), "feature_values": features,
+            "is_anomaly": raw <= float(self.artifact["threshold"]), "feature_values": values,
             "contributing_feature_deviations": deviations, "feature_diagnostics": diagnostics,
             "training_window_ids": self.metadata["training_window_ids"], "model_active": self.metadata["active"],
             "threshold_provenance": self.artifact["threshold_provenance"],

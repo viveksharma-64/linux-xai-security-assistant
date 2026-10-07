@@ -19,7 +19,7 @@
 # `test` job cannot: that the scikit-learn-backed tests actually execute. Those
 # tests skip themselves when scikit-learn is absent (`ml.training.SKLEARN_AVAILABLE`
 # is False), and a skip is green -- so if scikit-learn ever failed to install, the
-# `test` job would stay green while 13 tests silently vanished. scikit-learn is a
+# `test` job would stay green while 35 tests silently vanished. scikit-learn is a
 # declared runtime dependency, so `pip install -e '.[dev]'` already pulls it into
 # the `test` job too; the `ml` job asserts it imported and then refuses to pass if
 # any test in the scikit-learn-gated files skips. It touches only the CI config --
@@ -117,14 +117,24 @@ jobs:
           python -c "import sklearn; print('scikit-learn', sklearn.__version__)"
           python -c "from ml.training import SKLEARN_AVAILABLE; assert SKLEARN_AVAILABLE, 'ml.training could not import scikit-learn'; print('SKLEARN_AVAILABLE =', SKLEARN_AVAILABLE)"
       - name: Run the scikit-learn-gated tests, forbidding skips
-        # Run the three scikit-learn-gated files by name -- fast and focused, and
+        # Run the four scikit-learn-gated files by name -- fast and focused, and
         # the full suite (with these no longer skipped) still runs in `test`. `-rs`
         # prints any surviving skip reasons in the log. pytest has no native "fail
         # on skip", so a skip is still exit 0 here; the JUnit report this writes is
         # inspected by the next step, which is what actually enforces zero skips.
+        #
+        # test_ml_workflow_cli.py is listed here deliberately: the train -> evaluate
+        # -> gate workflow it covers cannot run without scikit-learn at all, so
+        # leaving it out of this job would let the one command that decides whether
+        # a model may be activated go untested behind a green check.
+        #
+        # These four files are currently *every* scikit-learn-gated test in the
+        # suite: without scikit-learn the whole suite skips 35 tests and these four
+        # files account for all 35. If a fifth file ever gains a SKLEARN_AVAILABLE
+        # skip, add it here -- the `test` job will not notice it vanishing.
         run: |
           pytest tests/test_ml_artifact.py tests/test_ml_attribution.py tests/test_ml_integration.py \
-            -rs --junit-xml=ml-junit.xml
+            tests/test_ml_workflow_cli.py -rs --junit-xml=ml-junit.xml
       - name: Fail if any scikit-learn-gated test skipped
         # A skip here means scikit-learn was not exercised despite being declared
         # -- exactly the silent-green regression this job exists to catch. Parse

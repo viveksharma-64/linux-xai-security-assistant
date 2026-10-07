@@ -25,7 +25,8 @@ only measures.
 """
 
 import math
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ml.scoring import MLScorer
@@ -33,6 +34,10 @@ from pipeline.event_stream import Event
 
 MAX_NORMAL_FPR = 0.05
 MIN_NORMAL_HOLDOUT_WINDOWS = 60
+
+
+class MLEvaluationError(ValueError):
+    pass
 
 
 def _wilson_upper_bound(successes: int, observations: int, z: float = 1.644854) -> float | None:
@@ -123,3 +128,66 @@ def evaluate_threshold(
         }
     )
     return report
+
+
+def evaluate_threshold_from_windows(
+    scorer: MLScorer,
+    windows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """
+    The same verified-normal measurement, taken from *stored* holdout windows.
+
+    `evaluate_threshold` wants live `Event` objects, which a holdout dataset does
+    not have: a collected window persists its 34 feature values, and the events
+    behind them live in whatever capture it was promoted from. So this is the
+    entry point an operator-facing evaluation actually uses -- it reads what
+    `read_ml_training_windows()` returns and scores each row's features directly
+    through `MLScorer.score_features`.
+
+    The report shape is the one `evaluate_threshold` produces, so
+    `ml.lifecycle.record_evaluated` reads it unchanged, plus `normal_window_ids`:
+    the measurement commits to *which* windows it measured, rather than to a bare
+    count that no later reader can check. `labels_available` is always False --
+    there are no labelled windows on this path, and the acceptance decision never
+    read them anyway.
+
+    Refuses rather than measures when the data cannot support the claim: a window
+    that is not attested verified-normal is not evidence about false positives, a
+    window built under a different feature schema is not comparable to this model,
+    and a repeated window id would inflate the sample behind the Wilson bound.
+    Scores into no model and activates nothing; it only measures.
+    """
+    expected_hash = scorer.metadata["schema_hash"]
+    expected_version = scorer.metadata["schema_version"]
+    window_ids = [window["id"] for window in windows]
+    duplicates = sorted(str(wid) for wid, count in Counter(window_ids).items() if count > 1)
+    if duplicates:
+        raise MLEvaluationError(f"holdout windows repeat ids, which would inflate the sample: {duplicates}")
+    unverified = [window["id"] for window in windows if not window.get("verified_normal")]
+    if unverified:
+        raise MLEvaluationError(f"holdout windows are not attested verified-normal: {unverified}")
+    incompatible = [
+        window["id"]
+        for window in windows
+        if window.get("schema_hash") != expected_hash or window.get("schema_version") != expected_version
+    ]
+    if incompatible:
+        raise MLEvaluationError(
+            f"holdout windows were built under a different feature schema than the model: {incompatible}"
+        )
+    normal_scores = [scorer.score_features(window["features"]) for window in windows]
+    false_positives = sum(item["is_anomaly"] for item in normal_scores)
+    return {
+        "normal_window_count": len(normal_scores),
+        "normal_window_ids": window_ids,
+        "normal_false_positive_count": false_positives,
+        "normal_false_positive_rate": false_positives / len(normal_scores) if normal_scores else None,
+        "labels_available": False,
+        "model_id": scorer.metadata["id"],
+        "schema_hash": scorer.metadata["schema_hash"],
+        "normal_window_scores": [
+            {"raw_score": item["raw_score"], "normalized_score": item["normalized_score"], "is_anomaly": item["is_anomaly"]}
+            for item in normal_scores
+        ],
+        "acceptance": normal_fpr_acceptance(false_positives, len(normal_scores)),
+    }
