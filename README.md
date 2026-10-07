@@ -355,6 +355,11 @@ inactive. Full detail in [docs/ML_LIFECYCLE.md](docs/ML_LIFECYCLE.md).
   only from a fresh call to the acceptance gate, and drift can append exactly two
   states — `drift_assessed` and `retraining_required`. Drift raises the question; a
   human answers it by training a new model and putting it through the same gate.
+- **The gate shuts something.** `ml/scoring.py` refuses to construct a scorer for a
+  model that is not active, before it reads the artifact, so an ungated model has
+  no scoring path at all — not one whose output a caller is trusted to discard. An
+  inactive model therefore yields a finding byte-identical to one scored with no
+  model configured, provenance hash included.
 
 Run a drift check (read-only unless you pass `--record`):
 

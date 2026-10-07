@@ -16,7 +16,14 @@ class MLScoringError(RuntimeError):
 
 
 class MLScorer:
-    def __init__(self, store: SQLiteEventStore, model_id: str, *, attribute: bool = False):
+    def __init__(
+        self,
+        store: SQLiteEventStore,
+        model_id: str,
+        *,
+        attribute: bool = False,
+        allow_inactive: bool = False,
+    ):
         # Opt-in-within-opt-in: a scorer must be configured *and* attribution
         # enabled. Default-off keeps the shipped payload byte-for-byte unchanged
         # and attribution off the default hot path -- it is advisory metadata an
@@ -30,6 +37,25 @@ class MLScorer:
         # There is no such thing as a constructed scorer without its metadata, and
         # saying so here is what lets a type checker agree.
         self.metadata: dict[str, Any] = metadata
+        # Activation gates scoring, and this is where it is enforced: refusing to
+        # *construct* the scorer means an inactive model has no scoring path at
+        # all, rather than one whose output a caller is trusted to discard. The
+        # activation gate is only a gate if something is actually shut by it.
+        #
+        # `metadata["active"]` only, not the lifecycle state: `ml.scoring` cannot
+        # import `ml.lifecycle` without closing the cycle
+        # `ml.lifecycle -> ml.evaluation -> ml.scoring`. The flag is the right thing
+        # to read anyway -- `storage/sqlite_store.py:activate_ml_model` is the only
+        # writer that can set it, and it already requires both the gate verdict and
+        # a recorded `eligible` state, so the flag *is* that check's conclusion.
+        #
+        # `allow_inactive` is the one legitimate exception, named so it greps:
+        # evaluation must score an inactive model, because scoring it against
+        # holdout windows is how it becomes eligible in the first place. A gate
+        # that refused that would be unsatisfiable. Nothing on the detection path
+        # passes it.
+        if not allow_inactive and self.metadata["active"] is not True:
+            raise MLScoringError("ML model is not active; refusing to construct a scoring path")
         if self.metadata["schema_version"] != SCHEMA_VERSION or self.metadata["schema_hash"] != schema_hash():
             raise MLScoringError("ML model feature schema is incompatible with this runtime")
         # ml/artifact.py owns the verify-then-parse ordering and refuses anything

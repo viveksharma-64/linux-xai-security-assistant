@@ -125,9 +125,19 @@ class DetectionEngine:
         if self.ml_scorer is None:
             return {"available": False, "reason": "no compatible ML model is configured"}
         try:
-            return self.ml_scorer.score(self._window_events(risk, events))
+            payload = self.ml_scorer.score(self._window_events(risk, events))
         except Exception as error:
             return {"available": False, "reason": f"ML scoring unavailable: {error}"}
+        # Belt to `ml/scoring.py`'s braces, which refuses to construct a scorer for
+        # an inactive model at all. This is not the security boundary -- it reads a
+        # field the scorer reports about itself, so it is only as trustworthy as the
+        # scorer -- but it is the check that keeps the *detector* from depending on
+        # someone else's enforcement. An inactive model reads here exactly as a
+        # missing one, so it takes the 3-term deterministic formula and contributes
+        # no evidence row.
+        if payload.get("model_active") is not True:
+            return {"available": False, "reason": "ML model is not active"}
+        return payload
 
     def _fuse_rules(self, results: Sequence[RuleResult]) -> float:
         probability_remaining = 1.0

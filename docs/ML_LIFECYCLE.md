@@ -7,12 +7,15 @@ has stopped looking like the host the model was trained on, and an
 **append-only, hash-chained lifecycle log** that records how a model got from
 trained to trusted and on what evidence.
 
-None of it can activate a model. The activation gate in
-[`ml/evaluation.py`](../ml/evaluation.py) is the only door, it is unchanged, and
-the ML subsystem remains **inactive by default**. Drift and the lifecycle log
-feed that gate's paperwork; they are not a way around it. See
-[docs/NORMAL_CORPUS_PROGRAM.md](NORMAL_CORPUS_PROGRAM.md) for the corpus program
-that builds data up to the bar.
+None of it can activate a model on its own. The activation gate in
+[`ml/evaluation.py`](../ml/evaluation.py) is the only door, its thresholds are
+unchanged, and the ML subsystem remains **inactive by default**. Drift and the
+lifecycle log feed that gate's paperwork; they are not a way around it. And the
+gate now shuts something: [`ml/scoring.py`](../ml/scoring.py) refuses to
+*construct* a scorer for a model that is not active, so an ungated model has no
+scoring path at all rather than one whose output a caller is trusted to discard.
+See [docs/NORMAL_CORPUS_PROGRAM.md](NORMAL_CORPUS_PROGRAM.md) for the corpus
+program that builds data up to the bar.
 
 ## The state path
 
@@ -33,31 +36,49 @@ observations *about* a model, not stages *of* one.
 | `trained` | `record_trained` | An artifact exists, with its schema and training-window provenance. |
 | `evaluated` | `record_evaluated` | Held-out measurement was performed; the numbers are in the row. |
 | `eligible` / `ineligible` | `record_activation_gate` | The gate was called on raw counts and returned this verdict. |
-| `active` | `record_activation` | The gate was satisfied *and* re-checked at the moment of the claim. |
+| `active` | `record_activation` | The gate was satisfied *and* re-checked at the moment of the claim, over a model whose latest state was already `eligible`. Sets `ml_models.active` in the same transaction. |
 | `drift_assessed` | `record_drift_assessment` | A drift check ran. Commits to the assessment it wrote. |
 | `retraining_required` | `record_drift_assessment` | That check found drift. A separate row, so it reads as its own entry. |
-| `drifted` | `record_drifted` | A human's judgment that the model no longer fits its host. |
-| `retired` | `record_retired` | The model is out of service. |
+| `drifted` | `record_drifted` | A human's judgment that the model no longer fits its host. Clears `ml_models.active`. |
+| `retired` | `record_retired` | The model is out of service. Clears `ml_models.active`. |
 
 The current state of a model is the **latest row**, never an edit of an earlier
 one (`current_state`, `lifecycle_report`).
 
-## The log records; it does not decide
+## The log records; the gate decides
 
 This is the load-bearing property of the whole layer, and it is enforced in more
 than one place on purpose:
 
-- **Writing a row causes nothing.** No append flips `ml_models.active`, changes a
-  threshold, or makes a scorer load. There is deliberately **no store method to
-  activate an existing model** — `active` can only be set when a model row is
-  first written — and this track did not add one. The log is a witness, not a
-  control surface.
+- **One door to `active`, with the gate across it.** No append flips
+  `ml_models.active`, changes a threshold, or makes a scorer load.
+  `record_activation` does not set the flag itself; it calls
+  `storage/sqlite_store.py:activate_ml_model`, the gated writer of `active = 1`,
+  which refuses unless the gate grants eligibility over the raw counts *and* the
+  model's own latest recorded state is already `eligible` — so a retired model
+  cannot be re-activated by re-asserting its old numbers. The flag and the row
+  justifying it are written in one transaction, so a model is never active without
+  its justification and never carries the row without the flag.
+
+  This replaces an earlier rule that there was **no store method to activate an
+  existing model**. That rule was absence-as-guarantee, and it made the gate
+  unreachable: `active` could then only be set when a model row was first written,
+  which is before any evaluation could have happened, so the only path to a
+  scoring model went around the gate entirely. What holds now is enforcement, not
+  absence — an *unguarded* setter still does not exist, and
+  `tests/test_ml_lifecycle.py` asserts that it does not.
+
+- **One exception, and it points the safe way.** Appending `retired` or `drifted`
+  *does* stand a model down, clearing `ml_models.active` in the same transaction
+  as the row. The failure mode of a retirement that leaves a model scoring is
+  strictly worse than the failure mode of one that does not.
 - **The gate's verdict cannot be supplied by the caller.** `activation_eligible`
   is set from exactly one thing: a fresh `normal_fpr_acceptance` call made inside
-  `record_activation_gate` / `record_activation` from the raw false-positive and
+  `record_activation_gate` / `activate_ml_model` from the raw false-positive and
   holdout-window counts, tested with `is True` so no truthy stand-in passes for
-  the gate's boolean. `record_activation` re-runs the gate rather than trusting an
-  earlier `eligible` row, and **raises** if it refuses.
+  the gate's boolean. Activation re-runs the gate rather than trusting an earlier
+  `eligible` row, and **raises** if it refuses.
+
 - **Drift cannot log its way to an activation, and a claim is checked against its
   own numbers.** `storage/sqlite_store.py:write_ml_lifecycle_transition`
   independently refuses an `active` row without a gate verdict, refuses any
@@ -297,7 +318,8 @@ GET /api/models/{id}  # provenance, full transition history, gate verdict, lates
 | Artifact → scorer | Two files on disk that used to be arbitrary pickled objects | Checksum verified before parse; JSON + `allow_pickle=False`; no code path at all. Numbers only. |
 | Descriptor → array filename | A filename read out of a not-yet-authenticated document | Bare basename resolved in the descriptor's own directory; traversal is refused before the checksum is known. |
 | Drift inputs → drift result | Model metadata, training windows, a foreign corpus database | Read-only throughout; cannot mutate a model, threshold, or activation state; schema/verification/overlap mismatches are refusals. |
-| Lifecycle log → activation | An append that would like to be a promotion | **One-way: the log records, never causes.** `active` is unreachable from drift; `activation_eligible` requires a fresh gate verdict; no store method activates an existing model. |
+| Lifecycle log → activation | An append that would like to be a promotion | **One gated door.** `active = 1` on an existing model is writable only by `activate_ml_model`, which requires a freshly recomputed gate verdict *and* a latest recorded state of `eligible`; `active` is unreachable from drift; an unguarded setter does not exist. `write_ml_model` can still set the flag when a row is first written. The one-directional exception is `retired`/`drifted`, which stand a model *down*. |
+| Activation state → scoring | A model that never passed the gate, or one stood down | `ml/scoring.py` refuses to construct a scorer unless `active` is `True`, before it reads the artifact; the detector independently drops any payload not reporting `model_active: True`. Enforced at construction, so a mid-run deactivation applies to scorers built after it. |
 | `actor` | A self-reported name (auth has no principal) | Labelled honestly as a claim — and chained, so the claim cannot be altered after the fact. |
 
 ## Out of scope here, on purpose

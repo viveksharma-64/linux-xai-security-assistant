@@ -10,14 +10,17 @@ and a current state cannot testify about how it was reached. So every transition
 appended to `ml_model_lifecycle`, which is hash-chained, so the history cannot be
 rewritten to make a decision look better-founded than it was.
 
-This module records; it does not decide
----------------------------------------
-The lifecycle log is one-way. Writing a row never causes anything: it does not
-flip `ml_models.active`, does not change a threshold, and does not make a scorer
-load. There is deliberately no method anywhere in the store to activate an
-existing model -- `active` can only be set when a model row is first written -- and
-this module does not add one. So the log is a witness, never a control surface,
-and no sequence of appends can arrive at an activation.
+The log records; the gate decides
+---------------------------------
+The lifecycle log is one-way, with one deliberate exception in each direction.
+Writing a row does not change a threshold and does not make a scorer load. No
+append can make a model active: `record_activation` does not flip the flag
+itself, it calls `storage/sqlite_store.py:activate_ml_model`, the gated writer
+of `active = 1`, which refuses unless the gate grants eligibility *and*
+the model's latest recorded state is already `eligible`. In the other direction,
+appending `retired` or `drifted` *does* stand a model down, in the same
+transaction as the row -- because the failure mode of a retirement that leaves a
+model scoring is strictly worse than the failure mode of one that does not.
 
 The gate is the only door
 -------------------------
@@ -175,35 +178,26 @@ def record_activation(
     actor: str | None = None,
 ) -> dict[str, Any]:
     """
-    Record that a model became active, refusing unless the gate says it may.
+    Activate a model, refusing unless the gate and its recorded history both allow it.
 
-    Re-runs the gate rather than trusting the earlier `eligible` row, so the
-    numbers are re-checked at the moment the claim is made and the `active` row
-    carries them itself. Raises `ValueError` if the gate refuses -- unlike the
-    gate row above, an ungated activation claim is not a fact worth recording.
+    Delegates to `storage/sqlite_store.py:activate_ml_model`, which sets
+    `ml_models.active` and appends this row in one transaction. One door, so the
+    flag and the justification for it cannot come apart: there is no way to reach
+    an active model without this row, and no way to write this row without the
+    model becoming active.
 
-    Recording is all this does. Nothing here makes a model active: a model is
-    active only if it was written that way by `write_ml_model`, and the store has
-    no method to change that flag afterwards. This row states, for the audit
-    record, that the gate had been satisfied at that point.
+    The store re-runs the gate over these raw counts rather than trusting the
+    earlier `eligible` row, so the numbers are re-checked at the moment the claim
+    is made and the `active` row carries them itself; it additionally requires the
+    model's latest recorded state to *be* `eligible`, which is what stops a
+    retired model being re-activated by re-asserting its old counts. Raises
+    `ValueError` if either refuses -- unlike the gate row above, an ungated
+    activation claim is not a fact worth recording.
     """
-    acceptance = normal_fpr_acceptance(int(false_positive_count), int(normal_window_count))
-    if acceptance["activation_eligible"] is not True:
-        raise ValueError(
-            "refusing to record activation: activation gate not satisfied "
-            f"({'; '.join(acceptance['reasons'])})"
-        )
-    return store.write_ml_lifecycle_transition(
+    return store.activate_ml_model(
         model_id,
-        "active",
-        reason="model activated after satisfying the activation gate",
-        evidence={
-            "acceptance": acceptance,
-            "false_positive_count": int(false_positive_count),
-            "normal_window_count": int(normal_window_count),
-        },
-        from_state="eligible",
-        activation_eligible=True,
+        false_positive_count=int(false_positive_count),
+        normal_window_count=int(normal_window_count),
         actor=actor,
     )
 
@@ -270,7 +264,9 @@ def record_drifted(
     Record an operator's judgment that a model is no longer fit for its host.
 
     Distinct from `retraining_required`, which drift writes on its own: this is a
-    human conclusion, and `actor` is the claim about who reached it.
+    human conclusion, and `actor` is the claim about who reached it. The store
+    clears `ml_models.active` in the same transaction, so a model judged unfit
+    stops influencing findings as of this row.
     """
     return store.write_ml_lifecycle_transition(
         model_id, "drifted", reason=reason, evidence=dict(evidence or {}), actor=actor
@@ -291,7 +287,9 @@ def record_retired(
     Retirement is a log entry, not a deletion: the artifact, its training window
     provenance, and every finding it contributed to stay exactly where they are.
     A retired model that scored a finding last month must still be explainable
-    next month.
+    next month. What it does stop is new scoring: the store clears
+    `ml_models.active` in the same transaction, and reaching `active` again means
+    going back through the gate.
     """
     return store.write_ml_lifecycle_transition(
         model_id, "retired", reason=reason, evidence=dict(evidence or {}), actor=actor

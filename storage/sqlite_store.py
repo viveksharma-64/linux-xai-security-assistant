@@ -715,6 +715,128 @@ class SQLiteEventStore(EventStore):
             record["active"] = bool(record["active"])
         return records
 
+    def activate_ml_model(
+        self,
+        model_id: str,
+        *,
+        false_positive_count: int,
+        normal_window_count: int,
+        actor: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        The only path that sets `ml_models.active` to 1 on an existing model, and the
+        only one with the gate across it. `write_ml_model` can still set the flag when
+        a row is first written, which is a separate door this does not close.
+
+        This replaces an earlier invariant reading "there is deliberately no store
+        method to activate an existing model". That rule was absence-as-guarantee,
+        and it made the activation gate **unreachable**: `active` could only be set
+        at INSERT by `write_ml_model`, and a model cannot be evaluated before its
+        row exists -- so the only route to `active = 1` that an evaluated model
+        could take ran through `train_isolation_forest(activate=True)`, which takes
+        no measurement and consults no gate. An unsatisfiable-in-principle gate
+        protects nothing. What this adds is enforcement rather than absence -- one
+        gated writer, behind three conditions.
+
+        1. **The gate must grant eligibility**, re-run here over the raw counts.
+           Raw counts rather than a caller-supplied verdict, for the same reason
+           `ml/lifecycle.py` takes raw counts: a caller who could hand over the
+           verdict could hand over the answer it wanted.
+        2. **The model row must exist.** An activation claim about a model that was
+           never written is not a claim worth recording.
+        3. **The model's latest lifecycle state must be `eligible`.** This is what
+           makes the log load-bearing rather than decorative -- the recorded
+           history of the measurement is a precondition of acting on it, not a
+           commentary on it. A model that was activated and later retired cannot be
+           re-activated by re-asserting its old counts; it goes through the gate
+           again. `drift_assessed` rows are skipped, matching
+           `ml/lifecycle.py:current_state`, so a routine drift check does not block
+           an activation; that state is re-expressed as SQL here rather than
+           calling `read_ml_lifecycle`, because this runs inside a transaction and
+           `_transaction` is not reentrant.
+
+        At most one model is active at a time, so activating one stands down
+        whichever was active before. The flag, the stand-down, and the chained
+        lifecycle row are one transaction under the chain lock: a model is never
+        active without the row saying why, and never carries the row without the
+        flag.
+        """
+        from ml.evaluation import normal_fpr_acceptance
+
+        acceptance = normal_fpr_acceptance(int(false_positive_count), int(normal_window_count))
+        if acceptance["activation_eligible"] is not True:
+            raise ValueError(
+                "refusing to activate: activation gate not satisfied "
+                f"({'; '.join(acceptance['reasons'])})"
+            )
+        evidence = {
+            "acceptance": acceptance,
+            "false_positive_count": int(false_positive_count),
+            "normal_window_count": int(normal_window_count),
+        }
+        # Same content check every other eligibility claim passes through. It
+        # cannot fail for the dict just built above; running it anyway keeps one
+        # enforcement path rather than a second, privileged one.
+        self._require_activation_gate_verdict(evidence)
+        created_at = time.time()
+
+        with self._chain_lock:
+            with self._transaction() as conn:
+                if conn.execute("SELECT 1 FROM ml_models WHERE id = ?", (model_id,)).fetchone() is None:
+                    raise ValueError(f"refusing to activate: no such ML model: {model_id!r}")
+                latest = conn.execute(
+                    "SELECT to_state FROM ml_model_lifecycle WHERE model_id = ? "
+                    "AND to_state != 'drift_assessed' ORDER BY chain_seq DESC, id DESC LIMIT 1",
+                    (model_id,),
+                ).fetchone()
+                state = latest["to_state"] if latest is not None else None
+                if state != "eligible":
+                    raise ValueError(
+                        "refusing to activate: the model's latest lifecycle state must be "
+                        f"'eligible', not {state!r}"
+                    )
+                conn.execute("UPDATE ml_models SET active = 0 WHERE active = 1")
+                conn.execute("UPDATE ml_models SET active = 1 WHERE id = ?", (model_id,))
+                row_id = self._insert_ml_lifecycle(
+                    conn, model_id, "active", "eligible",
+                    "model activated after satisfying the activation gate",
+                    evidence, True, actor, created_at,
+                )
+                return self._decode_ml_lifecycle_row(
+                    conn.execute("SELECT * FROM ml_model_lifecycle WHERE id = ?", (row_id,)).fetchone()
+                )
+
+    def deactivate_ml_model(self, model_id: str) -> bool:
+        """
+        Stand one model down. Returns whether it had been active.
+
+        The counterpart asymmetry to `activate_ml_model`: activation is gated and
+        refuses on any doubt, deactivation is ungated and always permitted. Standing
+        a model down can only ever remove ML influence from a fused score, so the
+        safe failure mode is for it to be easy -- an operator who suspects a model
+        should not have to satisfy a precondition to silence it. Idempotent, and
+        silent about unknown ids, so it is safe to call on an uncertain state.
+
+        It cannot activate: the value written is the literal `0`.
+        """
+        with self._transaction() as conn:
+            return self._set_ml_model_inactive(conn, model_id)
+
+    @staticmethod
+    def _set_ml_model_inactive(conn: sqlite3.Connection, model_id: str) -> bool:
+        """
+        The single place `ml_models.active` is cleared, so the literal `0` lives once.
+
+        Shared by `deactivate_ml_model` and by the `retired`/`drifted` branch of
+        `write_ml_lifecycle_transition`, which needs the clear inside its own
+        transaction and therefore cannot call the public method (`_transaction` is
+        not reentrant).
+        """
+        cursor = conn.execute(
+            "UPDATE ml_models SET active = 0 WHERE id = ? AND active = 1", (model_id,)
+        )
+        return cursor.rowcount > 0
+
     def write_ml_lifecycle_transition(
         self,
         model_id: str,
@@ -751,6 +873,15 @@ class SQLiteEventStore(EventStore):
         holds for every writer, including a future one. The state checks run before
         the content check: "this state may never claim eligibility at all" is the
         more fundamental refusal, and it is the more useful error to surface.
+
+        One append does have an effect, and it is one-directional: `retired` and
+        `drifted` clear `ml_models.active` in this same transaction. No append can
+        make a model active -- `activate_ml_model` is the only door, and it requires
+        a gate verdict and a recorded `eligible` state -- but an append that says a
+        model is out of service stands it down. Doing it here rather than in
+        `ml/lifecycle.py` makes it atomic with the chain extension and impossible
+        for a future caller to forget: there is no way to log a retirement and
+        leave the model scoring.
         """
         if to_state not in _ML_LIFECYCLE_STATES:
             raise ValueError(f"unknown ML lifecycle state: {to_state!r}")
@@ -773,6 +904,8 @@ class SQLiteEventStore(EventStore):
                     conn, model_id, to_state, from_state, reason, payload,
                     activation_eligible, actor, created_at,
                 )
+                if to_state in ("retired", "drifted"):
+                    self._set_ml_model_inactive(conn, model_id)
                 return self._decode_ml_lifecycle_row(
                     conn.execute("SELECT * FROM ml_model_lifecycle WHERE id = ?", (row_id,)).fetchone()
                 )

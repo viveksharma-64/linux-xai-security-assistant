@@ -5,7 +5,14 @@ import pytest
 from detection.detector import DetectionEngine
 from explainability.explainer import FindingExplainer
 from ml.evaluation import MIN_NORMAL_HOLDOUT_WINDOWS, evaluate_threshold, normal_fpr_acceptance
+from ml.artifact import load_artifact
 from ml.feature_schema import FEATURE_NAMES, extract_features, feature_vector, schema_hash
+from ml.lifecycle import (
+    record_activation,
+    record_activation_gate,
+    record_evaluated,
+    record_trained,
+)
 from ml.scoring import MLScorer, MLScoringError
 from ml.training import (
     SKLEARN_AVAILABLE,
@@ -60,6 +67,47 @@ def _trained(tmp_path):
     return store, dataset_id, metadata
 
 
+# Counts that clear the activation gate, supplied by the fixture below.
+_GATE_COUNTS = {"false_positive_count": 0, "normal_window_count": MIN_NORMAL_HOLDOUT_WINDOWS}
+
+
+def _activated(tmp_path):
+    """
+    A trained model walked through the lifecycle to `active`, which scoring requires.
+
+    A sibling of `_trained` rather than a change to it, because trained and active
+    are different states and several tests need the first: evaluation scores an
+    inactive model by design, and
+    `test_training_persists_immutable_provenance_and_checksum` asserts that
+    training alone leaves the flag false.
+
+    The counts handed to the gate are **supplied, not measured.** This fixture
+    trains on ten windows and the gate's floor is sixty independent verified-normal
+    *holdout* windows, so nothing in this file could clear the gate on its own
+    measurements -- these numbers exist to reach the state the scorer requires, and
+    are not evidence that this model would qualify on a host. The `evaluated` row
+    carries the same supplied numbers so the recorded history is at least
+    self-consistent.
+    """
+    store, dataset_id, metadata = _trained(tmp_path)
+    record_trained(store, metadata)
+    record_evaluated(store, metadata["id"], {
+        "normal_window_count": MIN_NORMAL_HOLDOUT_WINDOWS,
+        "normal_false_positive_count": 0,
+        "normal_false_positive_rate": 0.0,
+        "labels_available": False,
+        "confusion_matrix": None,
+    })
+    record_activation_gate(store, metadata["id"], **_GATE_COUNTS)
+    record_activation(store, metadata["id"], **_GATE_COUNTS)
+    return store, dataset_id, metadata
+
+
+def _risk():
+    return {"id": 7, "window_start": 100.0, "window_end": 110.0, "entity_type": "command", "entity_key": "python3", "anomaly_score": 0.7,
+            "contributing_features": {"execution_frequency": 1, "unique_commands": 1, "unique_uids": 1, "burst_activity": {"peak_execs_per_second": 1}}, "explanation": "deterministic behavior risk", "mode": "monitoring"}
+
+
 def test_named_feature_schema_is_deterministic_and_complete():
     events = _normal_windows()[0]
     assert extract_features(events) == extract_features(list(reversed(events)))
@@ -94,7 +142,7 @@ def test_training_persists_immutable_provenance_and_checksum(tmp_path):
 
 
 def test_schema_checked_scoring_is_deterministic_and_detects_corruption(tmp_path):
-    store, _, metadata = _trained(tmp_path)
+    store, _, metadata = _activated(tmp_path)
     scorer = MLScorer(store, metadata["id"])
     first = scorer.score(_normal_windows()[0])
     second = scorer.score(list(reversed(_normal_windows()[0])))
@@ -108,7 +156,11 @@ def test_schema_checked_scoring_is_deterministic_and_detects_corruption(tmp_path
 
 def test_evaluation_reports_normal_fpr_and_only_labeled_metrics_when_available(tmp_path):
     store, _, metadata = _trained(tmp_path)
-    scorer = MLScorer(store, metadata["id"])
+    # The documented exception to the activation gate, and the reason it has one:
+    # evaluating a model is how it becomes eligible, so evaluation necessarily
+    # scores a model that is not yet active. A gate that refused this would be
+    # unsatisfiable. Nothing on the detection path passes `allow_inactive`.
+    scorer = MLScorer(store, metadata["id"], allow_inactive=True)
     unlabeled = evaluate_threshold(scorer, _normal_windows())
     assert unlabeled["labels_available"] is False and "precision" not in unlabeled
     assert unlabeled["acceptance"]["activation_eligible"] is False
@@ -125,7 +177,7 @@ def test_fpr_acceptance_keeps_small_or_over_threshold_evaluations_inactive():
 
 
 def test_detection_and_explanation_include_ml_as_additive_evidence(tmp_path):
-    store, _, metadata = _trained(tmp_path)
+    store, _, metadata = _activated(tmp_path)
     scorer = MLScorer(store, metadata["id"])
     risk = {"id": 7, "window_start": 100.0, "window_end": 110.0, "entity_type": "command", "entity_key": "python3", "anomaly_score": 0.7,
             "contributing_features": {"execution_frequency": 1, "unique_commands": 1, "unique_uids": 1, "burst_activity": {"peak_execs_per_second": 1}}, "explanation": "deterministic behavior risk", "mode": "monitoring"}
@@ -141,7 +193,7 @@ def test_ml_attribution_opt_in_flows_to_finding_and_explanation(tmp_path):
     # With attribution enabled the same payload the detector passes through verbatim
     # now carries the model-faithful decomposition, and the explainer's existing
     # FACT factor surfaces it -- no new signal, no detector change.
-    store, _, metadata = _trained(tmp_path)
+    store, _, metadata = _activated(tmp_path)
     scorer = MLScorer(store, metadata["id"], attribute=True)
     risk = {"id": 7, "window_start": 100.0, "window_end": 110.0, "entity_type": "command", "entity_key": "python3", "anomaly_score": 0.7,
             "contributing_features": {"execution_frequency": 1, "unique_commands": 1, "unique_uids": 1, "burst_activity": {"peak_execs_per_second": 1}}, "explanation": "deterministic behavior risk", "mode": "monitoring"}
@@ -162,7 +214,7 @@ def test_default_scorer_omits_attribution_from_payload_and_factor(tmp_path):
     # Regression guard on the default path: a scorer built without attribute=True
     # adds no attribution key to the score payload, so the finding and the
     # explanation factor are byte-for-byte what they were before this track.
-    store, _, metadata = _trained(tmp_path)
+    store, _, metadata = _activated(tmp_path)
     scorer = MLScorer(store, metadata["id"])
     assert "attribution" not in scorer.score(_normal_windows()[0])
     risk = {"id": 7, "window_start": 100.0, "window_end": 110.0, "entity_type": "command", "entity_key": "python3", "anomaly_score": 0.7,
@@ -194,3 +246,71 @@ def test_ml_failure_falls_back_to_deterministic_detection(tmp_path):
     finding = DetectionEngine(store, ml_scorer=BrokenScorer()).detect([risk], [_event(1.5, comm="nc")], persist=False)["findings"][0]
     assert "ml_anomaly" not in [item["signal"] for item in finding["evidence"]]
     assert finding["fusion_formula"] == "min(1, 0.50 * behavior_score + 0.35 * rule_score + 0.15 * context_score)"
+
+
+# --- activation gates scoring ---
+
+
+def test_scorer_refuses_an_inactive_model(tmp_path):
+    # The gate is only a gate if something is shut by it. A trained-but-not-yet-
+    # activated model has no scoring path at all -- not one whose output a caller is
+    # trusted to discard.
+    store, _, metadata = _trained(tmp_path)
+    assert store.read_ml_model(metadata["id"])["active"] is False
+    with pytest.raises(MLScoringError, match="not active"):
+        MLScorer(store, metadata["id"])
+    # The named exception still works, so evaluation remains possible.
+    assert MLScorer(store, metadata["id"], allow_inactive=True).score(_normal_windows()[0])["available"] is True
+    # Refused before any filesystem I/O: with the artifact gone, a check ordered
+    # after `load_artifact` would report a missing or unverifiable artifact
+    # instead. The activation refusal does not depend on the artifact being
+    # readable, which is what makes it a cheap, unconditional first gate.
+    Path(metadata["artifact_path"]).unlink()
+    with pytest.raises(MLScoringError, match="not active"):
+        MLScorer(store, metadata["id"])
+
+
+def test_inactive_model_does_not_influence_the_fused_score(tmp_path):
+    # The detector's own check, exercised through the one construction that can
+    # reach it: `allow_inactive=True` yields a scorer whose payload reports
+    # `model_active: False`. An inactive model must then read exactly as a missing
+    # one -- not merely "close", but the same finding, including the provenance
+    # hash that is the finding's identity.
+    store, _, metadata = _trained(tmp_path)
+    scorer = MLScorer(store, metadata["id"], allow_inactive=True)
+    events = _normal_windows()[0]
+    with_inactive = DetectionEngine(store, ml_scorer=scorer).detect([_risk()], events, persist=False)["findings"][0]
+    without_ml = DetectionEngine(store).detect([_risk()], events, persist=False)["findings"][0]
+    assert [item["signal"] for item in with_inactive["evidence"]] == ["behavior_anomaly", "rule_fusion", "process_context"]
+    assert with_inactive["fusion_formula"] == "min(1, 0.50 * behavior_score + 0.35 * rule_score + 0.15 * context_score)"
+    assert with_inactive["risk_score"] == without_ml["risk_score"]
+    assert with_inactive["provenance_hash"] == without_ml["provenance_hash"]
+
+
+def test_explanation_reconstructs_the_score_without_ml(tmp_path):
+    # Detector and explainer have to drop ML on the same condition or the
+    # explainer's reconciliation raises. Pinned here because the two branch on
+    # different things: the detector on `model_active`, the explainer on whether an
+    # `ml_anomaly` evidence row is present.
+    store, _, metadata = _trained(tmp_path)
+    scorer = MLScorer(store, metadata["id"], allow_inactive=True)
+    finding = DetectionEngine(store, ml_scorer=scorer).detect([_risk()], _normal_windows()[0])["findings"][0]
+    explanation = FindingExplainer(store).explain_finding(finding)
+    assert explanation["calculation"]["inputs"]["ml_score"] is None
+    assert explanation["calculation"]["formula"] == "min(1, 0.50 * behavior_score + 0.35 * rule_score + 0.15 * context_score)"
+    assert not any(item["factor"] == "ml_anomaly_evidence" for item in explanation["contributing_factors"])
+
+
+def test_deactivation_takes_effect_for_scorers_constructed_after_it(tmp_path):
+    # A documented boundary, asserted rather than implied: `MLScorer.metadata` is a
+    # construction-time snapshot, so deactivating a model does not reach into a
+    # scorer that already exists. Enforcement is at construction. An operator
+    # standing a model down stops it being loaded again; it does not interrupt a
+    # detection run already holding it.
+    store, _, metadata = _activated(tmp_path)
+    scorer = MLScorer(store, metadata["id"])
+    assert store.deactivate_ml_model(metadata["id"]) is True
+    assert store.read_ml_model(metadata["id"])["active"] is False
+    assert scorer.score(_normal_windows()[0])["model_active"] is True  # the snapshot, not the row
+    with pytest.raises(MLScoringError, match="not active"):
+        MLScorer(store, metadata["id"])
