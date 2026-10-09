@@ -122,7 +122,7 @@ where BCC cannot attach — which makes it the source to check first when
 
 ## Retention runs in-process
 
-There is deliberately **no `.timer` unit.** Age pruning, the byte cap, and the
+Retention deliberately has **no `.timer` unit.** Age pruning, the byte cap, and the
 periodic `VACUUM` all run inside the ingest process on a timer driven by config
 (`retention_*` keys). This is one fewer moving part to drift out of sync with the
 service, and it means retention keeps running exactly as long as ingestion does.
@@ -142,6 +142,159 @@ evidence sits permanently over budget. Findings are rare next to events, so the
 growth is slow in practice — but it is growth with no ceiling. If you need a
 hard limit, archive the database and start a new chain rather than deleting
 rows from it.
+
+## Optional: capturing normal-behaviour windows (one per login session)
+
+This is **not** part of a serving deployment. It is the collection half of
+`docs/NORMAL_CORPUS_PROGRAM.md`: the ML activation gate in `ml/evaluation.py`
+requires 60 *independent* verified-normal holdout windows, and independent means a
+distinct login session — not consecutive slices of one long idle capture. Install it
+only on a host whose everyday behaviour you intend to contribute to the corpus.
+
+Two files implement it, plus a read-only verifier:
+
+| File | Role |
+|------|------|
+| `deploy/systemd/linux-xai-normal-capture.timer` | `OnBootSec=15min` + `OnUnitActiveSec=20min` + jitter — **polls** for uncaptured sessions |
+| `deploy/systemd/linux-xai-normal-capture.service` | `Type=oneshot`; runs `scripts/capture_normal_window.sh` |
+| `scripts/verify_capture_boot.py` | Read-only check that a capture is one login session the corpus has not already used |
+
+Install step 5's `linux-xai-*.service` glob copies the service but **silently does
+not match a `.timer`**. Copy both explicitly:
+
+```bash
+sudo cp deploy/systemd/linux-xai-normal-capture.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+# Enable the TIMER, not the service: the service has no [Install] section on
+# purpose, so the timer is the only thing that activates a capture.
+sudo systemctl enable --now linux-xai-normal-capture.timer
+sudo systemctl list-timers linux-xai-normal-capture.timer
+```
+
+### Why one capture per login session
+
+The unit of independence is a *session of use*, not an interval. A wall-clock timer
+on its own guarantees only that windows do not *overlap*: on a host with a month of
+uptime, six fires a day is 180 captures from one boot — precisely the defect that
+made the August 2026 corpus unusable. One capture per *boot* is the strictest fix,
+but it prices 60 windows at 60 reboots, which is not a program anyone finishes.
+
+So the identity is the pair `(boot_id, session_id)`, where `session_id` is the
+logind session the host is being used from. logind renumbers sessions from 1 after
+every reboot, so the session id alone is not unique. Each capture is named
+`normal-<boot_id>-s<session_id>.db`, which makes "already captured this session" a
+file-existence check, and the same pair is stamped into every event row (migration
+11) so `verify_capture_boot.py` checks the claim from the data rather than from the
+filename. The timer can therefore poll: the wrapper refuses to capture a session it
+has already captured, so the number of captures cannot exceed the number of logins
+however often the unit fires, and a manual `systemctl start` inside an
+already-captured session is a no-op. A typical desktop day yields several sessions,
+which is why 60 windows now costs roughly 6–9 boots.
+
+Same-boot sessions are a **weaker** independence claim than distinct boots — they
+share the kernel, page cache, and long-running daemons. That trade-off, and what to
+do about it, is written down in `docs/NORMAL_CORPUS_PROGRAM.md`.
+
+A fire that finds nobody logged in — or two live sessions and no way to tell which
+one to attribute the window to — exits **75** (`EX_TEMPFAIL`), and the service maps
+that to success with `SuccessExitStatus=75`. Without that, an idle host sitting at
+its login screen would mark the unit failed every 20 minutes and bury any real
+failure in the noise. Genuine refusals (a malformed session id, a session logind
+cannot corroborate, a non-user session, a capture that died) still exit 1 and still
+fail the unit, so `systemctl status` remains meaningful.
+
+Two knobs matter if you change the window length: `CAPTURE_SECONDS` in the unit, and
+`TimeoutStartSec=`, which for `Type=oneshot` bounds the whole of `ExecStart` and
+defaults to **90 s**. Left at the default it would truncate every 305 s window
+without reporting a failure. Keep it comfortably above `CAPTURE_SECONDS`.
+
+One sandbox constraint is specific to this unit: the wrapper resolves the session by
+reading `/run/systemd/sessions/`, so any directive that hides or empties `/run`
+(`PrivateUsers=`, a `RestrictFileSystems=` allowlist, a `TemporaryFileSystem=` over
+`/run`) makes every fire exit 75 and the corpus silently stops growing.
+`ProtectSystem=strict` is fine: it only makes `/run` read-only.
+
+### Where captures land
+
+`StateDirectory=linux-xai-captures` creates `/var/lib/linux-xai-captures` as
+`linux-xai`, `0700`, with `pending/` and `promoted/` beneath it and the databases
+themselves `0600`. This is deliberately **not** the ingest service's state
+directory: these are candidate corpus captures under review, not evidence, and no
+running component reads them.
+
+Do not reconfigure `CAPTURE_DIR` into `/tmp` — the first holdout capture of this
+program was lost to exactly that — and not into a home directory either, since
+`ProtectHome=yes` makes it unwritable. A capture that crashes leaves a
+`normal-<boot_id>-s<session_id>.db.partial` behind and never claims the session's
+slot, so a leftover `.partial` is the signal that a window failed; nothing
+promotable is produced.
+
+Alongside each database is a `.manifest.json` snapshot of logind's record for that
+session — login wall-clock, seat, VT, session type and class. It is written *before*
+the capture starts, because logind discards session records at reboot and the
+session can end while the window is still running. That file is what makes the
+independence claim reviewable a week later; `collect_normal_window.py` folds it into
+the promoted window's immutable `collector_context`.
+
+### Reviewing and promoting a capture
+
+Nothing is automatic. The unit captures and stops: it never promotes, never writes
+to the corpus database, and never touches the gate. `collect_normal_window.py`
+refuses to write without `--i-verified-normal` because `verified_normal` is an
+operator attestation of human review, which is what keeps a timer from approving
+its own training data.
+
+```bash
+cd /opt/linux-xai-security
+CAPS=/var/lib/linux-xai-captures
+
+# 1. Independence: one login session, non-empty, and a (boot_id, session_id) pair
+#    no promoted capture already used. Pass every pending capture at once so
+#    duplicates *within* the batch are caught too, not just against promoted/.
+sudo .venv/bin/python scripts/verify_capture_boot.py \
+    $CAPS/pending/normal-*.db --against $CAPS/promoted
+
+# 2. Normality: a PASS above says nothing about whether the window is benign.
+#    Inspect what the window actually contains before attesting to it.
+sudo .venv/bin/python scripts/collect_normal_window.py \
+    --source $CAPS/pending/normal-<boot_id>-s<session_id>.db --dry-run
+
+# 3. Promote. --role is a property of the DATASET, so set it on the creation call;
+#    passing --role to a later --dataset-id append records context and nothing more.
+sudo .venv/bin/python scripts/collect_normal_window.py \
+    --source $CAPS/pending/normal-<boot_id>-s<session_id>.db \
+    --dataset-db $CAPS/corpus.db \
+    --dataset-name "kali-desktop-holdout" --role holdout \
+    --operator "$USER" --reason "idle desktop, reviewed" \
+    --i-verified-normal
+
+# 4. Record the decision by moving the capture and its manifest together, so the
+#    one-per-session guard and the verifier's --against set both stay accurate.
+sudo mv $CAPS/pending/normal-<boot_id>-s<session_id>.db* $CAPS/promoted/
+
+# 5. Progress against the gate.
+sudo .venv/bin/python scripts/corpus_status.py --dataset-db $CAPS/corpus.db
+```
+
+Append every later window to that same dataset with `--dataset-id`; creating a
+second holdout dataset splits the count the gate reads. Promotion refuses a
+`(boot_id, session_id)` pair already promoted *anywhere in that corpus database*
+(exit status 4), whatever role either dataset carries and including on the
+`--dataset-name` path that creates a dataset. That rules out re-promoting a
+capture, slicing one session into two windows with `--window-start`/`--window-end`,
+and promoting one session into both a training and a holdout dataset — the last of
+which `scripts/ml_train_and_evaluate.py` cannot catch for you, because it compares
+window content byte-for-byte and two differently-bounded windows over one session
+do not match. Within a single dataset, training windows may still repeat a session;
+they are not counted as independent trials.
+
+The scope is one `--dataset-db` file, which is what the gate counts and what
+`corpus_status.py` measures. A deliberately separate corpus — a second experiment,
+a re-run from scratch — is a separate file and is not adjudicated against this one.
+
+A capture you decide against should be deleted rather than moved to `promoted/`.
+Deleting it frees that session's slot, but the session itself is over, so the next
+fire will simply find a different session or nothing at all.
 
 ## Verifying a deployment
 

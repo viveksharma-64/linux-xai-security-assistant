@@ -114,8 +114,9 @@ Wilson bound over 60 correlated slices of one boot is not 60 observations of
 "the scorer is quiet." A holdout window qualifies as independent when it differs
 from the training set and from other holdout windows in a way that matters:
 
-- **Distinct boot/session** — not consecutive windows carved from one long idle
-  capture.
+- **Distinct login session** — the identity is the pair `(boot_id, session_id)`,
+  stamped on every event row by migration 11. Not consecutive windows carved
+  from one long idle capture, and not one session promoted twice.
 - **Non-overlapping time** — disjoint wall-clock spans; no shared events (the
   stored `event_ids` make overlap auditable).
 - **Held out from training** — a window used to build a candidate model is never
@@ -124,6 +125,59 @@ from the training set and from other holdout windows in a way that matters:
 - **Representative spread** — ideally different days / workloads / machines, so
   the holdout exercises the scorer across the range of "normal," not one
   narrow slice.
+
+### Why the unit is a login session, and what that costs
+
+The strictest reading of the first criterion is one window per *boot*, which
+prices 60 windows at 60 reboots. That is not a program anyone finishes, so the
+unit of independence is the next-finest thing a desktop genuinely produces
+several of per boot: a **login session**, each one a separate decision to sit
+down and use the machine. A typical day yields several, which brings 60 windows
+down to roughly 6–9 boots.
+
+This is an honest weakening and worth stating plainly. Two sessions on one boot
+share things two boots do not: the same kernel and loaded modules, a warm page
+cache, the same long-running daemons with the same accumulated state, the same
+uptime-driven timer phase, and the same thermal and load history. Scorer
+behaviour across them is therefore **correlated**, while the Wilson bound in
+`ml/evaluation.py` assumes independent trials. The bound is unchanged — 60
+windows, one-sided 95% upper ≤5%, which at n=60 tolerates exactly zero false
+positives — so what shrinks is not the arithmetic but how much each window's
+"quiet" is really worth. A clean run over 60 same-boot sessions is weaker
+evidence than a clean run over 60 boots.
+
+Two things keep that from collapsing into the August 2026 failure, where 25
+consecutive captures came from a single 2h17m uptime:
+
+1. **Structural one-per-session enforcement.** `capture_normal_window.sh` will
+   not take a second capture of a `(boot_id, session_id)` pair it has already
+   captured, and `collect_normal_window.py` refuses to promote a `holdout`
+   window whose capture has no single attributable session or spans more than
+   one session, and refuses any window — either role, including on the
+   `--dataset-name` path that creates a dataset — whose pair has already been
+   promoted anywhere in that corpus database (exit status 4). Slicing one
+   session into two windows with `--window-start`/`--window-end` hits the same
+   refusal. So the window count cannot exceed the login count, and a session
+   cannot sit in a training dataset and a holdout dataset at once — which would
+   break **Held out from training** above while leaving every window distinct,
+   so the byte-for-byte overlap check in `scripts/ml_train_and_evaluate.py`
+   would not see it. Within one dataset training windows may still repeat a
+   session, because they are not counted as independent trials.
+2. **Spread, deliberately.** The **Representative spread** criterion above does
+   the work the per-window independence no longer does on its own. 6–9 boots ×
+   10–12 sessions is a far better-conditioned holdout than 60 sessions of one
+   uptime, and the collection target should be read as "spread across at least
+   6 boots," not "60 sessions by whatever route is quickest."
+
+Independence stays **auditable** rather than assumed: each promoted window's
+immutable `collector_context` carries `session_provenance` — the resolved pair,
+the per-session event counts the capture actually contained, and a snapshot of
+logind's record for that session including `REALTIME`, the login wall-clock in
+microseconds. That last field is what shows two same-boot windows came from
+sessions that did not overlap, and it survives the reboot that erases logind's
+own copy. Because `collector_context` is covered by the window's
+`immutable_hash`, a later reviewer can recompute the digest and know the
+provenance has not been edited to fit the claim.
 
 Independence is a **judgement recorded by the collection program**, not a
 property this program's counter can prove. `corpus_status.py` counts holdout
@@ -250,3 +304,11 @@ above; they are candidates, not pre-approved data.
    active model.
 
 The corpus grows to meet the bar. The bar does not move.
+
+## Model A non-overlap
+
+The offline Model A syscall-behavior dataset pipeline is separate from this
+program. ADFA-LD, DongTing, LID-DS, and any Model A-derived manifest or feature
+output cannot enter `ml_datasets`, cannot be attested through this program, and
+cannot satisfy the live-Kali verified-normal activation gate. See
+[`MODEL_A_DATASET.md`](MODEL_A_DATASET.md).

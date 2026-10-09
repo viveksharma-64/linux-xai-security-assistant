@@ -34,16 +34,29 @@ against `journalctl --list-boots` when reconstructing an incident. Hashing it
 would destroy that correlation to protect a value that is already readable by
 anyone who can read `/proc`.
 
-Everything here fails soft. A container with no `/etc/machine-id`, or a kernel
-that does not export a boot id, must degrade to "identity unknown" rather than
-stop ingestion: losing telemetry is a worse outcome than recording it with an
-incomplete provenance field, and a null is honest about what is not known.
+`session_id` names the *login session* -- logind's, as `XDG_SESSION_ID` reports
+it -- and exists for the verified-normal corpus rather than for incident
+reconstruction. The activation gate wants 60 independent holdout windows, and
+"independent" has to be decidable from the stored rows; boot_id alone forces one
+window per reboot. Login sessions are the finer unit of independence a desktop
+actually produces several of per boot. It is only meaningful paired with
+boot_id: logind numbers sessions from 1 again after every reboot, so the tuple
+`(boot_id, session_id)` is the identity, and `session_id` on its own is not.
+
+Everything here fails soft. A container with no `/etc/machine-id`, a kernel that
+does not export a boot id, or a daemon that belongs to no login session must
+degrade to "identity unknown" rather than stop ingestion: losing telemetry is a
+worse outcome than recording it with an incomplete provenance field, and a null
+is honest about what is not known. Callers that *need* identity -- the capture
+wrapper, which must not record an unattributable window -- enforce that
+themselves; see `scripts/capture_normal_window.sh`.
 """
 
 import hashlib
 import hmac
 import logging
 import os
+import re
 import uuid
 from functools import lru_cache
 
@@ -64,6 +77,23 @@ _HOST_ID_CONTEXT = b"linux-xai-security-assistant/host-id/v1"
 _HOST_ID_LENGTH = 32
 
 AGENT_ID_ENV = "SECURITY_AGENT_ID"
+
+# How a caller declares which login session it is observing, and how
+# `scripts/capture_normal_window.sh` hands the session it resolved down into the
+# ingestion process it starts.
+SESSION_ID_ENV = "SECURITY_SESSION_ID"
+
+# What logind exports into every session's environment. pam_systemd(8) sets it,
+# so it is present for an interactive login and absent for a system service --
+# which is exactly the distinction this field needs to make.
+XDG_SESSION_ID_ENV = "XDG_SESSION_ID"
+
+# logind session ids are short and opaque: "2" for a normal login, "c1" for a
+# greeter. Anything outside this shape is a misconfigured environment rather
+# than a session, and storing it would be worse than storing nothing --
+# `scripts/verify_capture_boot.py` keys holdout independence on this value, so a
+# junk id is a false independence claim.
+_SESSION_ID_PATTERN = re.compile(r"\A[A-Za-z0-9_-]{1,32}\Z")
 
 
 def _read_first_line(path: str) -> str | None:
@@ -130,6 +160,55 @@ def agent_id() -> str:
     return configured or str(uuid.uuid4())
 
 
+def _validate_session_id(raw: str | None, source: str) -> str | None:
+    """Accept a session id only if it has logind's shape; see `_SESSION_ID_PATTERN`."""
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    if not _SESSION_ID_PATTERN.match(value):
+        LOGGER.warning(
+            "ignoring malformed login session id from %s: %r; events will be "
+            "recorded without a session_id",
+            source,
+            value[:64],
+        )
+        return None
+    return value
+
+
+@lru_cache(maxsize=1)
+def session_id() -> str | None:
+    """
+    Identifier of the login session being observed, or None if there is not one.
+
+    Read from the environment and nowhere else, which is the load-bearing
+    decision here. logind can be *asked* which session is currently active on a
+    seat, and using that would be wrong for the process that stamps most events:
+    `linux-xai-ingest.service` is a long-running system service that belongs to
+    no login session, so "the active session when I started" is a value that is
+    already a guess, goes stale the moment that user logs out, and then
+    mislabels every subsequent event for the rest of the service's lifetime.
+    Declining to answer is the honest result, and a NULL `session_id` simply
+    means the row is not usable as evidence of an independent login session --
+    which is true.
+
+    So the two sources are both declarations rather than inferences:
+    `SECURITY_SESSION_ID` for a caller that resolved a session deliberately
+    (`scripts/capture_normal_window.sh` does, and refuses to capture if it
+    cannot), and `XDG_SESSION_ID` for a process that is genuinely running inside
+    a login session and inherited it from pam_systemd.
+
+    Only meaningful alongside `boot_id()`: session ids restart at 1 after a
+    reboot, so this value is a component of an identity, not an identity.
+    """
+    override = _validate_session_id(os.getenv(SESSION_ID_ENV), SESSION_ID_ENV)
+    if override is not None:
+        return override
+    return _validate_session_id(os.getenv(XDG_SESSION_ID_ENV), XDG_SESSION_ID_ENV)
+
+
 def reset_cache() -> None:
     """
     Clear the cached identity.
@@ -140,3 +219,4 @@ def reset_cache() -> None:
     host_id.cache_clear()
     boot_id.cache_clear()
     agent_id.cache_clear()
+    session_id.cache_clear()

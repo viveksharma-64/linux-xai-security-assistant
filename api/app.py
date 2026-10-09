@@ -154,6 +154,12 @@ class EventResponse(StrictModel):
     host_id: str | None = None
     boot_id: str | None = None
     agent_id: str | None = None
+    # Login session (migration 11), and null for the majority of rows on purpose:
+    # the ingest service belongs to no login session, so it stamps nothing rather
+    # than guessing. Present here because `read_event_records` selects `*` and
+    # this model forbids extras -- an event column the model does not know about
+    # is a 500, not a missing field.
+    session_id: str | None = None
     payload: dict[str, Any]
 
 

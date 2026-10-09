@@ -27,6 +27,8 @@ ROOT = Path(__file__).resolve().parent.parent
 UNITS = ROOT / "deploy" / "systemd"
 INGEST_UNIT = UNITS / "linux-xai-ingest.service"
 API_UNIT = UNITS / "linux-xai-api.service"
+CAPTURE_UNIT = UNITS / "linux-xai-normal-capture.service"
+CAPTURE_TIMER = UNITS / "linux-xai-normal-capture.timer"
 
 # The install prefix the units assume; stripped to resolve paths in this checkout.
 INSTALL_PREFIX = "/opt/linux-xai-security/"
@@ -113,3 +115,92 @@ def test_the_journal_reading_collector_has_journal_access():
     # supplementary group the service user sees only its own records, so the
     # collector would run, stay healthy, and emit nothing.
     assert "SupplementaryGroups=systemd-journal" in INGEST_UNIT.read_text()
+
+
+# --- the optional normal-capture units ---------------------------------------
+#
+# Same silent-until-deployed class of failure as the ingest unit above, but with
+# an extra trap: this one is Type=oneshot, so TimeoutStartSec= bounds the whole
+# capture rather than just its startup.
+
+
+def _directive(unit: Path, name: str) -> str | None:
+    match = re.search(rf"^{name}=(.*)$", unit.read_text(), re.MULTILINE)
+    return match.group(1).split("#")[0].strip() if match else None
+
+
+def test_capture_unit_runs_an_executable_script_that_exists():
+    # ExecStart= must name an executable file or systemd fails 203/EXEC on every
+    # boot, which the shell wrapper's own `bash -n` cleanliness would not reveal.
+    executable = _exec_start(CAPTURE_UNIT)[0]
+    assert executable.startswith(INSTALL_PREFIX)
+    script = ROOT / executable[len(INSTALL_PREFIX) :]
+    assert script.is_file(), f"{script} does not exist in the repository"
+    assert script.stat().st_mode & 0o111, f"{script} is not executable"
+
+
+def test_capture_unit_allows_the_whole_window_to_finish():
+    # TimeoutStartSec= defaults to 90s for Type=oneshot -- shorter than the
+    # window. Left at the default, or lowered below CAPTURE_SECONDS by a later
+    # edit, systemd would truncate every capture without reporting a failure.
+    assert _directive(CAPTURE_UNIT, "Type") == "oneshot"
+    seconds = _directive(CAPTURE_UNIT, "Environment=CAPTURE_SECONDS")
+    assert seconds is not None, "the unit must pin CAPTURE_SECONDS"
+    timeout = _directive(CAPTURE_UNIT, "TimeoutStartSec")
+    assert timeout is not None, "Type=oneshot without TimeoutStartSec truncates at 90s"
+    assert int(timeout) > int(seconds)
+
+
+def test_capture_unit_is_activated_only_by_its_timer():
+    # No [Install] section on purpose: `systemctl enable` on the service would
+    # arm a second activation path, and while the wrapper's guard would still
+    # hold, a hand-enabled service firing at boot would compete with the timer
+    # for no benefit.
+    assert "[Install]" not in CAPTURE_UNIT.read_text()
+    assert _directive(CAPTURE_TIMER, "Unit") == CAPTURE_UNIT.name
+    assert "[Install]" in CAPTURE_TIMER.read_text()
+
+
+def test_capture_timer_polls_and_the_wrapper_is_what_bounds_the_count():
+    # The timer deliberately repeats: there is no systemd trigger that fires once
+    # per *login session*, so the only way to notice a new session is to look.
+    # That makes the independence guarantee the ML activation gate depends on a
+    # property of the wrapper, not of the schedule -- it refuses a (boot_id,
+    # session_id) pair it has already captured, in either directory, so the
+    # capture count cannot exceed the login count however often the unit fires.
+    # Without that guard a polling timer recreates the defect that made the
+    # August 2026 corpus unusable: 180 captures from a single boot.
+    assert _directive(CAPTURE_TIMER, "OnBootSec")
+    assert _directive(CAPTURE_TIMER, "OnUnitActiveSec")
+    wrapper = (ROOT / "scripts" / "capture_normal_window.sh").read_text()
+    assert 'name="normal-$boot_id-s$session_id.db"' in wrapper, (
+        "the capture filename must carry the (boot_id, session_id) pair"
+    )
+    assert '[ -e "$pending/$name" ] || [ -e "$promoted/$name" ]' in wrapper, (
+        "the wrapper must refuse a session it has already captured"
+    )
+
+    # A calendar schedule is still wrong, and `Persistent=` with it doubly so:
+    # it would fire at fixed wall-clock times regardless of whether anyone has
+    # logged in since, and catch up every missed run at the next boot.
+    for calendar in ("OnCalendar", "Persistent"):
+        assert _directive(CAPTURE_TIMER, calendar) is None, (
+            f"{calendar}= would schedule captures against the clock, not against logins"
+        )
+
+
+def test_capture_unit_does_not_fail_when_there_is_nothing_to_capture():
+    # The directive that makes polling survivable. The wrapper exits 75
+    # (EX_TEMPFAIL) when nobody is logged in or no single session can be
+    # attributed; without this the unit would fail on every fire against an idle
+    # host, and a real refusal (exit 1) would be invisible in the noise.
+    assert _directive(CAPTURE_UNIT, "SuccessExitStatus") == "75"
+
+
+def test_capture_wrapper_defaults_to_a_collector_that_exists():
+    # The wrapper's default collector is the one verified process-execution
+    # source; the deprecated probes in telemetry/bcc are not wired to ingestion.
+    text = (ROOT / "scripts" / "capture_normal_window.sh").read_text()
+    match = re.search(r'^COLLECTOR="\$\{COLLECTOR:-(.+?)\}"', text, re.MULTILINE)
+    assert match, "the wrapper must pin a default COLLECTOR"
+    assert (ROOT / match.group(1)).is_file()

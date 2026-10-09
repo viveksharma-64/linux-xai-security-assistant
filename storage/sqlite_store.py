@@ -168,7 +168,7 @@ class SQLiteEventStore(EventStore):
         "pid", "ppid", "uid", "gid",
         "comm", "executable", "parent_comm",
         "source", "version", "event_hash",
-        "host_id", "boot_id", "agent_id",
+        "host_id", "boot_id", "agent_id", "session_id",
     })
 
     EVENT_INSERT_SQL = """
@@ -176,8 +176,8 @@ class SQLiteEventStore(EventStore):
             event_type, timestamp, timestamp_ns, timestamp_monotonic,
             pid, ppid, uid, gid,
             comm, executable, parent_comm, ancestry_json, source, version,
-            payload_json, event_hash, host_id, boot_id, agent_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            payload_json, event_hash, host_id, boot_id, agent_id, session_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
     def __init__(
@@ -454,6 +454,7 @@ class SQLiteEventStore(EventStore):
             host_id=row["host_id"],
             boot_id=row["boot_id"],
             agent_id=row["agent_id"],
+            session_id=row["session_id"],
         )
 
     def _event_hash(self, event: Event) -> str:
@@ -466,8 +467,8 @@ class SQLiteEventStore(EventStore):
         would treat one as a duplicate of the other and drop a real event from a
         real machine. So host must be here.
 
-        `boot_id`, `agent_id`, and `timestamp_monotonic` describe the
-        observation session rather than the observed event, and they change
+        `boot_id`, `agent_id`, `session_id`, and `timestamp_monotonic` describe
+        the observation session rather than the observed event, and they change
         every time the agent restarts. Including them would mean re-ingesting
         the same capture inserts a second copy of every row, which is exactly
         the restart behaviour `test_subprocess_shutdown_is_clean_and_service_can_restart`
@@ -535,6 +536,7 @@ class SQLiteEventStore(EventStore):
             event.host_id,
             event.boot_id,
             event.agent_id,
+            event.session_id,
         )
 
     def write(self, event: Event) -> bool:
@@ -758,9 +760,25 @@ class SQLiteEventStore(EventStore):
             assert cursor.lastrowid is not None
             return int(cursor.lastrowid)
 
-    def read_ml_training_windows(self, dataset_id: str) -> list[dict[str, Any]]:
+    def read_ml_training_windows(self, dataset_id: str | None = None) -> list[dict[str, Any]]:
+        """
+        Every window in one dataset, or -- unscoped -- every window in the store.
+
+        The unscoped form carries the same caveat as `verify_ml_training_windows`'s:
+        it is a full table scan and belongs in an operator tool, not on a hot path.
+        It exists because one question can only be answered across datasets --
+        whether a login session has already been promoted *somewhere* in this
+        corpus -- and a dataset-scoped read is structurally blind to a second
+        dataset in the same file. Callers that know their dataset should still name
+        it; the default is deliberately the broad answer, not a convenience.
+        """
+        sql = "SELECT * FROM ml_training_windows"
+        parameters: list[Any] = []
+        if dataset_id is not None:
+            sql += " WHERE dataset_id = ?"
+            parameters.append(dataset_id)
         with self._transaction() as conn:
-            rows = conn.execute("SELECT * FROM ml_training_windows WHERE dataset_id = ? ORDER BY window_start, id", (dataset_id,)).fetchall()
+            rows = conn.execute(f"{sql} ORDER BY window_start, id", parameters).fetchall()
         return self._decode_ml_training_windows(rows)
 
     def read_ml_training_windows_by_ids(self, window_ids: list[int]) -> list[dict[str, Any]]:

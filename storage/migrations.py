@@ -766,6 +766,44 @@ def _apply_ml_lifecycle(conn: sqlite3.Connection) -> None:
     )
 
 
+def _apply_login_session(conn: sqlite3.Connection) -> None:
+    """
+    Column recording the login session each event was observed under.
+
+    This exists for the verified-normal corpus, not for incident reconstruction.
+    `ml/evaluation.py` requires 60 *independent* holdout windows, and migration 3
+    made the only mechanically checkable independence claim "a distinct boot" --
+    which prices one holdout window at one reboot and puts the gate 60-87 reboots
+    away. A desktop produces several distinct login sessions per boot, and those
+    are genuinely separate sessions of use, so recording which one an event came
+    from turns each of them into a window whose independence
+    `scripts/verify_capture_boot.py` can check from the rows rather than trust.
+
+    Nullable, and most rows will be NULL on purpose. `pipeline/identity.session_id`
+    answers only when a caller declares a session, so the long-running ingest
+    service -- which belongs to no login session -- stamps NULL rather than
+    guessing at whoever happened to be logged in when it started. A NULL here
+    means "not usable as evidence of an independent login session", which for a
+    daemon's events is the truth. Rows written before this migration are NULL for
+    the same reason and are therefore not promotable as session-scoped holdout
+    windows; backfilling them would be inventing provenance.
+
+    Deliberately *not* part of `_event_hash`: like `boot_id` and `agent_id` it
+    describes the observation session rather than the event, and including it
+    would make re-ingesting one capture under a second login session insert a
+    duplicate copy of every row.
+
+    The index is keyed `(boot_id, session_id)` in that order because the identity
+    is the tuple -- logind restarts session numbering at 1 after every reboot, so
+    `session_id` alone is not unique across the database -- and because that is
+    the exact grouping the verifier queries.
+    """
+    _add_column_if_absent(conn, "events", "session_id", "TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_boot_session ON events(boot_id, session_id)"
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -816,6 +854,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=10,
         description="ML drift assessments and append-only hash-chained model lifecycle log",
         apply=_apply_ml_lifecycle,
+    ),
+    Migration(
+        version=11,
+        description="login session identity on events, for per-session holdout independence",
+        apply=_apply_login_session,
     ),
 )
 

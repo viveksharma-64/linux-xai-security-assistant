@@ -1,0 +1,99 @@
+# One bounded normal-behaviour capture per login session, for the verified-normal
+# corpus program (docs/NORMAL_CORPUS_PROGRAM.md).
+#
+# This unit observes and nothing else. It writes a capture database and stops.
+# It does NOT promote the capture into the corpus, does not touch the activation
+# gate, and does not write to the evidence database that linux-xai-ingest owns.
+# Promotion remains a manual attested step -- scripts/collect_normal_window.py
+# refuses to run without --i-verified-normal precisely so that no timer can
+# self-approve training data.
+#
+# Started by linux-xai-normal-capture.timer, which polls. Each start captures the
+# login session the host is currently being used from, unless that session has
+# already been captured, in which case the wrapper exits 0 having done nothing.
+# The identity is (boot_id, session_id), so several captures per boot are
+# expected and a session is never captured twice. See deploy/README.md for the
+# review-and-promote loop.
+#
+# Paths below assume an install under /opt/linux-xai-security. Capabilities and
+# sandboxing mirror linux-xai-ingest.service, because the same BCC collector
+# needs the same kernel rights.
+
+[Unit]
+Description=Linux XAI Security Assistant - capture this login session's normal behaviour
+Documentation=file:///opt/linux-xai-security/deploy/README.md
+# The corpus wants steady-state desktop behaviour, not boot noise. The timer's
+# OnBootSec= provides the settle delay; this only orders the unit after the
+# system is nominally up.
+After=multi-user.target
+
+[Service]
+Type=oneshot
+User=linux-xai
+Group=linux-xai
+WorkingDirectory=/opt/linux-xai-security
+
+# Same set as linux-xai-ingest.service: the capture runs the same BCC collector,
+# so it needs the same kernel rights and no more. Trim to the minimum your
+# kernel accepts.
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_SYS_RESOURCE
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_SYS_RESOURCE
+NoNewPrivileges=yes
+
+# /var/lib/linux-xai-captures, created 0700 and owned by linux-xai. Deliberately
+# NOT the ingest service's state directory: these are candidate corpus captures
+# under review, not evidence, and nothing in the running system reads them.
+StateDirectory=linux-xai-captures
+StateDirectoryMode=0700
+Environment=CAPTURE_DIR=/var/lib/linux-xai-captures
+Environment=CAPTURE_SECONDS=305
+Environment=COLLECTOR_PYTHON=/usr/bin/python3
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/opt/linux-xai-security/scripts/capture_normal_window.sh
+
+# 75 (EX_TEMPFAIL) is the wrapper's "nothing to capture right now": nobody is
+# logged in, or two sessions are live and neither can be attributed. The timer
+# polls, so without this an idle host at its login screen would mark this unit
+# failed on every fire and bury any real failure in the noise. Genuine refusals
+# -- a malformed session id, a session logind cannot corroborate, a capture that
+# died -- still exit 1 and still fail the unit.
+SuccessExitStatus=75
+
+# TimeoutStartSec= bounds the whole of ExecStart for Type=oneshot, and its
+# default is 90s -- shorter than the capture. Left at the default, systemd would
+# kill every window at 90 seconds and the corpus would quietly fill with
+# truncated captures. Keep this comfortably above CAPTURE_SECONDS.
+TimeoutStartSec=600
+# The wrapper ends the window with SIGTERM and live_ingestion drains and flushes
+# on it; give that room before SIGKILL.
+TimeoutStopSec=60
+
+# --- sandbox -----------------------------------------------------------------
+# Copied from linux-xai-ingest.service, including the two directives that are
+# deliberately off with their reasons, so they are not "fixed" back on without a
+# kernel to test against.
+#
+# One extra constraint this unit has and the ingest service does not: the wrapper
+# resolves the login session by reading /run/systemd/sessions/, so anything that
+# hides or empties /run here (PrivateUsers=, a RestrictFileSystems= allowlist, a
+# TemporaryFileSystem= over /run) makes every capture exit 75 and the corpus
+# silently stops growing. ProtectSystem=strict is fine -- it only makes /run
+# read-only, and the wrapper only reads it.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=no          # BCC needs /dev and /sys/kernel/debug access
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no  # the BPF verifier/JIT maps executable memory
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @privileged @debug
+SystemCallFilter=~@module @swap @reboot @clock

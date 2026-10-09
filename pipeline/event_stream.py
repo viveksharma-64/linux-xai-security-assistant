@@ -119,12 +119,13 @@ class Event:
     only when the collector supplied one.
     Identity, equality, and what "the same event" means
     ---------------------------------------------------
-    `timestamp_monotonic`, `boot_id`, and `agent_id` are excluded from equality
-    and hashing. They describe the observation session -- which agent run
-    noticed this event, on which boot, how far into that boot -- not the event
-    itself. Two normalizations of one collector record describe the same thing
-    that happened on the host even though the agent read them microseconds
-    apart, and code that aggregates or compares events must be able to say so;
+    `timestamp_monotonic`, `boot_id`, `agent_id`, and `session_id` are excluded
+    from equality and hashing. They describe the observation session -- which
+    agent run noticed this event, on which boot, under which login session, how
+    far into that boot -- not the event itself. Two normalizations of one
+    collector record describe the same thing that happened on the host even
+    though the agent read them microseconds apart, and code that aggregates or
+    compares events must be able to say so;
     `baseline/behavior_analyzer.aggregate_windows` is documented as
     deterministic and would otherwise stop being so.
 
@@ -165,6 +166,10 @@ class Event:
     host_id: str | None = None
     boot_id: str | None = field(default=None, compare=False)
     agent_id: str | None = field(default=None, compare=False)
+    # logind session, and null for anything that belongs to no login session --
+    # which includes the ingest service itself. Only meaningful with boot_id:
+    # session ids restart at 1 after a reboot.
+    session_id: str | None = field(default=None, compare=False)
 
     def __post_init__(self):
         # object.__setattr__ because the dataclass is frozen. These are
@@ -309,6 +314,7 @@ class Event:
             host_id=raw_json.get("host_id"),
             boot_id=raw_json.get("boot_id"),
             agent_id=raw_json.get("agent_id"),
+            session_id=raw_json.get("session_id"),
         )
 
 
@@ -500,6 +506,7 @@ class CanonicalNormalizer(EventNormalizer):
             ("host_id", identity.host_id()),
             ("boot_id", identity.boot_id()),
             ("agent_id", identity.agent_id()),
+            ("session_id", identity.session_id()),
         ):
             if record.get(key) is None:
                 record[key] = value

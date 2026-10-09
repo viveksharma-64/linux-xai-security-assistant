@@ -1,0 +1,56 @@
+# Polls for login sessions that have not been captured yet.
+#
+# Boot-triggered *and* repeating, which needs explaining, because the opposite
+# used to be the point. The gate in ml/evaluation.py needs 60 *independent*
+# holdout windows, and a plain wall-clock timer guarantees only that windows do
+# not overlap in time: on a host left up for a month, six fires a day would
+# produce 180 captures from one boot and reproduce exactly the defect that made
+# the August 2026 corpus unusable.
+#
+# What makes polling safe now is that independence is keyed on
+# (boot_id, session_id) rather than on the fire count. capture_normal_window.sh
+# resolves the login session the host is being used from and refuses to take a
+# second capture of a session it has already captured, so the number of captures
+# cannot exceed the number of logins however often this fires. Those 180 fires
+# would yield one capture per login and nothing more.
+#
+# Polling rather than a PAM hook because there is no systemd trigger that fires
+# once per login session: `systemd --user` is per *user*, not per session, and
+# pam_exec would put a capture in the login path, where a bug blocks logins.
+# Polling keeps the failure mode "a window was missed".
+#
+# A fire with nobody logged in, or with two sessions live and neither
+# attributable, exits 75 and the service maps that to success -- otherwise an
+# idle host at its login screen would mark the unit failed every 20 minutes.
+#
+# Persistent= is deliberately absent: it exists to replay missed OnCalendar=
+# elapses, and there is nothing to catch up on here. A session that ended before
+# it was captured is a session that produced no window, which is the honest
+# outcome.
+
+[Unit]
+Description=Linux XAI Security Assistant - poll for uncaptured normal-behaviour login sessions
+Documentation=file:///opt/linux-xai-security/deploy/README.md
+
+[Timer]
+Unit=linux-xai-normal-capture.service
+
+# Wait for the first session to settle. A window captured 30 seconds after boot
+# records systemd, display-manager, and session startup -- real behaviour, but
+# not the steady-state desktop behaviour the corpus is meant to characterise, and
+# a holdout set made of boot storms would not resemble what the model scores at
+# runtime.
+OnBootSec=15min
+# Then keep looking, so the second and later logins of a long uptime are offered
+# a window too -- the whole reason 60 windows now costs 6-9 boots instead of 60.
+# Measured from the end of the last run, so a 305s capture does not overlap the
+# next poll. 20min is a compromise: short enough to catch a brief login, long
+# enough that a desktop session is past its startup burst before the window
+# opens.
+OnUnitActiveSec=20min
+# Jitter so windows do not all land at the same offset into a session. The corpus
+# program asks for a representative spread, not 60 copies of minute 15.
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

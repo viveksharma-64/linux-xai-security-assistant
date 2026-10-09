@@ -830,7 +830,7 @@ def test_ml_lifecycle_tables_added_to_an_existing_database(tmp_path):
 
     store = SQLiteEventStore(str(db))
 
-    assert store.schema_version == LATEST_VERSION == 10
+    assert store.schema_version == LATEST_VERSION
     assert {"ml_drift_assessments", "ml_model_lifecycle"} <= _tables(db)
     assert store.verify_ml_lifecycle_chain() == {
         "ok": True,
@@ -849,17 +849,98 @@ def test_ml_lifecycle_tables_added_to_an_existing_database(tmp_path):
     finally:
         conn.close()
 
-    # Reopening re-runs migrate(): version 10 must not apply twice.
+    # Reopening re-runs migrate(): version 10 must not apply twice. Pinned to the
+    # literal 10 rather than LATEST_VERSION -- this test is about migration 10, and
+    # following LATEST_VERSION would quietly retarget it at whatever was added last.
     SQLiteEventStore(str(db))
     conn = sqlite3.connect(str(db))
     try:
         (rows,) = conn.execute(
             f"SELECT COUNT(*) FROM {SCHEMA_MIGRATIONS_TABLE} WHERE version = ?",
-            (LATEST_VERSION,),
+            (10,),
         ).fetchone()
     finally:
         conn.close()
     assert rows == 1, "migration 10 recorded itself more than once"
+
+
+def test_session_id_column_is_added_to_an_existing_database(tmp_path):
+    """
+    Migration 11 over a version-10 database, which is the shape a deployment
+    upgrading into this release is in.
+
+    Events stored before the column existed belong to no identifiable login
+    session, so they must survive with a NULL rather than being attributed to
+    whichever session happened to run the upgrade -- a backfilled session_id
+    would be a false independence claim for any capture promoted from them.
+    """
+    db = tmp_path / "session_upgrade.db"
+
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.isolation_level = None
+        migrations._ensure_version_table(conn)
+        migrations._apply_baseline(conn)
+        migrations._apply_backpressure_telemetry(conn)
+        migrations._apply_event_identity(conn)
+        migrations._apply_kernel_loss_telemetry(conn)
+        migrations._apply_hot_path_indexes(conn)
+        migrations._apply_maintenance_log(conn)
+        migrations._apply_collector_sources(conn)
+        migrations._apply_evidence_chain(conn)
+        migrations._apply_triage_annotations(conn)
+        migrations._apply_ml_lifecycle(conn)
+        for version in range(1, 11):
+            conn.execute(
+                f"INSERT INTO {SCHEMA_MIGRATIONS_TABLE} (version, description, applied_at) "
+                "VALUES (?, ?, 0.0)",
+                (version, f"v{version}"),
+            )
+        conn.execute(
+            "INSERT INTO events (event_type, timestamp, pid, comm, payload_json, event_hash, "
+            "host_id, boot_id) "
+            "VALUES ('process_exec', 7.0, 314, 'presession', '{}', 'pre-session-hash', "
+            "'host-a', 'boot-a')"
+        )
+    finally:
+        conn.close()
+
+    store = SQLiteEventStore(str(db))
+
+    assert store.schema_version == LATEST_VERSION
+    assert "session_id" in _columns(db, "events")
+
+    stored = list(store.read_all())
+    assert len(stored) == 1, "upgrading discarded stored events"
+    assert stored[0].pid == 314 and stored[0].comm == "presession"
+    assert stored[0].boot_id == "boot-a", "an upgrade rewrote existing identity"
+    assert stored[0].session_id is None, "an upgrade invented a login session"
+
+    # The index exists to make the per-session grouping in
+    # scripts/verify_capture_boot.py cheap on a capture of any size.
+    conn = sqlite3.connect(str(db))
+    try:
+        names = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'events'"
+            )
+        }
+    finally:
+        conn.close()
+    assert "idx_events_boot_session" in names
+
+    # Reopening re-runs migrate(): version 11 must not apply twice.
+    SQLiteEventStore(str(db)).close()
+    conn = sqlite3.connect(str(db))
+    try:
+        (rows,) = conn.execute(
+            f"SELECT COUNT(*) FROM {SCHEMA_MIGRATIONS_TABLE} WHERE version = ?",
+            (11,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert rows == 1, "migration 11 recorded itself more than once"
 
 
 def test_ml_lifecycle_vocabulary_is_constrained_at_the_schema(tmp_path):

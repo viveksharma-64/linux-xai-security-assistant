@@ -12,7 +12,7 @@ them, as one window, to a *candidate dataset* store via the existing
     create_verified_normal_dataset(...)   # one immutable dataset header
     add_verified_normal_window(...)        # one immutable feature window
 
-It deliberately adds NO new ML path. Two boundaries are load-bearing:
+It deliberately adds NO new ML path. Three boundaries are load-bearing:
 
 * **It cannot self-approve.** ``verified_normal`` is an operator attestation of
   human review, not something a script may assert on its own behalf. This tool
@@ -24,6 +24,15 @@ It deliberately adds NO new ML path. Two boundaries are load-bearing:
 * **It never mutates the source capture.** The source is opened read-only
   (``mode=ro``), so an operator's raw capture is untouched -- and older-schema
   captures (missing later columns) are read tolerantly rather than migrated.
+* **One login session contributes one holdout window.** The gate's Wilson bound
+  counts each holdout window as an independent trial, so a ``--role holdout``
+  window must be exactly one ``(boot_id, session_id)`` pair and must not be a
+  pair the target dataset already holds (exit status 4 otherwise). That rules out
+  re-promoting a capture and rules out slicing one session into two windows with
+  ``--window-start``/``--window-end``. The pair, plus the capture's logind
+  manifest, is stored in the window's immutable ``collector_context`` so the
+  claim stays auditable after logind has forgotten the session. Training windows
+  are not restricted this way: independence is a holdout property.
 
 Everything the tool writes goes to the candidate dataset store, which inherits
 the store's ``0600`` file mode. Whether a window counts toward the ML gate's
@@ -109,6 +118,7 @@ def _row_to_event(row: sqlite3.Row) -> Event:
         host_id=value("host_id"),
         boot_id=value("boot_id"),
         agent_id=value("agent_id"),
+        session_id=value("session_id"),
     )
 
 
@@ -154,6 +164,122 @@ def read_source_window(
     return event_ids, events
 
 
+def _session_provenance(source_path: str, events: list[Event]) -> dict[str, Any]:
+    """
+    Describe which boot and login session this window's events came from.
+
+    The identity is the *pair*: logind numbers sessions from 1 again after every
+    reboot, so ``session_id`` alone collides across boots while ``boot_id`` alone
+    collapses every session of one uptime into a single window. Computed the same
+    way ``scripts/verify_capture_boot.py`` computes it, from the rows rather than
+    the filename, so the two tools cannot disagree about what a capture claims.
+
+    ``identity`` is set only when the window is unambiguously one session.
+    Unattributed rows are counted rather than treated as a defect: the always-on
+    ingest service has no login session of its own, so daemon activity inside the
+    window legitimately carries NULLs, and captures stay host-wide on purpose --
+    filtering a window down to one session's processes would shift its feature
+    distribution away from training and runtime scoring.
+
+    The ``.manifest.json`` sidecar written by ``scripts/capture_normal_window.sh``
+    is folded in when present. It matters because logind discards its session
+    records at reboot: the login wall-clock in there is the only lasting evidence
+    that two same-boot sessions did not overlap, and without it a window reviewed
+    a week later cannot be audited at all.
+    """
+    pairs: dict[tuple[str, str], int] = {}
+    without_boot_id = 0
+    without_session_id = 0
+    for event in events:
+        if event.boot_id is None:
+            without_boot_id += 1
+        if event.session_id is None:
+            without_session_id += 1
+        if event.boot_id is not None and event.session_id is not None:
+            key = (str(event.boot_id), str(event.session_id))
+            pairs[key] = pairs.get(key, 0) + 1
+
+    identities = [
+        {"boot_id": boot_id, "session_id": session_id, "events": count}
+        for (boot_id, session_id), count in sorted(pairs.items())
+    ]
+    provenance: dict[str, Any] = {
+        "identities": identities,
+        "identity": identities[0] if len(identities) == 1 else None,
+        "rows_without_boot_id": without_boot_id,
+        "rows_without_session_id": without_session_id,
+        "capture_manifest": _read_capture_manifest(source_path),
+    }
+    if provenance["identity"] is not None:
+        # Drop the row count from the identity itself: it is the key two windows
+        # are compared on, and a count would make the same session look like two.
+        provenance["identity"] = {
+            "boot_id": identities[0]["boot_id"],
+            "session_id": identities[0]["session_id"],
+        }
+    return provenance
+
+
+def _read_capture_manifest(source_path: str) -> dict[str, Any] | None:
+    """Load the capture's ``.manifest.json`` sidecar, or None if there is none.
+
+    Missing is normal, not an error: captures taken before this sidecar existed,
+    or by hand, simply have no logind snapshot to record. Unreadable is also not
+    fatal here -- this tool's job is to record what provenance exists, and
+    refusing to promote over a damaged sidecar would be a gate this change was
+    not asked to add. ``scripts/verify_capture_boot.py`` is where independence is
+    adjudicated.
+    """
+    manifest_path = f"{source_path}.manifest.json"
+    if not os.path.exists(manifest_path):
+        return None
+    try:
+        with open(manifest_path, encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except (OSError, ValueError) as error:
+        return {"error": f"unreadable manifest at {manifest_path}: {error}"}
+    return loaded if isinstance(loaded, dict) else {"error": "manifest is not an object"}
+
+
+def _promoted_session_identities(
+    store: SQLiteEventStore,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Map (boot_id, session_id) -> the first window in this store that holds it.
+
+    Deliberately corpus-wide rather than dataset-scoped: the thing that must not
+    happen twice is the *promotion of a session*, and a dataset-scoped read cannot
+    see a second dataset in the same file. Checking only the dataset being
+    appended to left a hole wide enough to drive the whole program through --
+    create a second dataset and the same capture promotes again, with no
+    refusal and nothing in the stored provenance to mark the two windows as one
+    session.
+
+    Read back out of the immutable ``collector_context`` this tool writes, which
+    is covered by each window's ``immutable_hash``, so a session cannot be hidden
+    by editing the row. Windows written before session provenance existed have no
+    identity to report and are simply absent -- they were promoted under the
+    old one-per-boot rule and are not re-adjudicated here.
+    """
+    promoted: dict[tuple[str, str], dict[str, Any]] = {}
+    for window in store.read_ml_training_windows():
+        context = window.get("collector_context") or {}
+        identity = (context.get("session_provenance") or {}).get("identity")
+        if not isinstance(identity, dict):
+            continue
+        boot_id, session_id = identity.get("boot_id"), identity.get("session_id")
+        if boot_id is None or session_id is None:
+            continue
+        promoted.setdefault(
+            (str(boot_id), str(session_id)),
+            {
+                "window_id": int(window["id"]),
+                "dataset_id": str(window["dataset_id"]),
+                "role": context.get("role"),
+            },
+        )
+    return promoted
+
+
 def _feature_summary(events: list[Event]) -> dict[str, Any]:
     """A small, human-checkable digest of the window the operator is attesting."""
     features = extract_features(events)
@@ -171,8 +297,16 @@ def _feature_summary(events: list[Event]) -> dict[str, Any]:
     }
 
 
-def _build_verification(args: argparse.Namespace, source_path: str) -> dict[str, Any]:
-    """The operator attestation recorded immutably with the dataset and window."""
+def _build_verification(
+    args: argparse.Namespace, source_path: str, provenance: dict[str, Any]
+) -> dict[str, Any]:
+    """The operator attestation recorded immutably with the dataset and window.
+
+    The session identity rides along with the attestation, not only in the
+    window's collector context, because this is the record of *what a human said
+    they reviewed*. "alice reviewed boot X session 3" is auditable a year later;
+    "alice reviewed a window" is not.
+    """
     return {
         "verified_normal": True,  # only reached after the --i-verified-normal gate
         "operator": args.operator,
@@ -180,6 +314,7 @@ def _build_verification(args: argparse.Namespace, source_path: str) -> dict[str,
         "reviewed_at": time.time(),
         "source_capture": os.path.basename(source_path),
         "role": args.role,
+        "session_identity": provenance["identity"],
     }
 
 
@@ -222,6 +357,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     summary = _feature_summary(events)
+    provenance = _session_provenance(args.source, events)
+    summary["session_identity"] = provenance["identity"]
+    summary["session_count"] = len(provenance["identities"])
+    summary["rows_without_session_id"] = provenance["rows_without_session_id"]
 
     if args.dry_run:
         summary["dry_run"] = True
@@ -254,7 +393,73 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 3
 
-    verification = _build_verification(args, args.source)
+    # ---- holdout windows must each be one distinct login session
+    #
+    # The gate's Wilson bound treats the 60 holdout windows as independent trials,
+    # so two windows from one login session would not just be redundant, they
+    # would overstate the evidence. scripts/verify_capture_boot.py already refuses
+    # such a capture, but it inspects captures and can be skipped; this is the
+    # door the corpus is actually written through, and it is the only place that
+    # can see what has already been promoted.
+    if args.role == "holdout" and provenance["identity"] is None:
+        detail = (
+            f"{len(provenance['identities'])} distinct login sessions"
+            if provenance["identities"]
+            else "no attributable login session "
+            f"({provenance['rows_without_session_id']} rows with a NULL session_id)"
+        )
+        print(
+            f"refusing to promote a holdout window with {detail}: a holdout window "
+            "must be exactly one (boot_id, session_id) pair, because the activation "
+            "gate counts it as one independent trial. Verify the capture first:\n"
+            f"  python3 scripts/verify_capture_boot.py {args.source} --against DIR",
+            file=sys.stderr,
+        )
+        return 4
+
+    # ---- a login session is promoted once, into one dataset
+    #
+    # Two rules, and the asymmetry between them is deliberate. *Across* datasets a
+    # session may appear once whatever the role, including on the --dataset-name
+    # path: the same session in two datasets is one piece of evidence counted
+    # twice, and if either dataset feeds training then the other is no longer held
+    # out from it -- an overlap ml_train_and_evaluate.py cannot catch, because it
+    # compares window content byte-for-byte and two differently-bounded windows
+    # over one session do not match. *Within* one dataset only holdout is strict --
+    # one session, one window -- because training windows are not counted as
+    # independent trials and more data from a session already in the set is just
+    # more data.
+    if provenance["identity"] is not None:
+        check = SQLiteEventStore(args.dataset_db)
+        try:
+            promoted = _promoted_session_identities(check)
+        finally:
+            check.close()
+        key = (provenance["identity"]["boot_id"], provenance["identity"]["session_id"])
+        prior = promoted.get(key)
+        # args.dataset_id is None on the creation path, so every prior hit there is
+        # in another dataset by construction -- which is the case that used to pass.
+        elsewhere = prior is not None and prior["dataset_id"] != args.dataset_id
+        if prior is not None and (elsewhere or args.role == "holdout"):
+            consequence = (
+                "A session belongs to one dataset. Promoting it again here would "
+                "count the same evidence twice and, if the two datasets split "
+                "training from holdout, would stop the holdout being held out from "
+                "training."
+                if elsewhere
+                else "One session contributes one window -- re-promoting a capture, "
+                "or slicing it into two windows with --window-start/--window-end, "
+                "would inflate the holdout count without adding independent evidence."
+            )
+            print(
+                f"refusing to promote: boot {key[0]} session {key[1]} is already "
+                f"window {prior['window_id']} in dataset {prior['dataset_id']} "
+                f"(role {prior['role'] or 'unrecorded'}). {consequence}",
+                file=sys.stderr,
+            )
+            return 4
+
+    verification = _build_verification(args, args.source, provenance)
     environment = {
         "platform": platform.platform(),
         "python": sys.version.split()[0],
@@ -284,6 +489,13 @@ def main(argv: list[str] | None = None) -> int:
                 "source_capture": os.path.basename(args.source),
                 "sources": sorted({event.source for event in events}),
                 "versions": sorted({event.version for event in events}),
+                # The whole independence argument, stored with the window rather
+                # than left on the host: logind discards its session records at
+                # reboot, so this is the only thing that can answer "were these
+                # two windows really different sessions?" a month from now. It is
+                # covered by the window's immutable_hash, which is why the
+                # duplicate check above can trust what it reads back.
+                "session_provenance": provenance,
             },
         )
     except Exception as error:  # store/training raise ValueError subclasses on bad input
@@ -318,6 +530,9 @@ def _emit(summary: dict[str, Any], as_json: bool, header: str) -> None:
         "window_id",
         "role",
         "operator",
+        "session_identity",
+        "session_count",
+        "rows_without_session_id",
         "event_count",
         "observed_span_seconds",
         "unique_event_types",
