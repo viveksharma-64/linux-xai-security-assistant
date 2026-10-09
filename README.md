@@ -350,11 +350,37 @@ inactive. Full detail in [docs/ML_LIFECYCLE.md](docs/ML_LIFECYCLE.md).
   scheduled run cannot log "checked" and move on.
 - **An append-only log of how a model got where it is.** `ml/lifecycle.py` records
   `trained → evaluated → (eligible | ineligible) → active → (drifted | retired)`,
-  hash-chained in the same one fold as the evidence chains. The log **records; it
-  does not decide**: no append can activate a model, `activation_eligible` comes
-  only from a fresh call to the acceptance gate, and drift can append exactly two
-  states — `drift_assessed` and `retraining_required`. Drift raises the question; a
-  human answers it by training a new model and putting it through the same gate.
+  hash-chained in the same one fold as the evidence chains. The log **records; the
+  gate decides**: activation goes through one door, `storage/sqlite_store.py:activate_ml_model`,
+  which is the only writer of `ml_models.active = 1` and which refuses unless the
+  acceptance gate grants eligibility over the raw counts *and* the model's latest
+  recorded state is already `eligible`; training has no `activate` parameter and
+  an active model row cannot be inserted at all, so that door is the only one;
+  `activation_eligible` comes only from a
+  fresh call to that gate; and drift can append exactly two states —
+  `drift_assessed` and `retraining_required`. Drift raises the question; a human
+  answers it by training a new model and putting it through the same gate. The one
+  thing an append *does* cause points the safe way: `retired` and `drifted` stand a
+  model down in the same transaction.
+- **The gate shuts something.** `ml/scoring.py` refuses to construct a scorer for a
+  model that is not active, before it reads the artifact, so an ungated model has
+  no scoring path at all — not one whose output a caller is trusted to discard. An
+  inactive model therefore yields a finding byte-identical to one scored with no
+  model configured, provenance hash included.
+- **One command to train, measure, and ask the gate — and a different one to
+  activate.** `scripts/ml_train_and_evaluate.py` runs `train → record_trained →
+  score a held-out verified-normal corpus → record_evaluated →
+  record_activation_gate`, so the chained log carries the measurement, and the
+  window ids it was taken over, before any verdict cites them. It refuses *before*
+  training when the comparison is not one: the same dataset named for both roles, a
+  holdout that reuses training windows byte-for-byte, a holdout not marked
+  `role: holdout`, or disagreeing schema hashes. `--record` is off by default, the
+  holdout corpus is opened `mode=ro`, `--operator` is required to write anything,
+  and the exit codes separate the two kinds of "no": **2** means the gate refused,
+  **1** means the invocation was wrong. Activation is a *separate* invocation
+  (`--activate --model-id ...`) that re-reads the counts out of the model's own
+  `eligible` row — there is no flag to type a count into, and no single command
+  goes from raw data to an active model.
 
 Run a drift check (read-only unless you pass `--record`):
 
@@ -362,6 +388,73 @@ Run a drift check (read-only unless you pass `--record`):
 python3 scripts/ml_drift_check.py --db events.db --model-id iforest-... \
     --comparison-db corpus/normal.db --comparison-dataset verified-normal-...
 ```
+
+Train, measure, and ask the activation gate (also read-only unless `--record`):
+
+```bash
+python3 scripts/ml_train_and_evaluate.py --db models.db \
+    --training-dataset verified-normal-... \
+    --holdout-db corpus/normal.db --holdout-dataset verified-normal-... \
+    --artifact-dir models/ --contamination 0.01 --record --operator alice
+```
+
+```bash
+python3 scripts/ml_train_and_evaluate.py --db models.db \
+    --activate --model-id iforest-... --operator alice
+```
+
+**Expect this to refuse against the corpus as it stands, and read the refusal as
+the gate working.** The seed captures are not promoted into `ml_datasets` at all
+yet, and even once they are they amount to at most 4 holdout windows against a
+floor of 60 ([docs/NORMAL_CORPUS_PROGRAM.md](docs/NORMAL_CORPUS_PROGRAM.md)). The
+command exits 2 and records an `ineligible` row naming the shortfall. A refusal
+that is *recorded* is the point: the chained log then holds evidence that somebody
+measured, which pre-refusing without a row would not.
+
+**`--contamination` is the lever on whether the gate can be cleared at all.**
+Contamination *is* the Isolation Forest decision threshold, so a forest fitted to
+treat `c` of its training data as outlying flags roughly `c` of in-distribution
+normal windows — while the gate's budget is 5% at a one-sided 95% Wilson bound,
+which at n=60 means **zero** false positives are permitted (0/60 → 4.31%, 1/60 →
+7.13%). The default is **0.01** for exactly that reason: the former 0.05 default
+aimed the model at the ceiling it had to clear, and 60 independent draws at
+p=0.05 land on zero failures only about 4.6% of the time, where 0.01 gives about
+55%. Measured on the test corpus, over a holdout drawn *interior* to the training
+grid:
+
+| `--contamination` | training windows | false positives / 60 | gate | deliberate outlier flagged |
+|---|---|---|---|---|
+| 0.05 (the former default) | 35 / 70 / 140 | 5 / 3 / 4 | ineligible in all three | yes |
+| 0.01 (default) | 35 | **0** | **eligible** | yes |
+| 0.01 | 70 / 140 | 2 / 0 | ineligible / eligible | yes / **no** |
+| 0.001 | 35 / 70 / 140 | 0 / 0 / 0 | eligible | yes / yes / **no** |
+
+Two things follow. The lower default makes the gate *reachable*, not passable —
+the 70-window row is still refused, and that is the gate doing its job rather
+than a setting to tune away; and lowering contamination while *growing* the
+training set eventually buys eligibility by making the model too permissive to
+flag anything, which is the failure the gate cannot see. The configuration worth
+keeping is the one that is eligible *and* still catches the outlier. The flag's
+own `--help` says this, and its default is read off `train_isolation_forest`'s
+signature so the help cannot misreport it. Where the boundary actually landed in
+the training score distribution is recorded per model as
+`training_decision_percentiles` in the artifact descriptor.
+
+**`--calibrate-threshold` fits the boundary to held-out normal data instead, and
+is off by default because of an honest limit.** It is a separate invocation —
+refused alongside `--training-dataset`, `--record`, or `--activate` — and it
+*mints a second model* rather than editing one, since artifacts are immutable and
+checksum-pinned in both directions. The derived model is inactive and carries a
+single `trained` row: no gate verdict, because a threshold fitted to a holdout
+and a false-positive rate measured on that same holdout are one number computed
+twice, and the gate would recite the target rather than test it. The clean form
+needs a calibration split and a disjoint gate split, which the normal corpus
+cannot yet supply; until then the provenance string, the descriptor's
+`in_sample: true`, and the CLI's own output all say so. It is also not a free
+improvement: measured in the tests, calibrating an eligible model *to* a 5%
+target raises its threshold until it fails the gate, because at n=60 the gate's
+effective allowance is zero. See
+[docs/ML_LIFECYCLE.md](docs/ML_LIFECYCLE.md) for the full treatment.
 
 **Seeing the recorded state.** `GET /api/models` and `GET
 /api/models/{id}` render what the lifecycle log already holds — a model's
@@ -651,6 +744,18 @@ No threshold changes, activation, or baseline contamination are allowed merely
 to make a model pass. Drift assessment and the lifecycle log feed this gate's
 paperwork; they are never a way around it.
 
+Those three conditions are enforced in code, not only in policy, at both ends of
+the gate. `storage/sqlite_store.py:activate_ml_model` is the only writer of
+`ml_models.active = 1`: it re-computes the verdict from the recorded counts and
+refuses unless the model's latest lifecycle state is already `eligible`. Nothing
+else can reach that flag — training takes no `activate` parameter, because a
+held-out false-positive rate cannot exist at the moment training returns, and
+inserting a model row with `active` set is **refused** rather than gated, because
+a brand-new row has no lifecycle history and so could never meet the condition
+the real door imposes. And `ml/scoring.py` refuses to construct a scorer for a
+model that is not active, so an unapproved model has no scoring path at all — not
+one whose output a caller is trusted to discard.
+
 ## Tests
 
 Run the whole suite from the repository root. `pyproject.toml` sets
@@ -755,7 +860,7 @@ removed to make a run look clean.
 | `observability/` | Layered config, Prometheus-style metrics, and disk/queue/silence alerting |
 | `api/`, `dashboard/` | Authenticated analyst API and interface: read-only over the immutable evidence record, with append-only, default-deny triage writes |
 | `deploy/` | systemd units, example config, and the deployment guide |
-| `scripts/` | Environment check, ingestion benchmark, and collector-kill soak harness |
+| `scripts/` | Environment check, ingestion benchmark, collector-kill soak harness, and the ML corpus/train/drift tools |
 | `tests/` | Focused unit and integration regression tests |
 | `requirements.txt` | Python dependencies for API, policy, ML, and tests |
 

@@ -6,7 +6,7 @@ import sqlite3
 import stat
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
@@ -619,6 +619,123 @@ class SQLiteEventStore(EventStore):
             )
         return str(dataset["id"])
 
+    def read_ml_dataset(self, dataset_id: str) -> dict[str, Any] | None:
+        """
+        One dataset's immutable metadata, or None if no such row exists.
+
+        Present so a consumer can check a dataset's *own* attestation rather than
+        inferring it from its windows. `verified_normal` is recorded once, on the
+        dataset, and `create_ml_dataset` refuses a row without it -- so an absent
+        row and an unattested row are both answers a caller should be able to act
+        on, which is why this returns None instead of raising.
+        """
+        with self._transaction() as conn:
+            row = conn.execute("SELECT * FROM ml_datasets WHERE id = ?", (dataset_id,)).fetchone()
+        if row is None:
+            return None
+        record = dict(row)
+        for key in ("environment_json", "verification_json"):
+            record[key.removesuffix("_json")] = json.loads(record.pop(key))
+        return record
+
+    @staticmethod
+    def _training_window_digest(window: Mapping[str, Any]) -> str:
+        """
+        The one definition of a training window's `immutable_hash`.
+
+        Both the writer and `verify_ml_training_windows` call this, so the recorded
+        digest and the recomputed one cannot drift -- the same single-source argument
+        the lifecycle chain's `ML_LIFECYCLE_CHAIN_COLUMNS` makes.
+
+        It hashes *normalised* values rather than whatever the caller handed in,
+        because the verifier can only see what the columns hold. `window_start` is
+        REAL, so an int `1000` passed here is read back as `1000.0`, and
+        `json.dumps` writes those as `1000` and `1000.0` -- different bytes, a false
+        tamper report. `verified_normal` is the same hazard in the other direction:
+        the writer is handed Python `True` and the column stores `1`, and only
+        `bool()` on both sides makes `"true"` either way. It is normalised rather
+        than hardcoded to `True` on purpose -- a hardcoded literal would make
+        flipping that column to 0 undetectable, which is precisely a tamper worth
+        detecting. The four container fields need no normalisation: they are stored
+        as `json.dumps(..., sort_keys=True)`, and a loads/dumps round-trip of that
+        is byte-identical.
+        """
+        material = {
+            "dataset_id": str(window["dataset_id"]),
+            "window_start": float(window["window_start"]),
+            "window_end": float(window["window_end"]),
+            "event_ids": window["event_ids"],
+            "features": window["features"],
+            "schema_version": str(window["schema_version"]),
+            "schema_hash": str(window["schema_hash"]),
+            "collector_context": window["collector_context"],
+            "verified_normal": bool(window["verified_normal"]),
+            "verification": window["verification"],
+        }
+        return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    def verify_ml_training_windows(self, dataset_id: str | None = None, *, window_ids: Sequence[int] | None = None) -> dict[str, Any]:
+        """
+        Recompute every training window's `immutable_hash` from its stored columns.
+
+        A recorded hash is only tamper-evidence if something recomputes it. This is
+        that something: it reads the raw columns -- not the decoded records, whose
+        `bool()` and `json.loads` conversions are exactly what a digest has to see
+        through -- rebuilds the material dict, and reports
+        `{ok, checked, mismatched_ids}` in the shape the chain verdicts use.
+
+        Unlike the lifecycle log this is a *set* of independent digests, not a
+        chain, so a break is attributable to specific rows rather than to a
+        sequence position, and deleting a row is invisible here by construction.
+        Callers that know their scope should say so: `dataset_id` for a corpus,
+        `window_ids` for one model's own training provenance (`ml_models` records
+        ids, not a dataset). Both narrow the same scan and may be combined. The
+        unscoped form is a full table scan and belongs in an operator tool or a
+        bounded endpoint rather than on a hot path.
+
+        Undecodable JSON counts as a mismatch rather than raising: content that is
+        no longer parseable is a tampered row, and a verifier that crashes on the
+        worst input reports nothing about the rest of the table.
+        """
+        columns = "id, dataset_id, window_start, window_end, event_ids_json, features_json, schema_version, schema_hash, collector_context_json, verified_normal, verification_json, immutable_hash"
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if dataset_id is not None:
+            clauses.append("dataset_id = ?")
+            parameters.append(dataset_id)
+        if window_ids is not None:
+            # An empty id list scopes to nothing, which is the honest reading: a
+            # model with no training provenance has no windows to verify. Spelled
+            # out because `IN ()` is a syntax error, not an empty match.
+            if not window_ids:
+                return {"ok": True, "checked": 0, "mismatched_ids": []}
+            clauses.append(f"id IN ({', '.join('?' for _ in window_ids)})")
+            parameters.extend(int(window_id) for window_id in window_ids)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._transaction() as conn:
+            rows = conn.execute(f"SELECT {columns} FROM ml_training_windows{where} ORDER BY id", parameters).fetchall()
+        mismatched: list[int] = []
+        for row in rows:
+            try:
+                material = {
+                    "dataset_id": row["dataset_id"],
+                    "window_start": row["window_start"],
+                    "window_end": row["window_end"],
+                    "event_ids": json.loads(row["event_ids_json"]),
+                    "features": json.loads(row["features_json"]),
+                    "schema_version": row["schema_version"],
+                    "schema_hash": row["schema_hash"],
+                    "collector_context": json.loads(row["collector_context_json"]),
+                    "verified_normal": row["verified_normal"],
+                    "verification": json.loads(row["verification_json"]),
+                }
+                recomputed = self._training_window_digest(material)
+            except (TypeError, ValueError):
+                recomputed = None
+            if recomputed != row["immutable_hash"]:
+                mismatched.append(int(row["id"]))
+        return {"ok": not mismatched, "checked": len(rows), "mismatched_ids": mismatched}
+
     def write_ml_training_window(self, window: dict[str, Any]) -> int:
         """Append a verified-normal feature window; rows intentionally have no update API."""
         required = ("dataset_id", "window_start", "window_end", "event_ids", "features", "schema_version", "schema_hash", "collector_context", "verified_normal", "verification", "created_at")
@@ -627,8 +744,7 @@ class SQLiteEventStore(EventStore):
             raise ValueError(f"ML training window missing fields: {', '.join(missing)}")
         if window["verified_normal"] is not True or not window["verification"].get("verified_normal"):
             raise ValueError("training windows require explicit verified_normal=True")
-        material = {key: window[key] for key in required if key != "created_at"}
-        immutable_hash = hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        immutable_hash = self._training_window_digest(window)
         with self._transaction() as conn:
             dataset = conn.execute("SELECT schema_version, schema_hash FROM ml_datasets WHERE id = ?", (window["dataset_id"],)).fetchone()
             if dataset is None:
@@ -671,16 +787,43 @@ class SQLiteEventStore(EventStore):
         return records
 
     def write_ml_model(self, model: dict[str, Any]) -> str:
+        """
+        Insert one model provenance row. The row is always inactive.
+
+        `active` stays a required field, and the only value it may hold is false.
+        It is not dropped from the signature because a caller should still have to
+        say what it intends; it is simply no longer able to intend activation.
+
+        This refuses rather than gates. The plan for this change was to let an
+        `active` INSERT through on the same terms as `activate_ml_model` -- a gate
+        verdict plus the counts to re-derive it -- but that door cannot be given the
+        same lock. `activate_ml_model` requires three things, and the third is that
+        the model's *latest recorded lifecycle state* already be `eligible`. At
+        INSERT the model has no lifecycle history at all: no `trained` row, no
+        `evaluated` row, no `eligible` row. So a gated INSERT would be gated to a
+        strictly weaker standard than the door beside it, and would produce the one
+        state the lifecycle log exists to make impossible -- a model influencing
+        findings with an empty history. A second door with a weaker lock is not
+        defence in depth; it is the way in.
+
+        Refusing costs nothing: no caller in the tree passes `active=True`, and the
+        legitimate sequence is three calls that each leave a record --
+        `write_ml_model` (inactive), evaluate, then `activate_ml_model`.
+        """
         required = ("id", "version", "algorithm", "hyperparameters", "artifact_path", "artifact_checksum", "schema_version", "schema_hash", "training_window_ids", "runtime", "evaluation", "active", "created_at")
         missing = [key for key in required if key not in model]
         if missing:
             raise ValueError(f"ML model missing fields: {', '.join(missing)}")
+        if model["active"]:
+            raise ValueError(
+                "refusing to insert an active ML model: a new row cannot have the "
+                "recorded lifecycle history activation requires; use activate_ml_model "
+                "after the model has been evaluated and found eligible"
+            )
         with self._transaction() as conn:
-            if model["active"]:
-                conn.execute("UPDATE ml_models SET active = 0 WHERE active = 1")
             conn.execute(
                 "INSERT INTO ml_models (id, version, algorithm, hyperparameters_json, artifact_path, artifact_checksum, schema_version, schema_hash, training_window_ids_json, runtime_json, evaluation_json, active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (model["id"], model["version"], model["algorithm"], json.dumps(model["hyperparameters"], sort_keys=True), model["artifact_path"], model["artifact_checksum"], model["schema_version"], model["schema_hash"], json.dumps(model["training_window_ids"], sort_keys=True), json.dumps(model["runtime"], sort_keys=True), json.dumps(model["evaluation"], sort_keys=True), int(bool(model["active"])), float(model["created_at"])),
+                (model["id"], model["version"], model["algorithm"], json.dumps(model["hyperparameters"], sort_keys=True), model["artifact_path"], model["artifact_checksum"], model["schema_version"], model["schema_hash"], json.dumps(model["training_window_ids"], sort_keys=True), json.dumps(model["runtime"], sort_keys=True), json.dumps(model["evaluation"], sort_keys=True), 0, float(model["created_at"])),
             )
         return str(model["id"])
 
@@ -714,6 +857,129 @@ class SQLiteEventStore(EventStore):
         for record in records:
             record["active"] = bool(record["active"])
         return records
+
+    def activate_ml_model(
+        self,
+        model_id: str,
+        *,
+        false_positive_count: int,
+        normal_window_count: int,
+        actor: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        The only path that ever sets `ml_models.active` to 1. Not "the only path on
+        an existing model" -- the only path at all: `write_ml_model` now refuses an
+        active INSERT, so there is no second door.
+
+        This replaces an earlier invariant reading "there is deliberately no store
+        method to activate an existing model". That rule was absence-as-guarantee,
+        and it made the activation gate **unreachable**: `active` could only be set
+        at INSERT by `write_ml_model`, and a model cannot be evaluated before its
+        row exists -- so the one reachable route to `active = 1` ran through
+        `train_isolation_forest(activate=True)`, which took no measurement and
+        consulted no gate. An unsatisfiable-in-principle gate protects nothing. Both
+        halves of that are now gone: the training parameter is deleted and the
+        INSERT refuses. The guarantee is enforcement rather than absence -- one
+        writer, behind three conditions.
+
+        1. **The gate must grant eligibility**, re-run here over the raw counts.
+           Raw counts rather than a caller-supplied verdict, for the same reason
+           `ml/lifecycle.py` takes raw counts: a caller who could hand over the
+           verdict could hand over the answer it wanted.
+        2. **The model row must exist.** An activation claim about a model that was
+           never written is not a claim worth recording.
+        3. **The model's latest lifecycle state must be `eligible`.** This is what
+           makes the log load-bearing rather than decorative -- the recorded
+           history of the measurement is a precondition of acting on it, not a
+           commentary on it. A model that was activated and later retired cannot be
+           re-activated by re-asserting its old counts; it goes through the gate
+           again. `drift_assessed` rows are skipped, matching
+           `ml/lifecycle.py:current_state`, so a routine drift check does not block
+           an activation; that state is re-expressed as SQL here rather than
+           calling `read_ml_lifecycle`, because this runs inside a transaction and
+           `_transaction` is not reentrant.
+
+        At most one model is active at a time, so activating one stands down
+        whichever was active before. The flag, the stand-down, and the chained
+        lifecycle row are one transaction under the chain lock: a model is never
+        active without the row saying why, and never carries the row without the
+        flag.
+        """
+        from ml.evaluation import normal_fpr_acceptance
+
+        acceptance = normal_fpr_acceptance(int(false_positive_count), int(normal_window_count))
+        if acceptance["activation_eligible"] is not True:
+            raise ValueError(
+                "refusing to activate: activation gate not satisfied "
+                f"({'; '.join(acceptance['reasons'])})"
+            )
+        evidence = {
+            "acceptance": acceptance,
+            "false_positive_count": int(false_positive_count),
+            "normal_window_count": int(normal_window_count),
+        }
+        # Same content check every other eligibility claim passes through. It
+        # cannot fail for the dict just built above; running it anyway keeps one
+        # enforcement path rather than a second, privileged one.
+        self._require_activation_gate_verdict(evidence)
+        created_at = time.time()
+
+        with self._chain_lock:
+            with self._transaction() as conn:
+                if conn.execute("SELECT 1 FROM ml_models WHERE id = ?", (model_id,)).fetchone() is None:
+                    raise ValueError(f"refusing to activate: no such ML model: {model_id!r}")
+                latest = conn.execute(
+                    "SELECT to_state FROM ml_model_lifecycle WHERE model_id = ? "
+                    "AND to_state != 'drift_assessed' ORDER BY chain_seq DESC, id DESC LIMIT 1",
+                    (model_id,),
+                ).fetchone()
+                state = latest["to_state"] if latest is not None else None
+                if state != "eligible":
+                    raise ValueError(
+                        "refusing to activate: the model's latest lifecycle state must be "
+                        f"'eligible', not {state!r}"
+                    )
+                conn.execute("UPDATE ml_models SET active = 0 WHERE active = 1")
+                conn.execute("UPDATE ml_models SET active = 1 WHERE id = ?", (model_id,))
+                row_id = self._insert_ml_lifecycle(
+                    conn, model_id, "active", "eligible",
+                    "model activated after satisfying the activation gate",
+                    evidence, True, actor, created_at,
+                )
+                return self._decode_ml_lifecycle_row(
+                    conn.execute("SELECT * FROM ml_model_lifecycle WHERE id = ?", (row_id,)).fetchone()
+                )
+
+    def deactivate_ml_model(self, model_id: str) -> bool:
+        """
+        Stand one model down. Returns whether it had been active.
+
+        The counterpart asymmetry to `activate_ml_model`: activation is gated and
+        refuses on any doubt, deactivation is ungated and always permitted. Standing
+        a model down can only ever remove ML influence from a fused score, so the
+        safe failure mode is for it to be easy -- an operator who suspects a model
+        should not have to satisfy a precondition to silence it. Idempotent, and
+        silent about unknown ids, so it is safe to call on an uncertain state.
+
+        It cannot activate: the value written is the literal `0`.
+        """
+        with self._transaction() as conn:
+            return self._set_ml_model_inactive(conn, model_id)
+
+    @staticmethod
+    def _set_ml_model_inactive(conn: sqlite3.Connection, model_id: str) -> bool:
+        """
+        The single place `ml_models.active` is cleared, so the literal `0` lives once.
+
+        Shared by `deactivate_ml_model` and by the `retired`/`drifted` branch of
+        `write_ml_lifecycle_transition`, which needs the clear inside its own
+        transaction and therefore cannot call the public method (`_transaction` is
+        not reentrant).
+        """
+        cursor = conn.execute(
+            "UPDATE ml_models SET active = 0 WHERE id = ? AND active = 1", (model_id,)
+        )
+        return cursor.rowcount > 0
 
     def write_ml_lifecycle_transition(
         self,
@@ -751,6 +1017,15 @@ class SQLiteEventStore(EventStore):
         holds for every writer, including a future one. The state checks run before
         the content check: "this state may never claim eligibility at all" is the
         more fundamental refusal, and it is the more useful error to surface.
+
+        One append does have an effect, and it is one-directional: `retired` and
+        `drifted` clear `ml_models.active` in this same transaction. No append can
+        make a model active -- `activate_ml_model` is the only door, and it requires
+        a gate verdict and a recorded `eligible` state -- but an append that says a
+        model is out of service stands it down. Doing it here rather than in
+        `ml/lifecycle.py` makes it atomic with the chain extension and impossible
+        for a future caller to forget: there is no way to log a retirement and
+        leave the model scoring.
         """
         if to_state not in _ML_LIFECYCLE_STATES:
             raise ValueError(f"unknown ML lifecycle state: {to_state!r}")
@@ -773,6 +1048,8 @@ class SQLiteEventStore(EventStore):
                     conn, model_id, to_state, from_state, reason, payload,
                     activation_eligible, actor, created_at,
                 )
+                if to_state in ("retired", "drifted"):
+                    self._set_ml_model_inactive(conn, model_id)
                 return self._decode_ml_lifecycle_row(
                     conn.execute("SELECT * FROM ml_model_lifecycle WHERE id = ?", (row_id,)).fetchone()
                 )

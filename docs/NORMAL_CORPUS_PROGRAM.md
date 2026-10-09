@@ -184,12 +184,13 @@ python3 scripts/corpus_status.py --dataset-db corpus/normal.db --json
 ```
 
 It reports a **best-case count readiness**: because a measured FPR needs a
-trained candidate model scoring the holdouts (out of scope here, and unavailable
-while scikit-learn is absent), the tool passes `false_positives=0` — the most
-favourable case — purely to answer "is the *count* sufficient yet, and what is
-the best-possible Wilson ceiling?" A real acceptance run substitutes the model's
-measured false positives. The tool states this caveat in its own output and
-changes nothing.
+trained candidate model scoring the holdouts, the tool passes
+`false_positives=0` — the most favourable case — purely to answer "is the *count*
+sufficient yet, and what is the best-possible Wilson ceiling?" A real acceptance
+run substitutes the model's measured false positives; that is
+`scripts/ml_train_and_evaluate.py`'s job (step 4 below), and it needs
+scikit-learn, which `corpus_status.py` deliberately does not. The tool states this
+caveat in its own output and changes nothing.
 
 ## Seed material (honest starting point)
 
@@ -225,9 +226,27 @@ above; they are candidates, not pre-approved data.
    the best-case Wilson ceiling clears 5%.
 4. When the count is met, a candidate model is trained on the training windows
    and scored against the **held-out** windows; `normal_fpr_acceptance` is
-   evaluated on the model's **measured** false positives.
+   evaluated on the model's **measured** false positives. One command does this
+   and records all three transitions against the chained lifecycle log:
+
+   ```bash
+   python3 scripts/ml_train_and_evaluate.py --db models.db \
+       --training-dataset verified-normal-...training \
+       --holdout-db corpus/normal.db --holdout-dataset verified-normal-...holdout \
+       --artifact-dir models/ --contamination 0.01 --record --operator "$(id -un)"
+   ```
+
+   It refuses before training if the two datasets are the same, if the holdout
+   reuses training windows byte-for-byte, if the holdout dataset is not tagged
+   `--role holdout`, or if their schema hashes disagree — which is the payoff for
+   recording the role at promotion time. Run it today and it refuses: these
+   captures are not promoted yet, and four windows is not sixty. See
+   [`ML_LIFECYCLE.md`](ML_LIFECYCLE.md) for the exit codes and for how the
+   trainer's default contamination is chosen against the gate.
 5. Activation happens **only** if that measured assessment returns
    `activation_eligible=True` — against the unchanged 5% / 95%-Wilson / 60-window
-   bar.
+   bar — and only through a **second, separate** invocation
+   (`--activate --model-id ...`). No single command takes raw captures to an
+   active model.
 
 The corpus grows to meet the bar. The bar does not move.

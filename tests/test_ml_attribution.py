@@ -76,7 +76,10 @@ def _trained_model(tmp_path):
         add_verified_normal_window(store, dataset_id, events, [index * 10 + offset for offset in range(len(events))], verification)
     metadata = train_isolation_forest(store, dataset_id, str(tmp_path / "models"))
     # The native forest, loaded through the real verify-then-parse path.
-    return store, metadata, MLScorer(store, metadata["id"]).model
+    # `allow_inactive=True` because what is under test here is the forest's own
+    # arithmetic, not the activation gate -- putting every attribution test
+    # through a lifecycle walk would add setup that none of them assert on.
+    return store, metadata, MLScorer(store, metadata["id"], allow_inactive=True).model
 
 
 def _raw_from_depths(model, depths):
@@ -151,11 +154,13 @@ def test_attributed_path_is_bitwise_the_scored_path(tmp_path):
 
 
 def test_attribution_is_order_independent(tmp_path):
-    # Matches the deterministic-scoring guarantee (test_ml_integration.py:94): the
-    # window is a set, so reversing its event order must not move any number,
+    # Matches the deterministic-scoring guarantee asserted by
+    # test_ml_integration.py:test_schema_checked_scoring_is_deterministic_and_detects_corruption
+    # (named rather than numbered, because this file's inserts keep moving it):
+    # the window is a set, so reversing its event order must not move any number,
     # attribution included.
     store, metadata, _ = _trained_model(tmp_path)
-    scorer = MLScorer(store, metadata["id"], attribute=True)
+    scorer = MLScorer(store, metadata["id"], attribute=True, allow_inactive=True)
     events = _normal_windows()[0]
     first = scorer.score(events)
     second = scorer.score(list(reversed(events)))

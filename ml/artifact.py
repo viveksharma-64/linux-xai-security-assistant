@@ -62,6 +62,12 @@ _REQUIRED_FOREST_KEYS = ("n_estimators", "max_samples", "offset")
 # Top-level descriptor keys the scorer reads directly. Absent any one of them the
 # artifact is refused rather than defaulted: a missing threshold or calibration
 # block must fail closed, not silently score as permissive.
+#
+# `training_decision_percentiles` is deliberately *not* in this tuple even though
+# `write_artifact` requires it. The rule above is about keys whose absence would
+# change a score; the percentiles are a diagnostic the scorer never reads, so
+# refusing to load an artifact that lacks them would fail closed on a field that
+# cannot affect a verdict. Required on write, optional on read.
 _REQUIRED_DESCRIPTOR_KEYS = (
     "feature_names",
     "schema_version",
@@ -73,9 +79,38 @@ _REQUIRED_DESCRIPTOR_KEYS = (
     "decision_max",
 )
 
+# Percentile levels recorded for the training-score distribution. Fixed here
+# rather than chosen per call so every artifact's distribution is directly
+# comparable and a reader knows which keys to expect.
+TRAINING_DECISION_PERCENTILE_LEVELS: Sequence[int] = (1, 5, 25, 50, 75, 95, 99)
+_PERCENTILE_KEYS: Sequence[str] = tuple(f"p{level}" for level in TRAINING_DECISION_PERCENTILE_LEVELS)
+
 
 class MLArtifactError(ValueError):
     pass
+
+
+def decision_percentiles(decisions: Any) -> dict[str, float]:
+    """
+    Summarise a training-score distribution at `TRAINING_DECISION_PERCENTILE_LEVELS`.
+
+    `decision_min`/`decision_max` say how wide the training scores spread but not
+    where the decision boundary sits inside them -- and the boundary is at zero by
+    construction, because `IsolationForest.decision_function` is centred on the
+    fitted `contamination`. That makes `contamination` the model's self-declared
+    false-positive rate on its own training distribution, which is the coupling
+    that stayed invisible while only the two extremes were recorded: `p1` of a
+    forest fitted at `contamination=0.01` is approximately 0.0, and `p5` of one
+    fitted at 0.05 is too.
+
+    Diagnostic only. Nothing scores off these numbers; they exist so the
+    threshold's position in the distribution can be read off the artifact.
+    """
+    values = np.asarray(decisions, dtype=np.float64).ravel()
+    if values.size == 0:
+        raise MLArtifactError("refusing to summarise an empty training score distribution")
+    quantiles = np.percentile(values, list(TRAINING_DECISION_PERCENTILE_LEVELS))
+    return {key: float(value) for key, value in zip(_PERCENTILE_KEYS, quantiles, strict=True)}
 
 
 def _canonical_json(document: Mapping[str, Any]) -> bytes:
@@ -121,6 +156,7 @@ def write_artifact(
     calibration: Mapping[str, Any],
     decision_min: float,
     decision_max: float,
+    training_decision_percentiles: Mapping[str, float],
 ) -> dict[str, Any]:
     """
     Serialize one model to the two-file format and return its paths and checksums.
@@ -130,11 +166,30 @@ def write_artifact(
     `artifact_checksum` (its digest), plus the array file's path and digest for
     reporting. Both files are written `0600`, matching the store's posture -- a
     model artifact is derived from host telemetry.
+
+    `training_decision_percentiles` is a required keyword rather than a defaulted
+    one: a writer that forgets the training-score distribution produces an
+    artifact whose threshold cannot be placed within it, and that was the state
+    this field exists to end. Use `decision_percentiles()` to build it. It is
+    validated here -- keys, finiteness, monotonicity, and containment within
+    `decision_min`/`decision_max` -- so a reader can trust the shape without
+    re-deriving it.
     """
     trees = list(export["trees"])
     if not trees:
         raise MLArtifactError("refusing to write an artifact with no trees")
     n_features = len(feature_names)
+
+    missing_percentiles = [key for key in _PERCENTILE_KEYS if key not in training_decision_percentiles]
+    if missing_percentiles:
+        raise MLArtifactError(f"training_decision_percentiles is missing {', '.join(missing_percentiles)}")
+    percentiles = [float(training_decision_percentiles[key]) for key in _PERCENTILE_KEYS]
+    if not bool(np.all(np.isfinite(percentiles))):
+        raise MLArtifactError("training_decision_percentiles must all be finite")
+    if any(later < earlier for earlier, later in zip(percentiles, percentiles[1:], strict=False)):
+        raise MLArtifactError("training_decision_percentiles must be non-decreasing")
+    if percentiles[0] < float(decision_min) or percentiles[-1] > float(decision_max):
+        raise MLArtifactError("training_decision_percentiles fall outside decision_min/decision_max")
 
     arrays: dict[str, np.ndarray] = {
         "scaler_mean": np.asarray(export["scaler_mean"], dtype=np.float64),
@@ -174,14 +229,21 @@ def write_artifact(
             "max_samples": int(export["max_samples"]),
             "offset": float(export["offset"]),
         },
-        # Carried over verbatim from the previous artifact: the threshold is still
-        # an experimental decision boundary, and the calibration block still says
-        # what it would take to change that.
+        # What the scorer compares a raw score against, and the claim about where
+        # that number came from. `threshold_provenance` is a free-text string
+        # because its whole job is to be read by a human deciding whether to trust
+        # the threshold; the loader requires it to be present but cannot check that
+        # it is true.
         "threshold": float(threshold),
         "threshold_provenance": threshold_provenance,
         "calibration": dict(calibration),
         "decision_min": float(decision_min),
         "decision_max": float(decision_max),
+        # Where the threshold sits in the training distribution. Diagnostic, never
+        # read by the scorer -- see `decision_percentiles`.
+        "training_decision_percentiles": {
+            key: value for key, value in zip(_PERCENTILE_KEYS, percentiles, strict=True)
+        },
         # Redundant with the array file, deliberately: the descriptor is what the
         # database checksum authenticates, so having it commit to the shape as
         # well means a shape disagreement is a refusal rather than a mis-score.
