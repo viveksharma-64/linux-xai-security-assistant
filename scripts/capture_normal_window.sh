@@ -356,4 +356,8 @@ chmod 0600 "$pending/$name" "$manifest" 2>/dev/null || true
 echo "capture_normal_window: wrote $pending/$name"
 echo "capture_normal_window: session provenance in $manifest"
 echo "capture_normal_window: next, verify independence and review before promoting:"
-echo "  $INGEST_PYTHON scripts/verify_capture_boot.py $pending/$name --against $promoted"
+# sudo, because the capture is 0600 inside a 0700 directory owned by whoever ran
+# this -- root under sudo, linux-xai under the unit. Printed without it the
+# command fails as "unable to open database file", which reads like a corrupt
+# capture rather than the permission denial it actually is.
+echo "  sudo $INGEST_PYTHON scripts/verify_capture_boot.py $pending/$name --against $promoted"

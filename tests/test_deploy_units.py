@@ -117,6 +117,36 @@ def test_the_journal_reading_collector_has_journal_access():
     assert "SupplementaryGroups=systemd-journal" in INGEST_UNIT.read_text()
 
 
+# --- a file-format invariant that holds for every unit -----------------------
+
+
+def test_no_directive_carries_an_inline_comment():
+    # systemd treats `#` as a comment only at the *start* of a line. On a
+    # directive line the entire right-hand side is the value, so
+    # `PrivateDevices=no  # BCC needs /dev` parses as the value
+    # "no  # BCC needs /dev", fails as a boolean, and is dropped with a warning
+    # -- leaving the unit running on that directive's default instead.
+    #
+    # Both BCC units shipped two directives that way, found only by running
+    # `systemd-analyze verify` by hand. Nothing broke, because `PrivateDevices=`
+    # and `MemoryDenyWriteExecute=` both default to the `no` that was intended,
+    # but the next directive written that way inherits a default nobody chose.
+    #
+    # Checked against the raw text on purpose: `_directive()` above splits on
+    # `#`, so every assertion routed through it reads the value the author meant
+    # rather than the one systemd computes, which is what hid this.
+    offenders: list[str] = []
+    for unit in sorted(UNITS.glob("*.service")) + sorted(UNITS.glob("*.timer")):
+        for number, line in enumerate(unit.read_text().splitlines(), start=1):
+            text = line.strip()
+            # Skip whole-line comments (`#` and `;`), blanks, and [Section] headers.
+            if not text or text[0] in "#;[":
+                continue
+            if re.search(r"\s#", text):
+                offenders.append(f"{unit.name}:{number}: {text}")
+    assert not offenders, "systemd does not strip trailing comments:\n  " + "\n  ".join(offenders)
+
+
 # --- the optional normal-capture units ---------------------------------------
 #
 # Same silent-until-deployed class of failure as the ingest unit above, but with

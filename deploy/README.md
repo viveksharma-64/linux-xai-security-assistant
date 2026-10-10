@@ -251,8 +251,11 @@ CAPS=/var/lib/linux-xai-captures
 # 1. Independence: one login session, non-empty, and a (boot_id, session_id) pair
 #    no promoted capture already used. Pass every pending capture at once so
 #    duplicates *within* the batch are caught too, not just against promoted/.
-sudo .venv/bin/python scripts/verify_capture_boot.py \
-    $CAPS/pending/normal-*.db --against $CAPS/promoted
+#    The glob is quoted so that ROOT expands it: pending/ is 0700 and owned by
+#    the capture user, so a glob your own shell expands matches nothing and the
+#    literal pattern is handed on as a filename.
+sudo sh -c ".venv/bin/python scripts/verify_capture_boot.py \
+    $CAPS/pending/normal-*.db --against $CAPS/promoted"
 
 # 2. Normality: a PASS above says nothing about whether the window is benign.
 #    Inspect what the window actually contains before attesting to it.
@@ -270,7 +273,16 @@ sudo .venv/bin/python scripts/collect_normal_window.py \
 
 # 4. Record the decision by moving the capture and its manifest together, so the
 #    one-per-session guard and the verifier's --against set both stay accurate.
-sudo mv $CAPS/pending/normal-<boot_id>-s<session_id>.db* $CAPS/promoted/
+#    find does the matching, not a shell: pending/ is 0700 and owned by the
+#    capture user, so a pattern your own shell expands matches nothing -- and a
+#    pattern handed to `sudo sh -c` would have the <> below parsed as root-shell
+#    redirections. Single-quoted, the placeholders stay inert and an unedited
+#    paste matches nothing instead of writing files. The trailing * matters: it
+#    carries the -wal and -shm sidecars, and moving the database without a WAL
+#    that still holds rows is the training-13 failure mode.
+sudo find $CAPS/pending -maxdepth 1 \
+    -name 'normal-<boot_id>-s<session_id>.db*' \
+    -exec mv -t $CAPS/promoted/ {} +
 
 # 5. Progress against the gate.
 sudo .venv/bin/python scripts/corpus_status.py --dataset-db $CAPS/corpus.db

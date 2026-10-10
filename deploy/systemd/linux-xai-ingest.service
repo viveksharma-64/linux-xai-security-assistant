@@ -81,7 +81,8 @@ TimeoutStopSec=30
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-PrivateDevices=no          # BCC needs /dev and /sys/kernel/debug access
+# BCC needs /dev and /sys/kernel/debug access
+PrivateDevices=no
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
@@ -91,7 +92,8 @@ RestrictSUIDSGID=yes
 RestrictRealtime=yes
 RestrictNamespaces=yes
 LockPersonality=yes
-MemoryDenyWriteExecute=no  # the BPF verifier/JIT maps executable memory
+# the BPF verifier/JIT maps executable memory
+MemoryDenyWriteExecute=no
 SystemCallArchitectures=native
 # bpf() and perf_event_open() live in @privileged/@debug; @module stays blocked.
 SystemCallFilter=@system-service @privileged @debug
